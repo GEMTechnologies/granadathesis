@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test University API</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .result { background: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+        textarea { width: 100%; height: 100px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>University Slash Command Tester</h1>
+    
+    <h2>1. Test API Endpoint</h2>
+    <button onclick="testAPI()">Test /api/thesis/universities</button>
+    <div id="apiResult" class="result"></div>
+    
+    <h2>2. Simulate Slash Command</h2>
+    <textarea id="testInput" placeholder="Type here to test slash detection..."></textarea>
+    <div id="slashResult" class="result"></div>
+    
+    <h2>3. Component Logs</h2>
+    <div id="logs" class="result" style="height: 200px; overflow-y: auto; white-space: pre-wrap; font-size: 12px;"></div>
+    
+    <script>
+        // Capture console logs
+        const logsDiv = document.getElementById('logs');
+        const originalLog = console.log;
+        const originalError = console.error;
+        
+        console.log = function(...args) {
+            originalLog(...args);
+            logsDiv.innerHTML += args.join(' ') + '\n';
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        };
+        
+        console.error = function(...args) {
+            originalError(...args);
+            logsDiv.innerHTML += '[ERROR] ' + args.join(' ') + '\n';
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        };
+        
+        // Test API
+        async function testAPI() {
+            const result = document.getElementById('apiResult');
+            try {
+                const response = await fetch('http://localhost:8000/api/thesis/universities');
+                const data = await response.json();
+                result.innerHTML = '<strong style="color: green;">✓ API Working!</strong><br>' + JSON.stringify(data, null, 2);
+                console.log('API test successful:', data);
+            } catch (error) {
+                result.innerHTML = '<strong style="color: red;">✗ API Failed</strong><br>' + error.message;
+                console.error('API test failed:', error);
+            }
+        }
+        
+        // Test slash detection
+        document.getElementById('testInput').addEventListener('input', (e) => {
+            const value = e.target.value;
+            const lastCharIsSlash = value[value.length - 1] === '/';
+            const startsWithSlash = value.trim().startsWith('/');
+            const shouldShow = lastCharIsSlash || startsWithSlash;
+            
+            const result = document.getElementById('slashResult');
+            result.innerHTML = `
+                <strong>Input:</strong> "${value}"<br>
+                <strong>Last char is /:</strong> ${lastCharIsSlash}<br>
+                <strong>Starts with /:</strong> ${startsWithSlash}<br>
+                <strong>Should show dropdown:</strong> <span style="color: ${shouldShow ? 'green' : 'gray'}">${shouldShow ? '✓ YES' : '✗ NO'}</span>
+            `;
+            console.log('Slash detection test:', { value, shouldShow });
+        });
+        
+        // Auto-test on load
+        console.log('University Slash Command Tester loaded');
+        testAPI();
+    </script>
+</body>
+</html>

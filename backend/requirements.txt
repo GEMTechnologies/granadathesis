@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+supabase
+redis
+openai
+anthropic
+google-generativeai
+requests
+python-dotenv
+httpx
+tenacity
+asyncpg
+sse-starlette
+python-multipart
+python-docx

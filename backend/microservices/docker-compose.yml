@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # API Gateway - Main entry point
+  gateway:
+    build: ./gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - OBJECTIVE_SERVICE_URL=http://objective-service:8001
+      - CONTENT_SERVICE_URL=http://content-service:8002
+      - SEARCH_SERVICE_URL=http://search-service:8003
+    depends_on:
+      - objective-service
+      - content-service
+      - search-service
+    restart: unless-stopped
+
+  # Objective Service - OpenRouter only
+  objective-service:
+    build: ./services/objective
+    ports:
+      - "8001:8001"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - REDIS_URL=redis://redis:6379
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - EXA_API_KEY=${EXA_API_KEY}
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # Content Service - DeepSeek Direct only
+  content-service:
+    build: ./services/content
+    ports:
+      - "8002:8002"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+      - search-service
+    restart: unless-stopped
+
+  # Search Service - Academic APIs
+  search-service:
+    build: ./services/search
+    ports:
+      - "8003:8003"
+    environment:
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+      - PUBMED_API_KEY=${PUBMED_API_KEY}
+      - EXA_API_KEY=${EXA_API_KEY}
+      - ZOTERO_API_KEY=${ZOTERO_API_KEY}
+      - ZOTERO_USER_ID=${ZOTERO_USER_ID}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+networks:
+  default:
+    name: thesis-network

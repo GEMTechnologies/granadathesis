@@ -1,0 +1,113 @@
+services:
+  backend:
+    build: ./backend
+    working_dir: /app/lightweight
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - ./thesis_data:/thesis_data
+      - ./workspaces:/app/workspaces
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+
+  frontend:
+    build:
+      context: ./web-ui
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./web-ui:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    environment:
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+      - BACKEND_URL=http://backend:8000
+      - HOSTNAME=0.0.0.0
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=thesis
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  worker-content:
+    build: ./backend
+    working_dir: /app/lightweight
+    command: python workers/content_worker.py
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - ./thesis_data:/thesis_data
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - PYTHONPATH=.
+
+  worker-objective:
+    build: ./backend
+    working_dir: /app/lightweight
+    command: python workers/objective_worker.py
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - ./thesis_data:/thesis_data
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - PYTHONPATH=.
+
+  worker-search:
+    build: ./backend
+    working_dir: /app/lightweight
+    command: python workers/search_worker.py
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - ./thesis_data:/thesis_data
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - PYTHONPATH=.
+
+volumes:
+  redis_data:
+  postgres_data:

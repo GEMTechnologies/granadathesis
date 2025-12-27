@@ -1,0 +1,36 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# PID files
+.backend.pid
+.frontend.pid
+
+# Markdown files (as requested)
+*.md
+**/*.md
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

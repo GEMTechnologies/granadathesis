@@ -1,0 +1,42 @@
+{
+  "workspace_id": "workspace_42860b795e74",
+  "topic": "New Project",
+  "context": "Auto-created workspace for user anonymous",
+  "created_at": "2025-12-18T12:14:19.129883",
+  "updated_at": "2025-12-18T12:14:19.129902",
+  "status": "active",
+  "version": "1.0",
+  "settings": {
+    "search": {
+      "year_from": null,
+      "year_to": null,
+      "years_back": 5,
+      "sources": [
+        "semantic_scholar",
+        "crossref",
+        "openalex",
+        "arxiv",
+        "pubmed",
+        "core",
+        "dblp"
+      ],
+      "max_results_per_source": 10,
+      "max_total_results": 50,
+      "require_abstract": true,
+      "require_open_access": false,
+      "language": "en",
+      "sort_by": "relevance"
+    },
+    "indexing": {
+      "auto_download_pdfs": true,
+      "extract_text": true,
+      "generate_summaries": false,
+      "max_sources": 500
+    },
+    "citations": {
+      "style": "apa",
+      "include_doi": true,
+      "include_url": true
+    }
+  }
+}

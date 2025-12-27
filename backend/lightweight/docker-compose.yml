@@ -1,0 +1,141 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Local Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=thesis
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Redis - Job queue and cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # API Server - Receives requests, queues jobs
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+    volumes:
+      - ./:/app
+      - ../../thesis_data:/thesis_data
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    command: python api.py
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M # Low memory limit
+
+  # Objective Worker - Wakes for objectives
+  objective-worker:
+    build: .
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - SUPABASE_URL=https://placeholder.supabase.co
+      - SUPABASE_SERVICE_ROLE_KEY=placeholder
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+    volumes:
+      - ./:/app
+      - ../../thesis_data:/thesis_data
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    command: python workers/objective_worker.py
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Content Worker - Wakes for content
+  content-worker:
+    build: .
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/thesis
+      - SUPABASE_URL=https://placeholder.supabase.co
+      - SUPABASE_SERVICE_ROLE_KEY=placeholder
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+    volumes:
+      - ./:/app
+      - ../../thesis_data:/thesis_data
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    command: python workers/content_worker.py
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Search Worker - Wakes for searches
+  search-worker:
+    build: .
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379
+      - SUPABASE_URL=https://placeholder.supabase.co
+      - SUPABASE_SERVICE_ROLE_KEY=placeholder
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+      - EXA_API_KEY=${EXA_API_KEY}
+    volumes:
+      - ./:/app
+    depends_on:
+      - redis
+    command: python workers/search_worker.py
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+networks:
+  default:
+    name: thesis-lightweight
+
+volumes:
+  postgres_data:
+
+    # Total memory: ~1.6GB (vs 4GB+ microservices)

@@ -1,0 +1,88 @@
+# Skills API endpoints - Add before the SSE endpoint section
+# ==========================================
+# Skills Management
+# ==========================================
+
+@app.get("/api/skills")
+async def list_skills():
+    """List all available skills."""
+    try:
+        from services.skills_manager import get_skills_manager
+        skills_manager = get_skills_manager()
+        skills = skills_manager.list_skills()
+        
+        return {
+            "skills": [
+                {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "metadata": skill.metadata
+                }
+                for skill in skills
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/skills/{skill_name}")
+async def get_skill(skill_name: str):
+    """Get details of a specific skill."""
+    try:
+        from services.skills_manager import get_skills_manager
+        skills_manager = get_skills_manager()
+        skill = skills_manager.get_skill(skill_name)
+        
+        if not skill:
+            raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+        
+        return {
+            "name": skill.name,
+            "description": skill.description,
+            "instructions": skill.instructions,
+            "metadata": skill.metadata,
+            "path": str(skill.path)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/skills/reload")
+async def reload_skills():
+    """Reload all skills from disk."""
+    try:
+        from services.skills_manager import get_skills_manager
+        skills_manager = get_skills_manager()
+        skills_manager.reload_skills()
+        
+        return {
+            "status": "success",
+            "message": "Skills reloaded successfully",
+            "count": len(skills_manager.list_skills())
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/skills/for-task")
+async def get_skills_for_task(task: str):
+    """Get skills that might be relevant for a task."""
+    try:
+        from services.skills_manager import get_skills_manager
+        skills_manager = get_skills_manager()
+        relevant_skills = skills_manager.get_skills_for_task(task)
+        
+        return {
+            "task": task,
+            "skills": [
+                {
+                    "name": skill.name,
+                    "description": skill.description
+                }
+                for skill in relevant_skills
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
