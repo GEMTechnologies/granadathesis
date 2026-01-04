@@ -47,7 +47,8 @@ class Chapter5Generator:
         objectives: List[str],
         chapter_two_content: str = "",
         chapter_four_content: str = "",
-        output_dir: str = None
+        output_dir: str = None,
+        sample_size: int = None
     ):
         self.topic = topic
         self.case_study = case_study
@@ -55,6 +56,7 @@ class Chapter5Generator:
         self.chapter_two_content = chapter_two_content
         self.chapter_four_content = chapter_four_content
         self.output_dir = Path(output_dir) if output_dir else Path("/home/gemtech/Desktop/thesis")
+        self.sample_size = sample_size or 385
         
         # Extract comprehensive literature data
         self.literature_citations = self._extract_citations_from_chapter2()
@@ -252,7 +254,7 @@ Throughout this discussion, the five main sections of findings from Chapter Four
         Generate comprehensive discussion for one objective (5,000+ words per objective).
         Integrates deeply with Chapter 2 literature and Chapter 4 data.
         """
-        section_num = f"5.{obj_num + 1}"
+        section_num = f"5.{obj_num}"
         
         # Get multiple citations for rich discussion
         citations_list = self.literature_citations[:10]
@@ -261,9 +263,9 @@ Throughout this discussion, the five main sections of findings from Chapter Four
 
 ### {section_num}.1 Overview of Findings
 
-The findings related to Objective {obj_num} were presented in Chapter Four and revealed important and nuanced insights concerning {objective}. This section provided a comprehensive discussion of these findings, comparing them in detail with the literature reviewed in Chapter Two, examining their relationship to established theories, and interpreting their significance for advancing knowledge in this field.
+The findings related to Objective {obj_num} were presented in Chapter Four and revealed important and nuanced insights concerning {objective.lower()}. This section provided a comprehensive discussion of these findings, comparing them in detail with the literature reviewed in Chapter Two, examining their relationship to established theories, and interpreting their significance for advancing knowledge in this field.
 
-The data collected for this objective came from multiple sources, including {len(self.empirical_studies)} survey respondents, in-depth interviews with key informants, focus group discussions, and observational data from field work. This multimethod data collection enabled a comprehensive and triangulated understanding of {objective}, reducing the risk of method-specific biases and increasing confidence in the findings.
+The data collected for this objective came from multiple sources, including a survey of {self.sample_size} respondents, in-depth interviews with key informants, focus group discussions, and observational data from field work.
 
 ### {section_num}.2 Comparison with Theoretical Frameworks
 
@@ -502,67 +504,6 @@ This research had demonstrated that {{final_conclusion_statement}}. Through syst
 """
 
 
-async def generate_chapter5(
-    topic: str,
-    case_study: str,
-    objectives: List[str],
-    chapter_two_filepath: str = None,
-    chapter_four_filepath: str = None,
-    output_dir: str = None,
-    job_id: str = None,
-    session_id: str = None
-) -> Dict[str, Any]:
-    """Main function to generate PhD-level Chapter 5 (20,000+ words)."""
-    
-    output_dir = output_dir or "/home/gemtech/Desktop/thesis/thesis_data/default"
-    
-    # Load Chapter 2 content
-    chapter_two_content = ""
-    if chapter_two_filepath and os.path.exists(chapter_two_filepath):
-        with open(chapter_two_filepath, 'r', encoding='utf-8') as f:
-            chapter_two_content = f.read()
-        print(f"✓ Loaded Chapter 2: {chapter_two_filepath}")
-    
-    # Load Chapter 4 content
-    chapter_four_content = ""
-    if chapter_four_filepath and os.path.exists(chapter_four_filepath):
-        with open(chapter_four_filepath, 'r', encoding='utf-8') as f:
-            chapter_four_content = f.read()
-        print(f"✓ Loaded Chapter 4: {chapter_four_filepath}")
-    
-    # Create generator
-    generator = Chapter5Generator(
-        topic=topic,
-        case_study=case_study,
-        objectives=objectives,
-        chapter_two_content=chapter_two_content,
-        chapter_four_content=chapter_four_content,
-        output_dir=output_dir
-    )
-    
-    # Generate chapter
-    chapter_content = await generator.generate_full_chapter()
-    
-    # Save to file
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    safe_topic = re.sub(r'[^\w\s-]', '', topic)[:50].replace(' ', '_')
-    filename = f"Chapter_5_PhD_Discussion_{safe_topic}.md"
-    filepath = os.path.join(output_dir, filename)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(chapter_content)
-    
-    print(f"✅ Chapter 5 (PhD-level) generated: {filepath}")
-    print(f"   - Target: ~20,000 words comprehensive discussion")
-    print(f"   - Sections: Introduction + {len(objectives)} objectives + Broader implications + Theory + Methods + Practice + Conclusion")
-    
-    return {
-        'filepath': filepath,
-        'objectives_discussed': len(objectives),
-        'word_count_estimate': '20000+',
-        'status': 'success'
-    }
-
     
     def _extract_citations_from_chapter2(self) -> Dict[str, List[Dict[str, str]]]:
         """
@@ -796,11 +737,13 @@ async def generate_chapter5(
     chapter_four_filepath: str = None,
     output_dir: str = None,
     job_id: str = None,
-    session_id: str = None
+    session_id: str = None,
+    sample_size: int = None
 ) -> Dict[str, Any]:
     """Main function to generate Chapter 5."""
     
-    output_dir = output_dir or "/home/gemtech/Desktop/thesis/thesis_data/default"
+    from services.workspace_service import WORKSPACES_DIR
+    output_dir = output_dir or str(WORKSPACES_DIR / "default")
     
     # Load Chapter 2 content if available
     chapter_two_content = ""
@@ -839,7 +782,8 @@ async def generate_chapter5(
         objectives=objectives,
         chapter_two_content=chapter_two_content,
         chapter_four_content=chapter_four_content,
-        output_dir=output_dir
+        output_dir=output_dir,
+        sample_size=sample_size
     )
     
     # Generate chapter

@@ -1,0 +1,49 @@
+    async def _generate_creative_headings(self, objective: str, topic: str) -> List[str]:
+        """Generate creative, academic sub-headings for an objective using LLM."""
+        try:
+            from services.deepseek_direct import deepseek_direct_service
+            
+            prompt = f"""Generate 4 distinct, engaging, and specific academic sub-headings for a literature review section that discusses the following objective:
+
+TOPIC: {topic}
+OBJECTIVE: {objective}
+
+The sub-headings should break down the objective into specific thematic areas suitable for lengthy empirical review.
+Avoid generic titles like "Introduction" or "Conclusion".
+Avoid repetitive phrasing.
+Do NOT use the phrase "Thematic Aspect of".
+
+Return ONLY a valid JSON list of 4 clean strings.
+Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeholder Engagement", "Governance Impact"]"""
+
+            content = await deepseek_direct_service.generate_content(
+                prompt=prompt,
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            import json
+            import re
+            
+            # Clean content to ensure valid JSON
+            content = content.replace("```json", "").replace("```", "").strip()
+            
+            headings = json.loads(content)
+            if isinstance(headings, list) and len(headings) >= 4:
+                return headings[:4]
+                
+        except Exception as e:
+            print(f"Error generating creative headings: {e}")
+            
+        # Fallback if LLM fails (Smart Regex construction)
+        import re
+        clean_obj = re.sub(r'^(to|To)\s+(assess|examine|analyze|evaluate|investigate|determine|study|explore)\s+', '', objective)
+        clean_obj = re.sub(r'^(to|To)\s+', '', clean_obj)
+        short_heading = ' '.join(clean_obj.split()[:10]).title()
+            
+        return [
+            f"Key Themes in {short_heading}",
+            f"Empirical Evidence on {short_heading}",
+            f"Critical Analysis of {short_heading}",
+            f"Comparative Perspectives on {short_heading}"
+        ]

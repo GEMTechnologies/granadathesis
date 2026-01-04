@@ -15,40 +15,41 @@ import {
     AlertCircle,
     RefreshCw,
     Type,
-    Minus
+    Minus,
+    MessageCircle,
+    Trash2
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
+import { ThemeToggle } from '../ui/ThemeToggle';
 
-interface Job {
-    job_id: string;
-    message: string;
-    status: 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
-    progress: number;
-    current_step: string;
-    created_at: string;
+interface Conversation {
+    conversation_id: string;
+    title: string;
     updated_at: string;
+    summary?: string;
+    total_messages: number;
 }
 
 interface TopMenuBarProps {
     workspaceId: string;
     onNewChat: () => void;
-    onSelectJob: (jobId: string) => void;
-    currentJobId?: string | null;
-    chatTitle?: string;  // Add chat title prop
+    onSelectHistoryItem: (id: string, type: 'job' | 'conversation') => void;
+    currentHistoryId?: string | null;
+    chatTitle?: string;
 }
 
 export function TopMenuBar({
     workspaceId,
     onNewChat,
-    onSelectJob,
-    currentJobId,
+    onSelectHistoryItem,
+    currentHistoryId,
     chatTitle
 }: TopMenuBarProps) {
     const [showHistory, setShowHistory] = useState(false);
-    const [jobs, setJobs] = useState<Job[]>([]);
+    const [conversations, setConversations] = useState<Conversation[]>([]);
     const [loading, setLoading] = useState(false);
-    const [activeJobs, setActiveJobs] = useState<Job[]>([]);
+    const [activeJobs, setActiveJobs] = useState<any[]>([]);
     const [fontSize, setFontSize] = useState<'small' | 'medium' | 'large'>('medium');
 
     // Load font size preference from localStorage
@@ -82,32 +83,10 @@ export function TopMenuBar({
         localStorage.setItem('ui-font-size', nextSize);
     };
 
-    const decreaseFontSize = () => {
-        const order: Array<'small' | 'medium' | 'large'> = ['small', 'medium', 'large'];
-        const currentIndex = order.indexOf(fontSize);
-        if (currentIndex > 0) {
-            const newSize = order[currentIndex - 1];
-            setFontSize(newSize);
-            applyFontSize(newSize);
-            localStorage.setItem('ui-font-size', newSize);
-        }
-    };
-
-    const increaseFontSize = () => {
-        const order: Array<'small' | 'medium' | 'large'> = ['small', 'medium', 'large'];
-        const currentIndex = order.indexOf(fontSize);
-        if (currentIndex < order.length - 1) {
-            const newSize = order[currentIndex + 1];
-            setFontSize(newSize);
-            applyFontSize(newSize);
-            localStorage.setItem('ui-font-size', newSize);
-        }
-    };
-
-    // Fetch jobs on mount and when dropdown opens
+    // Fetch conversations on mount and when dropdown opens
     useEffect(() => {
         if (showHistory) {
-            fetchJobs();
+            fetchConversations();
         }
     }, [showHistory, workspaceId]);
 
@@ -118,19 +97,52 @@ export function TopMenuBar({
         return () => clearInterval(interval);
     }, [workspaceId]);
 
-    const fetchJobs = async () => {
+    const fetchConversations = async () => {
         setLoading(true);
         try {
             const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
-            const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/jobs?limit=20`);
+            const response = await fetch(`${backendUrl}/api/sessions/list`);
             if (response.ok) {
                 const data = await response.json();
-                setJobs(data.jobs || []);
+                setConversations(data.conversations || []);
             }
         } catch (error) {
-            console.error('Failed to fetch jobs:', error);
+            console.error('Failed to fetch conversations:', error);
         } finally {
             setLoading(false);
+        }
+    };
+
+    const handleDeleteConversation = async (e: React.MouseEvent, id: string) => {
+        e.stopPropagation();
+        if (!confirm('Are you sure you want to delete this chat and all its files?')) return;
+
+        try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+            const response = await fetch(`${backendUrl}/api/session/${id}`, { method: 'DELETE' });
+            if (response.ok) {
+                if (currentHistoryId === id) {
+                    onNewChat();
+                }
+                fetchConversations();
+            }
+        } catch (error) {
+            console.error('Failed to delete conversation:', error);
+        }
+    };
+
+    const handleClearAll = async () => {
+        if (!confirm('Are you sure you want to delete ALL chat history and ALL associated files? This cannot be undone.')) return;
+
+        try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+            const response = await fetch(`${backendUrl}/api/sessions/clear`, { method: 'DELETE' });
+            if (response.ok) {
+                onNewChat();
+                fetchConversations();
+            }
+        } catch (error) {
+            console.error('Failed to clear sessions:', error);
         }
     };
 
@@ -147,26 +159,8 @@ export function TopMenuBar({
         }
     };
 
-    const getStatusIcon = (status: Job['status']) => {
-        switch (status) {
-            case 'running':
-                return <Play className="w-3 h-3 text-green-500 animate-pulse" />;
-            case 'paused':
-                return <Pause className="w-3 h-3 text-yellow-500" />;
-            case 'completed':
-                return <CheckCircle2 className="w-3 h-3 text-green-500" />;
-            case 'failed':
-                return <XCircle className="w-3 h-3 text-red-500" />;
-            case 'cancelled':
-                return <Square className="w-3 h-3 text-gray-500" />;
-            case 'pending':
-                return <Clock className="w-3 h-3 text-blue-500" />;
-            default:
-                return <AlertCircle className="w-3 h-3 text-gray-400" />;
-        }
-    };
-
     const formatTime = (dateString: string) => {
+        if (!dateString) return '';
         const date = new Date(dateString);
         const now = new Date();
         const diffMs = now.getTime() - date.getTime();
@@ -216,93 +210,108 @@ export function TopMenuBar({
                 </span>
             </div>
 
-            {/* Right side - History */}
-            <div className="relative">
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setShowHistory(!showHistory)}
-                    className="gap-2 text-sm"
-                >
-                    <History className="w-4 h-4" />
-                    Chat History
-                    <ChevronDown className={cn(
-                        "w-4 h-4 transition-transform",
-                        showHistory && "rotate-180"
-                    )} />
-                </Button>
+            {/* Right side - History & Theme */}
+            <div className="flex items-center gap-2">
+                <ThemeToggle />
+                <div className="relative">
+                    <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setShowHistory(!showHistory)}
+                        className="gap-2 text-sm"
+                    >
+                        <History className="w-4 h-4" />
+                        Chat History
+                        <ChevronDown className={cn(
+                            "w-4 h-4 transition-transform",
+                            showHistory && "rotate-180"
+                        )} />
+                    </Button>
 
-                {/* History Dropdown */}
-                {showHistory && (
-                    <div className="absolute right-0 top-full mt-2 w-96 max-h-[70vh] overflow-y-auto bg-background border rounded-lg shadow-lg z-[100]">
-                        <div className="p-3 border-b flex items-center justify-between">
-                            <span className="text-sm font-medium">Recent Chats</span>
-                            <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={fetchJobs}
-                                disabled={loading}
-                            >
-                                <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
-                            </Button>
-                        </div>
+                    {/* History Dropdown */}
+                    {showHistory && (
+                        <div className="absolute right-0 top-full mt-2 w-96 max-h-[70vh] overflow-y-auto bg-background border rounded-lg shadow-lg z-[100]">
+                            <div className="p-3 border-b flex items-center justify-between">
+                                <span className="text-sm font-medium">Recent Chats</span>
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={fetchConversations}
+                                    disabled={loading}
+                                >
+                                    <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
+                                </Button>
+                            </div>
 
-                        {loading ? (
-                            <div className="p-8 text-center text-muted-foreground">
-                                <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
-                                Loading...
-                            </div>
-                        ) : jobs.length === 0 ? (
-                            <div className="p-8 text-center text-muted-foreground">
-                                <History className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                                No chat history yet
-                            </div>
-                        ) : (
-                            <div className="divide-y">
-                                {jobs.map(job => (
-                                    <button
-                                        key={job.job_id}
-                                        onClick={() => {
-                                            onSelectJob(job.job_id);
-                                            setShowHistory(false);
-                                        }}
-                                        className={cn(
-                                            "w-full p-3 text-left hover:bg-accent transition-colors",
-                                            currentJobId === job.job_id && "bg-accent"
-                                        )}
-                                    >
-                                        <div className="flex items-start gap-3">
-                                            <div className="mt-1">
-                                                {getStatusIcon(job.status)}
-                                            </div>
-                                            <div className="flex-1 min-w-0">
-                                                <p className="text-sm font-medium truncate">
-                                                    {job.message.slice(0, 60)}
-                                                    {job.message.length > 60 && '...'}
-                                                </p>
-                                                <div className="flex items-center gap-2 mt-1">
-                                                    <span className="text-xs text-muted-foreground">
-                                                        {formatTime(job.created_at)}
-                                                    </span>
-                                                    {job.status === 'running' && (
-                                                        <span className="text-xs text-green-500">
-                                                            {Math.round(job.progress * 100)}%
-                                                        </span>
-                                                    )}
-                                                    {job.current_step && job.status === 'running' && (
-                                                        <span className="text-xs text-muted-foreground truncate max-w-[150px]">
-                                                            • {job.current_step}
-                                                        </span>
-                                                    )}
+                            {loading ? (
+                                <div className="p-8 text-center text-muted-foreground">
+                                    <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
+                                    Loading...
+                                </div>
+                            ) : conversations.length === 0 ? (
+                                <div className="p-8 text-center text-muted-foreground">
+                                    <History className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                                    No chat history yet
+                                </div>
+                            ) : (
+                                <div className="divide-y">
+                                    {conversations.map(conv => (
+                                        <div key={conv.conversation_id} className="group relative">
+                                            <button
+                                                onClick={() => {
+                                                    onSelectHistoryItem(conv.conversation_id, 'conversation');
+                                                    setShowHistory(false);
+                                                }}
+                                                className={cn(
+                                                    "w-full p-3 pr-12 text-left hover:bg-accent transition-colors",
+                                                    currentHistoryId === conv.conversation_id && "bg-accent"
+                                                )}
+                                            >
+                                                <div className="flex items-start gap-3">
+                                                    <div className="mt-1">
+                                                        <MessageCircle className="w-4 h-4 text-primary opacity-70" />
+                                                    </div>
+                                                    <div className="flex-1 min-w-0">
+                                                        <p className="text-sm font-medium truncate">
+                                                            {conv.title}
+                                                        </p>
+                                                        <div className="flex items-center gap-2 mt-1">
+                                                            <span className="text-xs text-muted-foreground">
+                                                                {formatTime(conv.updated_at)}
+                                                            </span>
+                                                            <span className="text-xs text-muted-foreground">
+                                                                • {conv.total_messages} messages
+                                                            </span>
+                                                        </div>
+                                                    </div>
                                                 </div>
-                                            </div>
+                                            </button>
+                                            <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                onClick={(e) => handleDeleteConversation(e, conv.conversation_id)}
+                                                className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity hover:text-destructive p-2 h-auto"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </Button>
                                         </div>
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )}
+                                    ))}
+                                    <div className="p-2 bg-accent/30 border-t">
+                                        <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            onClick={handleClearAll}
+                                            className="w-full text-destructive hover:bg-destructive/10 gap-2"
+                                        >
+                                            <Trash2 className="w-4 h-4" />
+                                            Clear All History
+                                        </Button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
             </div>
 
             {/* Click outside to close */}

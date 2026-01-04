@@ -114,6 +114,22 @@ class DocumentService:
         self._save_metadata()
         
         logger.info(f"Uploaded document {filename} with {len(chunks)} chunks")
+
+        # BRIDGE TO SOURCES SERVICE:
+        # Automatically add PDFs to Sources for Thesis RAG context
+        if file_type == "pdf":
+            try:
+                from services.sources_service import sources_service
+                # Use add_pdf_source to extract metadata and add to sources/ index
+                # We pass the saved path. add_pdf_source will make its own copy in sources/pdfs
+                await sources_service.add_pdf_source(
+                    workspace_id=self.workspace_id,
+                    pdf_path=saved_path,
+                    original_filename=filename
+                )
+                logger.info(f"✅ Automatically added {filename} to Sources index for Thesis RAG")
+            except Exception as bridge_error:
+                logger.warning(f"⚠️ Failed to auto-add to Sources: {bridge_error}")
         
         return doc_metadata
     

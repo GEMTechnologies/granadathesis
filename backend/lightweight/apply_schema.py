@@ -65,6 +65,24 @@ async def apply_schema():
             UNIQUE(thesis_id, objective_type, objective_number)
         );
         
+        -- Users Table
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            username TEXT,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+        );
+
+        -- Workspaces Table
+        CREATE TABLE IF NOT EXISTS workspaces (
+            workspace_id TEXT PRIMARY KEY,
+            owner_user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+            name TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+            UNIQUE(owner_user_id)  -- For now, one workspace per user to start
+        );
+
         -- RLS
         ALTER TABLE sources ENABLE ROW LEVEL SECURITY;
         DROP POLICY IF EXISTS "Allow all access" ON sources;

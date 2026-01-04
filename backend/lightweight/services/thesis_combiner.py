@@ -223,28 +223,43 @@ class ThesisCombiner:
         submission_date = datetime.now().strftime("%B %Y")
         current_year = datetime.now().year
         
+        logo_markdown = ""
+        if "juba" in self.university.lower():
+            logo_path = "/home/gemtech/Desktop/thesis/backend/lightweight/uoj_logo.png"
+            logo_markdown = f"![{self.university} LOGO]({logo_path})\n\n"
+        
         preliminaries = f"""
 {'='*80}
 PRELIMINARY PAGES
 {'='*80}
 
-# {self.topic.upper()}
+<div style="text-align: center;">
 
-## A Thesis Submitted in Partial Fulfilment of the Requirements for the Award of {self.degree}
+{logo_markdown}# {self.topic.upper()}
+
+&nbsp;
+
+**BY**
+
+&nbsp;
+
+### {self.student_name}
+
+&nbsp;
 
 ---
 
-**Student:** {self.student_name}
-
-**Supervisor:** {self.supervisor_name}
+**A Thesis Submitted in Partial Fulfilment of the Requirements for the Award of {self.degree}**
 
 **Department:** {self.department}
 
 **University:** {self.university}
 
-**Submission Date:** {submission_date}
+**Date:** {submission_date}
 
 ---
+
+</div>
 
 {'='*80}
 

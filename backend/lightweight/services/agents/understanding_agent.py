@@ -28,8 +28,8 @@ class UnderstandingAgent(BaseAgent):
     - Decides which agents to spawn next
     """
     
-    def __init__(self, agent_type: AgentType, session_id: str, parent_id: Optional[str] = None):
-        super().__init__(agent_type, session_id, parent_id)
+    def __init__(self, agent_type: AgentType, session_id: str, parent_id: Optional[str] = None, job_id: Optional[str] = None):
+        super().__init__(agent_type, session_id, parent_id, job_id)
         
         # Intent patterns for classification
         self.intent_patterns = {
@@ -38,6 +38,9 @@ class UnderstandingAgent(BaseAgent):
                 r"find\s+(?:information|info)\s+(?:about|on)",
                 r"look\s+up",
                 r"google",
+                r"statistics\s+(?:on|for)",
+                r"latest\s+data\s+(?:on|for)",
+                r"current\s+info",
             ],
             "search_papers": [
                 r"search\s+(?:for\s+)?papers?",
@@ -52,6 +55,8 @@ class UnderstandingAgent(BaseAgent):
             ],
             "summarize": [
                 r"summarize",
+                r"summarise",
+                r"sumarise",
                 r"summary\s+of",
                 r"give\s+me\s+(?:a\s+)?summary",
                 r"brief\s+(?:me\s+)?(?:on|about)",
@@ -74,6 +79,24 @@ class UnderstandingAgent(BaseAgent):
                 r"go\s+to\s+(?:the\s+)?(?:url|website)",
                 r"visit\s+(?:the\s+)?(?:url|website)",
             ],
+            "chat_with_document": [
+                r"chat\s+with\s+(?:my\s+)?(?:thesis|document|file)",
+                r"ask\s+(?:questions?\s+)?about\s+(?:my\s+)?(?:thesis|pdf)",
+                r"what\s+does\s+(?:my\s+)?(?:thesis|document)\s+say",
+            ],
+            "edit_document": [
+                r"edit\s+(?:parts\s+in|pages?\s+in|sections?\s+in)\s+(?:my\s+)?(?:thesis|file|document)",
+                r"rewrite\s+(?:section|page|part)",
+                r"improve\s+(?:section|page|part)",
+                r"change\s+(?:page|part|section)",
+            ],
+            "auto_cite": [
+                r"auto-cite",
+                r"do\s+auto\s+citation",
+                r"fix\s+citations",
+                r"add\s+references",
+                r"cite\s+this",
+            ],
         }
         
         # Entity extraction patterns
@@ -84,212 +107,183 @@ class UnderstandingAgent(BaseAgent):
             "url": r"(https?://[^\s]+)",
             "filename": r"(?:file\s+(?:named?|called))\s+([^\s,\.]+(?:\.[a-z]+)?)",
         }
+        
+    def _parse_slash_command(self, message: str) -> Optional[Dict[str, Any]]:
+        """Strictly parse slash commands like /uoj_phd n=120 topic='...'"""
+        if not message.strip().startswith("/"):
+            return None
+            
+        # Extract command
+        command_match = re.match(r"^/(\w+)", message)
+        if not command_match:
+            return None
+            
+        command = command_match.group(1)
+        args = {}
+        
+        # Parse arguments: key="value", key='value', or key=value
+        pattern = r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|([^"\'\s]+))'
+        for match in re.finditer(pattern, message):
+            key = match.group(1)
+            # Group 2 is double quotes, 3 is single quotes, 4 is no quotes
+            val = match.group(2) or match.group(3) or match.group(4)
+            args[key] = val
+            
+        return {"command": command, "args": args}
     
     async def run(self, context: AgentContext) -> AgentContext:
         """
-        Main understanding process.
-        
-        Steps:
-        1. Extract basic intent
-        2. Extract entities
-        3. Check conversation history
-        4. Determine goals
-        5. Plan required actions
+        Main understanding process using DeepSeek LLM.
         """
-        await self.report_status(AgentStatus.THINKING, "🧠 Understanding your request...")
+        await self.report_status(AgentStatus.THINKING, "🧠 Analyzing request...")
         
-        message = context.user_message
-        msg_lower = message.lower().strip()
-        
-        # Step 1: Classify intent
-        await self.report_status(AgentStatus.WORKING, "📋 Analyzing intent...")
-        intent = self._classify_intent(msg_lower)
-        context.intent = intent
-        
-        # Step 2: Extract entities
-        await self.report_status(AgentStatus.WORKING, "🔍 Extracting key information...")
-        entities = self._extract_entities(message)
-        context.entities = entities
-        
-        # Step 3: Check for user info (name, etc.)
-        if "name" in entities:
-            context.user_name = entities["name"]
-            await self.report_status(AgentStatus.WORKING, f"👋 Hello {entities['name']}!")
-        
-        # Step 4: Determine goals
-        await self.report_status(AgentStatus.WORKING, "🎯 Identifying goals...")
-        goals = self._determine_goals(intent, entities, message)
-        context.goals = goals
-        
-        # Step 5: Plan required actions
-        await self.report_status(AgentStatus.WORKING, "📝 Planning actions...")
-        actions = self._plan_actions(intent, entities, goals)
-        context.required_actions = actions
-        context.action_plan = [{"action": a, "status": "pending"} for a in actions]
-        
-        # Build summary for other agents
-        understanding_summary = {
-            "intent": intent,
-            "entities": entities,
-            "goals": goals,
-            "required_actions": actions,
-            "confidence": self._calculate_confidence(intent, entities, goals)
-        }
-        
-        await self.report_status(
-            AgentStatus.COMPLETED,
-            f"✅ Understood: {intent} | Goals: {len(goals)} | Actions: {len(actions)}",
-            data=understanding_summary
-        )
-        
-        return context
-    
-    def _classify_intent(self, msg_lower: str) -> str:
-        """Classify the user's intent from message."""
-        for intent, patterns in self.intent_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, msg_lower):
-                    return intent
-        
-        # Default to question if ends with ?
-        if msg_lower.endswith("?"):
-            return "question"
-        
-        # Default to general conversation
-        return "conversation"
-    
-    def _extract_entities(self, message: str) -> Dict[str, Any]:
-        """Extract named entities from message."""
-        entities = {}
-        
-        for entity_type, pattern in self.entity_patterns.items():
-            matches = re.findall(pattern, message, re.IGNORECASE)
-            if matches:
-                # Take first match for single entities, all for lists
-                if entity_type in ["url"]:
-                    entities[entity_type] = matches
+        try:
+            # 1. Deterministic Command Parsing
+            cmd = self._parse_slash_command(context.user_message)
+            if cmd:
+                # Map commands to intents
+                if cmd["command"] in ["uoj_phd", "thesis", "generate_thesis", "uoj_general"]:
+                    context.intent = "workflow_thesis"
+                    # Default actions for thesis generation
+                    context.required_actions = ["spawn_action_agent"]
+                    
+                    # Set format based on command
+                    if cmd["command"] == "uoj_general":
+                         context.entities["thesis_type"] = "general"
+                    elif cmd["command"] == "uoj_phd":
+                         context.entities["thesis_type"] = "phd"
                 else:
-                    entities[entity_type] = matches[0] if len(matches) == 1 else matches
-        
-        # Extract quoted content
-        quoted = re.findall(r'"([^"]+)"', message)
-        if quoted:
-            entities["quoted_content"] = quoted
-        
-        # Extract word content from "with word X" pattern
-        word_match = re.search(r'with\s+word\s+(.+?)(?:\s|$|,|\.)', message, re.IGNORECASE)
-        if word_match:
-            entities["word_content"] = word_match.group(1).strip()
-        
-        return entities
-    
-    def _determine_goals(self, intent: str, entities: Dict, message: str) -> List[str]:
-        """Determine the user's goals based on intent and entities."""
-        goals = []
-        
-        if intent == "search_web":
-            topic = entities.get("topic", message)
-            goals.append(f"Find information about: {topic}")
-            goals.append("Present search results clearly")
-        
-        elif intent == "search_papers":
-            topic = entities.get("topic", message)
-            goals.append(f"Find academic papers about: {topic}")
-            goals.append("Extract key findings")
-            if "summarize" in message.lower() or "summary" in message.lower():
-                goals.append("Synthesize findings into summary")
-        
-        elif intent == "create_file":
-            filename = entities.get("filename", "new_file")
-            content = entities.get("word_content", entities.get("quoted_content", [""])[0] if entities.get("quoted_content") else "")
-            goals.append(f"Create file: {filename}")
-            if content:
-                goals.append(f"Include content: {content}")
-        
-        elif intent == "summarize":
-            topic = entities.get("topic", message)
-            goals.append(f"Summarize: {topic}")
-            goals.append("Make it concise and clear")
-        
-        elif intent == "question":
-            goals.append("Answer the user's question accurately")
-            goals.append("Provide helpful context")
-        
-        elif intent == "greeting":
-            goals.append("Greet the user warmly")
-            goals.append("Offer assistance")
-        
-        elif intent == "thesis":
-            goals.append("Help with academic writing")
-            goals.append("Follow university formatting")
-        
-        elif intent == "browse":
-            urls = entities.get("url", [])
-            if urls:
-                goals.append(f"Navigate to: {urls[0]}")
-                goals.append("Extract relevant content")
-        
-        else:
-            goals.append("Understand and assist with request")
-        
-        return goals
-    
-    def _plan_actions(self, intent: str, entities: Dict, goals: List[str]) -> List[str]:
-        """Plan the sequence of actions needed."""
-        actions = []
-        
-        if intent == "search_web":
-            actions.append("spawn_research_agent")
-            actions.append("search_web")
-            actions.append("present_results")
-        
-        elif intent == "search_papers":
-            actions.append("spawn_research_agent")
-            actions.append("search_papers")
-            if any("summary" in g.lower() or "synthesize" in g.lower() for g in goals):
-                actions.append("spawn_writer_agent")
-                actions.append("write_summary")
-        
-        elif intent == "create_file":
-            actions.append("spawn_action_agent")
-            actions.append("create_file")
-        
-        elif intent == "browse":
-            actions.append("spawn_browser_agent")
-            actions.append("navigate")
-            actions.append("extract_content")
-        
-        elif intent == "thesis":
-            actions.append("spawn_research_agent")
-            actions.append("gather_context")
-            actions.append("spawn_writer_agent")
-            actions.append("write_content")
-            actions.append("spawn_verification_agent")
-            actions.append("verify_quality")
-        
-        elif intent in ["question", "conversation", "greeting"]:
-            actions.append("direct_llm_response")
-        
-        return actions
-    
-    def _calculate_confidence(self, intent: str, entities: Dict, goals: List[str]) -> float:
-        """Calculate confidence in understanding."""
-        confidence = 0.5  # Base
-        
-        # Intent clarity
-        if intent not in ["conversation"]:
-            confidence += 0.2
-        
-        # Entity extraction success
-        if entities:
-            confidence += min(0.2, len(entities) * 0.05)
-        
-        # Goal clarity
-        if goals:
-            confidence += min(0.1, len(goals) * 0.03)
-        
-        return min(1.0, confidence)
+                    context.intent = "execute_code" # Default fallback
+                
+                context.entities.update(cmd["args"])
+                
+                # Specific entity handlings
+                if "topic" in context.entities:
+                     context.entities["topic"] = context.entities["topic"].strip('"\'')
+                
+                context.goals = [f"Execute command: {cmd['command']}"]
+                
+                await self.report_status(AgentStatus.COMPLETED, f"✅ Command Parsed: {cmd['command']}", data=context.entities)
+                return context
 
+            from services.deepseek_direct import deepseek_direct_service
+            
+            # Build prompt
+            prompt = f"""You are the customized Understanding Agent for 'AntiGravity'—a PhD-level research assistant.
+You are a PhD-level architect. Your first priority is to ensure the thesis follows a correct academic structure.
+
+User Request: "{context.user_message}"
+User Context: {context.user_preferences}
+Workspace Files: {context.available_files}
+History: {context.conversation_history[-8:] if context.conversation_history else "None"}
+
+PHD PROTOCOL (CRITICAL):
+1. Template Discovery: If the user wants a chapter or a thesis, look in 'Workspace Files' for 'outline.json', 'template.md', or 'structure.md'.
+2. University Context: If the user mentions a location (e.g., South Sudan), recognize that specific university templates (like 'UoJ' for University of Juba) may be applicable.
+3. Proactive Questioning: If NO outline/template exists and this is the start of a project, your 'reasoning' MUST suggest asking the user: "Do you have a specific university template or outline you'd like me to follow?"
+4. Workflow: If it's a thesis task, set intent to 'workflow_thesis'.
+5. Data Analysis: If the user asks for charts, graphs, plots, or 'analysis' (e.g., 'aalysis', 'generate chats', 'bar chart'), set intent to 'data_analysis'.
+
+Capabilities:
+1. Thesis: 'workflow_thesis' for structure/chapters.
+2. Research: 'research' for data.
+3. Writing: 'create_file' / 'edit_file'.
+4. Chat: Greetings or general advice.
+
+Output JSON ONLY:
+{{
+    "intent": "workflow_thesis" | "research" | "create_file" | "edit_file" | "delete_file" | "open_file" | "modify_file" | "insert_media" | "chat" | "chat_with_document" | "edit_document" | "auto_cite" | "create_image" | "execute_code" | "data_analysis",
+    "required_analysis": "statistical" | "exploratory" | "forecasting" | "none",
+    "confidence": 0.0-1.0,
+    "entities": {{ "topic": "...", "filename": "...", "university": "...", "outline_found": true|false, "sections": ["..."], "image_prompt": "detailed prompt for AI generator", "paragraph_index": number, "line_number": number, "action_type": "insert" | "delete" | "replace", "content_update": "..." }},
+    "missing_info": ["template_confirmation", "outline_details"],
+    "goals": ["precisely what we are doing step-by-step (e.g., 'Gather statistics on Sudan food security', 'Generate a bar chart of displacement drivers', 'Update essay with analysis')"],
+    "next_agent": "research" | "action" | "writer" | "none",
+    "reasoning": "PhD architect reasoning. List the discrete tasks to be shown in the UI checklist."
+}}
+"""
+            # Call DeepSeek
+            response = await deepseek_direct_service.generate_content(
+                prompt=prompt,
+                system_prompt="You are a strict JSON-outputting analysis agent.",
+                temperature=0.1
+            )
+            
+            # Parse JSON
+            import json
+            cleaned_response = response.replace("```json", "").replace("```", "").strip()
+            analysis = json.loads(cleaned_response)
+            
+            # Update Context
+            context.intent = analysis.get("intent")
+            context.entities = analysis.get("entities", {})
+            context.goals = analysis.get("goals", [])
+            
+            # Determine Actions and Next Agent
+            next_agent = analysis.get("next_agent")
+            
+            # Reset actions and build based on analysis
+            context.required_actions = []
+            
+            # 1. Check for Research Need (keywords in message or explicit agent choice)
+            research_keywords = ["studies", "citation", "research", "papers", "factual", "real", "academic", "statistics", "data", "current", "latest", "search", "find", "trends"]
+            needs_research = next_agent == "research" or any(k in context.user_message.lower() for k in research_keywords)
+            print(f"DEBUG: needs_research={needs_research}")
+            
+            if needs_research:
+                context.required_actions.append("spawn_research_agent")
+                if "search_papers" not in context.required_actions:
+                    context.required_actions.append("search_papers")
+                if "search_web" not in context.required_actions:
+                    context.required_actions.append("search_web")
+
+            # 2. Check for Writing/Action Need
+            analysis_keywords = ["chart", "charting", "plot", "graph", "analysis", "aalysis", "analyze", "calculation", "statistic", "visualization", "chats"]
+            user_msg_lower = context.user_message.lower()
+            needs_analysis = context.intent in ["execute_code", "data_analysis"] or any(k in user_msg_lower for k in analysis_keywords)
+            print(f"DEBUG: needs_analysis={needs_analysis}, user_msg='{user_msg_lower[:50]}...'")
+
+            if next_agent == "action" or context.intent in ["create_file", "edit_file", "delete_file", "open_file", "modify_file", "insert_media", "summarize_document", "workflow_thesis", "chat_with_document", "edit_document", "auto_cite", "create_image", "present_results", "execute_code", "data_analysis"] or needs_analysis:
+                 context.required_actions.append("spawn_action_agent")
+                 
+                 if needs_analysis and context.intent not in ["execute_code", "data_analysis"]:
+                     context.intent = "data_analysis"
+                 
+                 # NEW: If data analysis is needed, add it to action plan
+                 if context.intent in ["execute_code", "data_analysis"]:
+                     if "execute_code" not in context.required_actions:
+                         context.required_actions.append("execute_code")
+                     if "present_results" not in context.required_actions:
+                         context.required_actions.append("present_results")
+                     
+                     # Add to action_plan so ActionAgent knows what to do
+                     from services.agent_spawner import AgentAction
+                     context.action_plan.append(AgentAction(
+                         action="data_analysis",
+                         parameters={"type": analysis.get("required_analysis", "statistical")},
+                         description=f"Perform {analysis.get('required_analysis', 'statistical')} data analysis and generate charts"
+                     ))
+            elif next_agent == "writer":
+                 context.required_actions.append("spawn_writer_agent")
+            
+            # 3. Handle specific research intents
+            if context.intent == "research" and "spawn_research_agent" not in context.required_actions:
+                context.required_actions.append("spawn_research_agent")
+            
+            # Log understanding
+            await self.report_status(
+                AgentStatus.COMPLETED,
+                f"✅ Understood: {context.intent} | Next: {next_agent}",
+                data=analysis
+            )
+            
+            return context
+            
+        except Exception as e:
+            print(f"⚠️ Understanding Agent LLM failed: {e}")
+            # Fallback to simple classification (legacy logic could go here or just chat)
+            context.intent = "chat"
+            return context
 
 # Export for agent spawner
 __agent_class__ = UnderstandingAgent

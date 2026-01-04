@@ -107,7 +107,7 @@ class AuthService:
             email,
             username,
             password_hash,
-            datetime.utcnow().isoformat()
+            datetime.utcnow()
         )
         
         # Create default workspace for user
@@ -120,7 +120,7 @@ class AuthService:
             workspace_id,
             user_id,
             "My Workspace",
-            datetime.utcnow().isoformat()
+            datetime.utcnow()
         )
         
         return User(
@@ -130,7 +130,7 @@ class AuthService:
             workspaces=[workspace_id],
             created_at=datetime.utcnow().isoformat()
         )
-    
+
     async def login(self, email: str, password: str) -> dict:
         """
         Login user and return access token.
@@ -227,7 +227,7 @@ class AuthService:
             email=user_row['email'],
             username=user_row['username'],
             workspaces=[w['workspace_id'] for w in workspaces],
-            created_at=user_row['created_at']
+            created_at=user_row['created_at'].isoformat() if hasattr(user_row['created_at'], 'isoformat') else str(user_row['created_at'])
         )
         
         # Cache for next time
@@ -253,7 +253,7 @@ class AuthService:
             workspace_id,
             user_id,
             workspace_name,
-            datetime.utcnow().isoformat()
+            datetime.utcnow()
         )
         
         # Invalidate user cache (force refresh)

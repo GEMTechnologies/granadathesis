@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 import json
 
-from ..base_template.base_generator import BaseThesisGenerator
+from ..base_template import BaseThesisGenerator
 
 
 class UoJPhDGenerator(BaseThesisGenerator):

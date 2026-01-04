@@ -7,6 +7,8 @@ import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
 import { Alert } from '../ui/alert';
 import { Card } from '../ui/card';
+import { ParameterCollectionModal } from '../thesis/ParameterCollectionModal';
+import { ThesisParameters } from '../../lib/thesisParameters';
 
 interface Agent {
   id: string;
@@ -23,8 +25,15 @@ interface University {
   description: string;
 }
 
+interface Workflow {
+  command: string;
+  description: string;
+  icon: string;
+  category: string;
+}
+
 interface ChatBarProps {
-  onChatStart?: (message: string, mentionedAgents?: string[]) => void;
+  onChatStart?: (message: string, mentionedAgents?: string[], parameters?: ThesisParameters) => void;
   onFileUpload?: (files: File[]) => void;
   isProcessing?: boolean;
   placeholder?: string;
@@ -33,11 +42,19 @@ interface ChatBarProps {
   currentStage?: string;
 }
 
+const DEFAULT_WORKFLOWS: Workflow[] = [
+  { command: 'uoj_general', description: 'University of Juba General (Bachelor) Proposal', icon: '🎓', category: 'thesis' },
+  { command: 'uoj_phd', description: 'University of Juba PhD Thesis', icon: '🏛️', category: 'thesis' },
+  { command: 'generate-full-thesis', description: 'Generate complete PhD thesis (all 6 chapters)', icon: '📚', category: 'thesis' },
+  { command: 'generate-chapter1', description: 'Generate Chapter 1 (Introduction)', icon: '📖', category: 'thesis' },
+  { command: 'generate-chapter2', description: 'Generate Chapter 2 (Literature Review)', icon: '📚', category: 'thesis' },
+];
+
 export function ChatBar({
   onChatStart,
   onFileUpload,
   isProcessing = false,
-  placeholder = 'Ask me about your research, request content generation, or seek assistance... (use @ for agents, / for universities)',
+  placeholder = 'Ask me about your research, request content generation, or seek assistance... (use @ for agents, / for thesis commands)',
   onStop,
   currentStatus,
   currentStage
@@ -56,13 +73,17 @@ export function ChatBar({
   const [mentionedAgents, setMentionedAgents] = useState<string[]>([]);
   const [mentionStartPos, setMentionStartPos] = useState<number | null>(null);
 
-  // University slash command state
-  const [universities, setUniversities] = useState<University[]>([]);
-  const [showUniversities, setShowUniversities] = useState(false);
-  const [universityQuery, setUniversityQuery] = useState('');
-  const [selectedUniversityIndex, setSelectedUniversityIndex] = useState(0);
-  const [selectedUniversity, setSelectedUniversity] = useState<University | null>(null);
+  // Workflow slash command state
+  const [workflows, setWorkflows] = useState<Workflow[]>(DEFAULT_WORKFLOWS);
+  const [showWorkflows, setShowWorkflows] = useState(false);
+  const [workflowQuery, setWorkflowQuery] = useState('');
+  const [selectedWorkflowIndex, setSelectedWorkflowIndex] = useState(0);
   const [slashStartPos, setSlashStartPos] = useState<number | null>(null);
+
+  // Parameter collection modal state
+  const [showParameterModal, setShowParameterModal] = useState(false);
+  const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
+  const [initialParameters, setInitialParameters] = useState<Partial<ThesisParameters>>({});
 
   // Fetch agents on mount
   useEffect(() => {
@@ -75,11 +96,8 @@ export function ChatBar({
       const response = await fetch(`${backendUrl}/api/agents/list`);
       const data = await response.json();
       if (data.status === 'ok' && data.agents && data.agents.length > 0) {
-        // console.log('✅ Loaded agents:', data.agents);
         setAgents(data.agents);
       } else {
-        // Use default agents if API returns empty
-        // console.log('⚠️ No agents from API, using defaults');
         setAgents([
           { id: 'research', name: 'research', display_name: 'Research Agent', type: 'agent', health: 'healthy' },
           { id: 'writer', name: 'writer', display_name: 'Writer Agent', type: 'agent', health: 'healthy' },
@@ -91,7 +109,6 @@ export function ChatBar({
       }
     } catch (error) {
       console.error('Failed to fetch agents:', error);
-      // Set default agents on error
       setAgents([
         { id: 'research', name: 'research', display_name: 'Research Agent', type: 'agent', health: 'healthy' },
         { id: 'writer', name: 'writer', display_name: 'Writer Agent', type: 'agent', health: 'healthy' },
@@ -103,35 +120,32 @@ export function ChatBar({
     }
   };
 
-  // Fetch universities on mount
-  const fetchUniversities = async () => {
+  // Fetch workflows on mount
+  const fetchWorkflows = async () => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
-      const response = await fetch(`${backendUrl}/api/thesis/universities`);
+      const response = await fetch(`${backendUrl}/api/thesis/workflows`);
       const data = await response.json();
-      if (data.universities && data.universities.length > 0) {
-        // console.log('✅ Loaded universities:', data.universities);
-        setUniversities(data.universities);
+      if (data.workflows && data.workflows.length > 0) {
+        console.log('✅ Loaded workflows:', data.workflows);
+        // Combine API workflows with our critical defaults to ensure they exist
+        const apiWorkflows = data.workflows;
+        const missingDefaults = DEFAULT_WORKFLOWS.filter(dw =>
+          !apiWorkflows.some((aw: Workflow) => aw.command === dw.command)
+        );
+        setWorkflows([...missingDefaults, ...apiWorkflows]);
       } else {
-        // Use default universities if API returns empty
-        // console.log('⚠️ No universities from API, using defaults');
-        setUniversities([
-          { type: 'uoj_phd', name: 'University of Juba PhD', abbreviation: 'UoJ', description: 'PhD thesis template for University of Juba' },
-          { type: 'generic', name: 'Generic University', abbreviation: 'GEN', description: 'Generic thesis template' },
-        ]);
+        console.log('⚠️ No workflows from API, using defaults');
+        setWorkflows(DEFAULT_WORKFLOWS);
       }
     } catch (error) {
-      console.error('Failed to fetch universities:', error);
-      // Set default universities on error
-      setUniversities([
-        { type: 'uoj_phd', name: 'University of Juba PhD', abbreviation: 'UoJ', description: 'PhD thesis template for University of Juba' },
-        { type: 'generic', name: 'Generic University', abbreviation: 'GEN', description: 'Generic thesis template' },
-      ]);
+      console.error('Failed to fetch workflows:', error);
+      setWorkflows(DEFAULT_WORKFLOWS);
     }
   };
 
   useEffect(() => {
-    fetchUniversities();
+    fetchWorkflows();
   }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -179,7 +193,7 @@ export function ChatBar({
         setMentionQuery(query);
         setMentionStartPos(lastAtIndex);
         setSelectedMentionIndex(0);
-        setShowUniversities(false);
+        setShowWorkflows(false);
         // console.log('🔍 Showing mentions for query:', query, 'Agents:', agents.length);
       }
     } else {
@@ -188,26 +202,26 @@ export function ChatBar({
       setMentionStartPos(null);
     }
 
-    // Check for / slash command (universities)
+    // Check for / slash command (workflows)
     if (!atIsMoreRecent && lastSlashIndex !== -1) {
       const textAfterSlash = textBeforeCursor.substring(lastSlashIndex + 1);
       // Check if there's a space or newline after / (command ended)
       if (textAfterSlash.includes(' ') || textAfterSlash.includes('\n')) {
-        setShowUniversities(false);
-        setUniversityQuery('');
+        setShowWorkflows(false);
+        setWorkflowQuery('');
         setSlashStartPos(null);
       } else {
-        // Show universities dropdown
+        // Show workflows dropdown
         const query = textAfterSlash.toLowerCase();
-        setShowUniversities(true);
-        setUniversityQuery(query);
+        setShowWorkflows(true);
+        setWorkflowQuery(query);
         setSlashStartPos(lastSlashIndex);
-        setSelectedUniversityIndex(0);
-        // console.log('📚 Showing universities for query:', query, 'Universities:', universities.length);
+        setSelectedWorkflowIndex(0);
+        console.log('📚 Showing workflows for query:', query, 'Workflows:', workflows.length);
       }
     } else {
-      setShowUniversities(false);
-      setUniversityQuery('');
+      setShowWorkflows(false);
+      setWorkflowQuery('');
       setSlashStartPos(null);
     }
   };
@@ -237,25 +251,70 @@ export function ChatBar({
     }, 0);
   };
 
-  const insertUniversity = (university: University) => {
-    if (!textareaRef.current || slashStartPos === null) return;
+  const extractParametersFromMessage = (msg: string): Partial<ThesisParameters> => {
+    const params: Partial<ThesisParameters> = {};
 
-    const textBefore = message.substring(0, slashStartPos);
-    const textAfter = message.substring(textareaRef.current.selectionStart);
-    const newMessage = `${textBefore}/${university.type} ${textAfter}`;
+    // Extract topic: topic="Title" or topic: Title
+    const topicMatch = msg.match(/topic\s*[:=]\s*['"]?([^'"]+)['"]?/i);
+    if (topicMatch) params.topic = topicMatch[1];
 
-    setMessage(newMessage);
-    setSelectedUniversity(university);
-    setShowUniversities(false);
-    setUniversityQuery('');
+    // Extract case study: case_study="Juba"
+    const caseMatch = msg.match(/case[ _]study\s*[:=]\s*['"]?([^'"]+)['"]?/i);
+    if (caseMatch) params.caseStudy = caseMatch[1];
+
+    // Extract sample size: n=120
+    const nMatch = msg.match(/\b(n|sample[ _]size)\s*[:=]\s*(\d+)/i);
+    if (nMatch) params.sampleSize = parseInt(nMatch[2]);
+
+    // Extract design: design="mixed"
+    const designMatch = msg.match(/design\s*[:=]\s*['"]?(quantitative|qualitative|mixed)['"]?/i);
+    if (designMatch) params.researchDesign = designMatch[1] as any;
+
+    // Fallback: If no explicit topic tag, use all text after the command as the topic
+    if (!params.topic) {
+      // Strip the command itself (e.g. /uoj_phd)
+      const textWithoutCommand = msg.replace(/^\/[a-zA-Z0-9_-]+/, '').trim();
+      if (textWithoutCommand && !textWithoutCommand.includes('=')) {
+        params.topic = textWithoutCommand;
+      }
+    }
+
+    return params;
+  };
+
+  const insertWorkflow = (workflow: Workflow) => {
+    // Close the workflow dropdown
+    setShowWorkflows(false);
+    setWorkflowQuery('');
     setSlashStartPos(null);
 
-    // Focus back on textarea
-    setTimeout(() => {
-      textareaRef.current?.focus();
-      const newCursorPos = slashStartPos + university.type.length + 2; // +2 for / and space
-      textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos);
-    }, 0);
+    const initialParams = extractParametersFromMessage(message);
+    setInitialParameters(initialParams);
+
+    // Clear the message
+    setMessage('');
+
+    // Show parameter collection modal
+    setSelectedWorkflow(workflow);
+    setShowParameterModal(true);
+  };
+
+  const handleParameterSubmit = (parameters: ThesisParameters) => {
+    if (!selectedWorkflow) return;
+
+    // Format the message with workflow command and parameters
+    const paramMessage = `/${selectedWorkflow.command} ${parameters.topic}${parameters.caseStudy ? ` in ${parameters.caseStudy}` : ''}`;
+
+    // Send the message with parameters as metadata
+    if (onChatStart) {
+      onChatStart(paramMessage, mentionedAgents.length > 0 ? mentionedAgents : undefined, parameters);
+    }
+
+    setMessage('');
+    setMentionedAgents([]);
+    setShowParameterModal(false);
+    setSelectedWorkflow(null);
+    setInitialParameters({});
   };
 
   const filteredAgents = agents.filter(agent =>
@@ -263,9 +322,9 @@ export function ChatBar({
     agent.display_name.toLowerCase().includes(mentionQuery)
   );
 
-  const filteredUniversities = universities.filter(uni =>
-    uni.type.toLowerCase().includes(universityQuery) ||
-    uni.name.toLowerCase().includes(universityQuery)
+  const filteredWorkflows = workflows.filter(wf =>
+    wf.command.toLowerCase().includes(workflowQuery) ||
+    wf.description.toLowerCase().includes(workflowQuery)
   );
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -298,36 +357,36 @@ export function ChatBar({
       }
     }
 
-    if (showUniversities) {
+    if (showWorkflows) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedUniversityIndex(prev =>
-          prev < filteredUniversities.length - 1 ? prev + 1 : prev
+        setSelectedWorkflowIndex(prev =>
+          prev < filteredWorkflows.length - 1 ? prev + 1 : prev
         );
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setSelectedUniversityIndex(prev => prev > 0 ? prev - 1 : 0);
+        setSelectedWorkflowIndex(prev => prev > 0 ? prev - 1 : 0);
         return;
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
-        if (filteredUniversities[selectedUniversityIndex]) {
-          insertUniversity(filteredUniversities[selectedUniversityIndex]);
+        if (filteredWorkflows[selectedWorkflowIndex]) {
+          insertWorkflow(filteredWorkflows[selectedWorkflowIndex]);
         }
         return;
       }
       if (e.key === 'Escape') {
         e.preventDefault();
-        setShowUniversities(false);
-        setUniversityQuery('');
+        setShowWorkflows(false);
+        setWorkflowQuery('');
         setSlashStartPos(null);
         return;
       }
     }
 
-    if (e.key === 'Enter' && !e.shiftKey && !showMentions && !showUniversities) {
+    if (e.key === 'Enter' && !e.shiftKey && !showMentions && !showWorkflows) {
       e.preventDefault();
       handleSubmit(e);
     }
@@ -399,20 +458,47 @@ export function ChatBar({
 
       {/* Main Input Container */}
       <div className={cn(
-        "relative rounded-3xl transition-all duration-500 shadow-2xl overflow-hidden",
+        "relative rounded-3xl transition-all duration-500 shadow-2xl overflow-visible",
         isFocused
           ? "bg-background border-primary/30 ring-4 ring-primary/5"
           : "bg-muted/30 border-transparent backdrop-blur-sm"
       )}>
         <form onSubmit={handleSubmit} className="flex flex-col">
+          {/* Upload Progress Indicator Overlay */}
+          {uploadedFiles.length > 0 && uploadedFiles.some(f => (f as any).progress !== undefined) && (
+            <div className="absolute inset-0 z-20 bg-background/90 backdrop-blur-sm flex items-center justify-center rounded-3xl animate-in fade-in duration-200">
+              <div className="w-3/4 max-w-sm space-y-3">
+                {uploadedFiles.map((file: any, index) => (
+                  file.progress !== undefined && (
+                    <div key={index} className="space-y-1">
+                      <div className="flex justify-between text-xs font-medium">
+                        <span className="truncate max-w-[70%]">{file.name}</span>
+                        <span className="text-primary">{file.progress}%</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300 ease-out"
+                          style={{ width: `${file.progress}%` }}
+                        />
+                      </div>
+                    </div>
+                  )
+                ))}
+                <div className="text-center text-[10px] text-muted-foreground animate-pulse mt-2">
+                  Uploading files to workspace...
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Files Preview Row (Integrated) */}
-          {uploadedFiles.length > 0 && (
+          {uploadedFiles.length > 0 && !uploadedFiles.some(f => (f as any).progress !== undefined) && (
             <div className="flex flex-wrap gap-2 p-3 bg-muted/20 border-b border-border/10">
               {uploadedFiles.map((file, index) => (
                 <div key={index} className="flex items-center gap-2 px-2 py-1 rounded-lg bg-background border border-border/40 shadow-sm animate-in zoom-in-95 duration-200">
                   {getFileIcon(file)}
                   <span className="text-[10px] font-semibold truncate max-w-[120px]">{file.name}</span>
-                  <button onClick={() => removeFile(index)} className="hover:text-destructive transition-colors">
+                  <button onClick={() => removeFile(index)} className="hover:text-destructive transition-colors" type="button">
                     <X className="w-3 h-3" />
                   </button>
                 </div>
@@ -442,7 +528,7 @@ export function ChatBar({
                 rows={1}
                 className={cn(
                   "w-full resize-none bg-transparent px-4 py-3 pr-10",
-                  "text-sm font-medium placeholder:text-muted-foreground/50",
+                  "text-sm font-medium text-foreground placeholder:text-muted-foreground/50",
                   "focus:outline-none disabled:opacity-50 max-h-48"
                 )}
                 disabled={isProcessing}
@@ -450,11 +536,11 @@ export function ChatBar({
               />
 
               {/* Redesigned Mentions & Slash Dropdowns */}
-              {(showMentions || showUniversities) && (
-                <div data-dropdown className="absolute bottom-full left-0 mb-4 w-full max-w-[320px] animate-in slide-in-from-bottom-2 duration-200">
-                  <Card className="p-1.5 shadow-2xl border-primary/10 backdrop-blur-xl bg-background/95 rounded-2xl">
-                    <div className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground/60 px-3 py-2">
-                      {showMentions ? 'Mention Agent' : 'Select Template'}
+              {(showMentions || showWorkflows) && (
+                <div data-dropdown className="absolute bottom-full left-0 mb-4 w-full max-w-[420px] animate-in slide-in-from-bottom-2 duration-200 z-[100]">
+                  <div className="p-1.5 shadow-2xl border border-border backdrop-blur-xl bg-card rounded-2xl" style={{ backgroundColor: '#262626', borderColor: '#393939' }}>
+                    <div className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground px-3 py-2" style={{ color: '#8D8D8D' }}>
+                      {showMentions ? 'Mention Agent' : 'Thesis Commands'}
                     </div>
                     <div className="max-h-60 overflow-y-auto space-y-0.5 custom-scrollbar">
                       {showMentions ? (
@@ -465,38 +551,39 @@ export function ChatBar({
                             onMouseDown={(e) => { e.preventDefault(); insertMention(agent); }}
                             className={cn(
                               "w-full text-left px-3 py-2.5 rounded-xl text-xs flex items-center gap-3 transition-all",
-                              index === selectedMentionIndex ? "bg-primary text-primary-foreground shadow-lg scale-[1.02]" : "hover:bg-muted text-foreground"
+                              index === selectedMentionIndex ? "bg-primary text-primary-foreground shadow-lg scale-[1.02]" : "hover:bg-muted text-card-foreground"
                             )}
                           >
                             <span className="text-base">{getAgentIcon(agent.name)}</span>
                             <div className="flex-1">
                               <div className="font-bold">{agent.display_name}</div>
-                              <div className={cn("text-[9px] uppercase tracking-tighter", index === selectedMentionIndex ? "text-primary-foreground/70" : "text-muted-foreground/70")}>{agent.type}</div>
+                              <div className={cn("text-[9px] uppercase tracking-tighter", index === selectedMentionIndex ? "text-primary-foreground/70" : "text-muted-foreground")}>{agent.type}</div>
                             </div>
                             {mentionedAgents.includes(agent.id) && <Check className="w-3 h-3" />}
                           </button>
                         ))
                       ) : (
-                        filteredUniversities.map((uni, index) => (
+                        filteredWorkflows.map((workflow, index) => (
                           <button
-                            key={uni.type}
+                            key={workflow.command}
                             type="button"
-                            onMouseDown={(e) => { e.preventDefault(); insertUniversity(uni); }}
+                            onMouseDown={(e) => { e.preventDefault(); insertWorkflow(workflow); }}
                             className={cn(
                               "w-full text-left px-3 py-2.5 rounded-xl text-xs flex items-center gap-3 transition-all",
-                              index === selectedUniversityIndex ? "bg-primary text-primary-foreground shadow-lg scale-[1.02]" : "hover:bg-muted text-foreground"
+                              index === selectedWorkflowIndex ? "bg-primary text-primary-foreground shadow-lg scale-[1.02]" : "hover:bg-muted text-card-foreground"
                             )}
+                            style={index !== selectedWorkflowIndex ? { color: '#F4F4F4' } : undefined}
                           >
-                            <BookOpen className="w-4 h-4" />
+                            <span className="text-lg">{workflow.icon}</span>
                             <div className="flex-1">
-                              <div className="font-bold">{uni.name}</div>
-                              <div className={cn("text-[9px] uppercase tracking-tighter text-muted-foreground/70", index === selectedUniversityIndex && "text-primary-foreground/70")}>{uni.abbreviation}</div>
+                              <div className="font-bold">/{workflow.command}</div>
+                              <div className={cn("text-[9px] tracking-tight", index === selectedWorkflowIndex ? "text-primary-foreground/70" : "text-muted-foreground")} style={{ color: index === selectedWorkflowIndex ? undefined : '#8D8D8D' }}>{workflow.description}</div>
                             </div>
                           </button>
                         ))
                       )}
                     </div>
-                  </Card>
+                  </div>
                 </div>
               )}
             </div>
@@ -554,9 +641,24 @@ export function ChatBar({
       {/* Footer Text */}
       <div className="mt-3 px-4 flex justify-center">
         <p className="text-[10px] font-medium text-muted-foreground/40 text-center tracking-wide">
-          Shift + Enter for new line • @ mention agents • / university templates
+          Shift + Enter for new line • @ mention agents • / thesis commands
         </p>
       </div>
+
+      {selectedWorkflow && (
+        <ParameterCollectionModal
+          isOpen={showParameterModal}
+          onClose={() => {
+            setShowParameterModal(false);
+            setSelectedWorkflow(null);
+            setInitialParameters({});
+          }}
+          onSubmit={handleParameterSubmit}
+          workflowCommand={selectedWorkflow.command}
+          workflowDescription={selectedWorkflow.description}
+          initialParameters={initialParameters}
+        />
+      )}
     </div>
   );
 }

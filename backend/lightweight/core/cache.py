@@ -139,3 +139,5 @@ def cached(ttl: int = 3600, key_prefix: str = ""):
 
 # Convenience alias
 cache = CacheLayer
+Cache = CacheLayer
+

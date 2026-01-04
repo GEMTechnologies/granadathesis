@@ -48,7 +48,8 @@ class Chapter6Generator:
         chapter_three_content: str = "",
         chapter_four_content: str = "",
         chapter_five_content: str = "",
-        output_dir: str = None
+        output_dir: str = None,
+        sample_size: int = None
     ):
         """
         Initialise Chapter 6 generator.
@@ -500,7 +501,8 @@ def generate_chapter6(
     chapter_three_content: str = "",
     chapter_four_content: str = "",
     chapter_five_content: str = "",
-    output_dir: str = None
+    output_dir: str = None,
+    **kwargs
 ) -> str:
     """
     Generate Chapter 6 content.
@@ -528,7 +530,8 @@ def generate_chapter6(
         chapter_three_content=chapter_three_content,
         chapter_four_content=chapter_four_content,
         chapter_five_content=chapter_five_content,
-        output_dir=output_dir
+        output_dir=output_dir,
+        sample_size=kwargs.get('sample_size')
     )
     
     return generator.generate_full_chapter()

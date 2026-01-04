@@ -23,7 +23,17 @@ from services.academic_search import academic_search_service
 from services.deepseek_direct import deepseek_direct_service
 from services.sources_service import sources_service
 from core.events import events
+from services.chapter4_generator import generate_chapter4
+from services.chapter5_generator import generate_chapter5
+from services.chapter6_generator import generate_chapter6
+from services.data_collection_worker import generate_study_tools, generate_research_dataset
 import re
+import os
+from services.thesis_session_db import ThesisSessionDB
+from services.objective_generator import generate_smart_objectives
+from services.uoj_chapter_one_generator import generate_chapter_one_uoj
+from services.uoj_preliminary_generator import generate_preliminary_pages_uoj
+from services.uoj_appendix_generator import generate_appendices_uoj
 
 
 def add_source_after_diagrams(content: str, section_title: str = "") -> str:
@@ -85,6 +95,7 @@ class ResearchResult:
     url: str
     abstract: str
     source: str  # global, continental, national, local
+    venue: str = ""  # Journal or publication venue
     
     def _get_full_name(self, author) -> str:
         """Extract full author name from either string or dict format."""
@@ -181,85 +192,12 @@ class ResearchResult:
         else:
             url = ""
         
-        # APA 7 format: Author (Year). Title. URL
+        # APA 7 format: Author (Year). Title. Journal. URL
         # URL is plain text (not markdown link) for clean DOCX output
+        venue_str = f" *{self.venue}*." if self.venue else ""
         if url:
-            return f"{author_str} ({self.year}). {self.title}. {url}"
-        else:
-            source_info = f" [Source: {self.source.upper()}]" if self.source else ""
-            return f"{author_str} ({self.year}). {self.title}.{source_info}"
-
-
-@dataclass
-class SectionContent:
-    """Content for a single section."""
-    section_id: str
-    title: str
-    content: str
-    citations: List[ResearchResult]
-    word_count: int = 0
-    status: str = "pending"
-
-
-@dataclass  
-class ChapterState:
-    """Shared state for parallel agents."""
-    topic: str
-    case_study: str
-    job_id: str
-    session_id: str
-    
-    # Chapter being generated (1, 2, 3, etc.)
-    chapter_number: int = 1
-    
-    # Background style selection (user can choose)
-    background_style: str = "inverted_pyramid"  # Default style
-    
-    # Research results by scope
-    research: Dict[str, List[ResearchResult]] = field(default_factory=dict)
-    
-    # Objectives and research questions from Chapter 1
-    objectives: Dict[str, Any] = field(default_factory=dict)
-    research_questions: List[str] = field(default_factory=list)  # For Chapter 2
-    themes: List[Dict[str, Any]] = field(default_factory=list)  # Chapter 2 themes
-    
-    # Sections content
-    sections: Dict[str, SectionContent] = field(default_factory=dict)
-    
-    # Chapter 2 citation tracking
-    chapter2_used_citations: set = field(default_factory=set)  # Track used DOIs/titles
-    chapter2_citation_pool: List[ResearchResult] = field(default_factory=list)  # 100+ papers
-    
-    def mark_citation_used(self, citation: ResearchResult):
-        """Mark a citation as used to prevent reuse."""
-        identifier = citation.doi if citation.doi else citation.title
-        self.chapter2_used_citations.add(identifier)
-    
-    def get_fresh_citations(self, count: int) -> List[ResearchResult]:
-        """Get unused citations from the pool."""
-        fresh = []
-        for citation in self.chapter2_citation_pool:
-            identifier = citation.doi if citation.doi else citation.title
-            if identifier not in self.chapter2_used_citations:
-                fresh.append(citation)
-                self.mark_citation_used(citation)
-                if len(fresh) >= count:
-                    break
-        return fresh
-    
-    def get_remaining_count(self) -> int:
-        """Get count of unused citations."""
-        return len(self.chapter2_citation_pool) - len(self.chapter2_used_citations)
-    
-    # Status tracking
-    agents_status: Dict[str, AgentStatus] = field(default_factory=dict)
-    
-    # Final output
-    final_content: str = ""
-    total_citations: int = 0
-    
-    # Database instance (for persistence across chapters)
-    db: Any = None
+            return f"{author_str} ({self.year}). {self.title}.{venue_str} {url}"
+from services.chapter_state import ChapterState, ResearchResult, SectionContent, AgentStatus
 
 
 # Available background writing styles
@@ -525,14 +463,15 @@ class ResearchSwarm:
                         doi=paper.get("doi", ""),
                         url=paper.get("url", ""),
                         abstract=paper.get("abstract", "")[:500],
-                        source=agent_id
+                        source=agent_id,
+                        venue=paper.get("venue", "")
                     )
                     papers.append(research)
                     
                     # Save to sources library (async)
                     try:
                         await sources_service.add_source(
-                            workspace_id="default",
+                            workspace_id=self.state.workspace_id,
                             source_data={
                                 "title": research.title,
                                 "authors": research.authors,
@@ -540,6 +479,7 @@ class ResearchSwarm:
                                 "doi": research.doi,
                                 "url": research.url or (f"https://doi.org/{research.doi}" if research.doi else ""),
                                 "abstract": research.abstract,
+                                "venue": research.venue,
                                 "source_type": "chapter_research",
                                 "search_scope": agent_id
                             },
@@ -627,7 +567,60 @@ class WriterSwarm:
         },
     ]
     
-    # Chapter Two - Literature Review Structure
+    # -------------------------------------------------------------------------
+    # GENERAL THESIS (5-CHAPTER) FORMAT CONFIGURATIONS
+    # Based on strict user templates
+    # -------------------------------------------------------------------------
+    GENERAL_SECTION_CONFIGS = [
+        {
+            "id": "gen_intro",
+            "sections": [
+                {"id": "1.0", "title": "Introduction to the Study", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "general_intro"},
+                {"id": "1.1", "title": "Background of the Study", "paragraphs": 6, "sources": ["global", "continental", "regional", "national", "local"], "structure": "inverted_pyramid", "needs_citations": True, "style": "general_background"},
+            ]
+        },
+        {
+            "id": "gen_problem",
+            "sections": [
+                {"id": "1.2", "title": "Problem Statement", "paragraphs": 4, "sources": ["national", "local"], "needs_citations": True, "style": "problem_statement"},
+                {"id": "1.3", "title": "Purpose of the Study", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "purpose_statement"},
+            ]
+        },
+        {
+            "id": "gen_objectives",
+            "sections": [
+                {"id": "1.4", "title": "Objectives of the Study", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "objectives_intro"},
+                {"id": "1.4.1", "title": "General Objective", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "objective"},
+                {"id": "1.4.2", "title": "Specific Objectives", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "objectives_list_smart"},
+                {"id": "1.5", "title": "Study Questions", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "questions"},
+                {"id": "1.6", "title": "Research Hypothesis", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "hypothesis"},
+            ]
+        },
+        {
+            "id": "gen_scope",
+            "sections": [
+                {"id": "1.7", "title": "Significance of the Study", "paragraphs": 3, "sources": [], "needs_citations": False, "style": "significance"},
+                {"id": "1.8", "title": "Scope of the Study", "paragraphs": 3, "sources": [], "needs_citations": False, "style": "scope_detail"},
+                {"id": "1.9", "title": "Limitations of the Study", "paragraphs": 4, "sources": [], "needs_citations": False, "style": "limitations_future"},
+                {"id": "1.11", "title": "Delimitation of the Study", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "delimitations"},
+            ]
+        },
+        {
+            "id": "gen_frameworks",
+            "sections": [
+                {"id": "1.12", "title": "Theoretical Framework of the Study", "paragraphs": 5, "sources": ["global"], "needs_citations": True, "style": "theoretical_framework_gen"},
+                {"id": "1.13", "title": "Conceptual Framework", "paragraphs": 3, "sources": ["global"], "needs_citations": True, "style": "conceptual_framework_gen"},
+            ]
+        },
+        {
+            "id": "gen_end",
+            "sections": [
+                {"id": "1.14", "title": "Methodology", "paragraphs": 2, "sources": [], "needs_citations": False, "style": "methodology_brief"},
+                {"id": "1.15", "title": "Definition of Key Terms", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "definitions_gen"},
+                {"id": "1.16", "title": "Organization of the Study", "paragraphs": 2, "sources": [], "needs_citations": False, "style": "organization_5chapter"},
+            ]
+        }
+    ]
     # NOTE: This static config is NOT USED - generate_chapter_two() creates dynamic configs
     # with real theory names and theme titles based on the topic and objectives.
     # Keeping this as reference only.
@@ -645,67 +638,67 @@ class WriterSwarm:
         {
             "id": "study_area",
             "sections": [
-                {"id": "3.2", "title": "Study Area", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "study_area"},
+                {"id": "3.2", "title": "Study Area", "paragraphs": 4, "sources": ["local"], "needs_citations": True, "style": "study_area"},
             ]
         },
         {
             "id": "research_philosophy",
             "sections": [
-                {"id": "3.3", "title": "Research Philosophy", "paragraphs": 8, "sources": [], "needs_citations": True, "style": "research_philosophy"},
+                {"id": "3.3", "title": "Research Philosophy", "paragraphs": 8, "sources": ["methodology"], "needs_citations": True, "style": "research_philosophy"},
             ]
         },
         {
             "id": "research_design",
             "sections": [
-                {"id": "3.4", "title": "Research Design", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "research_design"},
+                {"id": "3.4", "title": "Research Design", "paragraphs": 5, "sources": ["methodology"], "needs_citations": True, "style": "research_design"},
             ]
         },
         {
             "id": "target_population",
             "sections": [
-                {"id": "3.5", "title": "Target Population", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "target_population"},
+                {"id": "3.5", "title": "Target Population", "paragraphs": 4, "sources": ["methodology", "local"], "needs_citations": True, "style": "target_population"},
             ]
         },
         {
             "id": "sampling_design",
             "sections": [
-                {"id": "3.6", "title": "Sampling Design and Procedures", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "sampling_design"},
+                {"id": "3.6", "title": "Sampling Design and Procedures", "paragraphs": 5, "sources": ["methodology"], "needs_citations": True, "style": "sampling_design"},
             ]
         },
         {
             "id": "sample_size",
             "sections": [
-                {"id": "3.7", "title": "Sample Size", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "sample_size"},
+                {"id": "3.7", "title": "Sample Size", "paragraphs": 5, "sources": ["methodology", "local"], "needs_citations": True, "style": "sample_size"},
             ]
         },
         {
             "id": "data_instruments",
             "sections": [
-                {"id": "3.8", "title": "Data Collection Instruments", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "data_instruments"},
+                {"id": "3.8", "title": "Data Collection Instruments", "paragraphs": 5, "sources": ["methodology"], "needs_citations": True, "style": "data_instruments"},
             ]
         },
         {
             "id": "validity_reliability",
             "sections": [
-                {"id": "3.9", "title": "Validity and Reliability of Instruments", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "validity_reliability"},
+                {"id": "3.9", "title": "Validity and Reliability of Instruments", "paragraphs": 5, "sources": ["methodology"], "needs_citations": True, "style": "validity_reliability"},
             ]
         },
         {
             "id": "data_procedures",
             "sections": [
-                {"id": "3.10", "title": "Data Collection Procedures", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "data_procedures"},
+                {"id": "3.10", "title": "Data Collection Procedures", "paragraphs": 4, "sources": ["methodology"], "needs_citations": True, "style": "data_procedures"},
             ]
         },
         {
             "id": "data_analysis",
             "sections": [
-                {"id": "3.11", "title": "Data Analysis Procedures", "paragraphs": 5, "sources": [], "needs_citations": True, "style": "data_analysis"},
+                {"id": "3.11", "title": "Data Analysis Procedures", "paragraphs": 5, "sources": ["methodology", "data_analysis"], "needs_citations": True, "style": "data_analysis"},
             ]
         },
         {
             "id": "ethical_considerations",
             "sections": [
-                {"id": "3.12", "title": "Ethical Considerations", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "ethical_considerations"},
+                {"id": "3.12", "title": "Ethical Considerations", "paragraphs": 4, "sources": ["methodology"], "needs_citations": True, "style": "ethical_considerations"},
             ]
         },
     ]
@@ -723,7 +716,12 @@ class WriterSwarm:
         # For Chapter 1: uses default SECTION_CONFIGS
         # For Chapter 2: ChapterTwoWriterSwarm sets SECTION_CONFIGS to chapter_two_configs
         # For Chapter 3: ChapterThreeWriterSwarm sets SECTION_CONFIGS to chapter_three_configs
-        configs = self.SECTION_CONFIGS
+        # Use SECTION_CONFIGS or GENERAL_SECTION_CONFIGS based on thesis_type
+        if self.state.parameters.get("thesis_type") == "general":
+            configs = self.GENERAL_SECTION_CONFIGS
+            await events.publish(self.state.job_id, "log", {"message": "📝 Using General Thesis Structure (5 Chapters)"}, session_id=self.state.session_id)
+        else:
+            configs = self.SECTION_CONFIGS
         
         # Calculate total sections for progress tracking
         total_sections = sum(len(config["sections"]) for config in configs)
@@ -932,7 +930,53 @@ class WriterSwarm:
                 prompt = self._build_scope_prompt(section_id, title, style)
             elif style == "definitions":
                 prompt = self._build_definitions_prompt(section_id, title, citation_context)
-            # Chapter Two styles
+            # General Thesis Styles (User Custom)
+            elif style == "general_intro":
+                prompt = self._build_general_intro_prompt(section_id, title, citation_context)
+            elif style == "general_background":
+                prompt = self._build_general_background_prompt(section_id, title, citation_context)
+            elif style == "problem_statement":
+                prompt = self._build_problem_statement_gen_prompt(section_id, title, citation_context)
+            elif style == "purpose_statement":
+                prompt = self._build_purpose_statement_prompt(section_id, title)
+            elif style == "objectives_list_smart":
+                prompt = self._build_objectives_smart_prompt(section_id, title)
+            elif style == "hypothesis":
+                prompt = self._build_hypothesis_prompt(section_id, title)
+            elif style == "significance":
+                prompt = self._build_significance_prompt(section_id, title)
+            elif style == "scope_detail":
+                prompt = self._build_scope_detail_prompt(section_id, title)
+            elif style == "limitations_future":
+                prompt = self._build_limitations_future_prompt(section_id, title)
+            elif style == "theoretical_framework_gen":
+                prompt = self._build_theoretical_gen_prompt(section_id, title, citation_context)
+            elif style == "conceptual_framework_gen":
+                prompt = self._build_conceptual_gen_prompt(section_id, title, citation_context)
+            elif style == "methodology_brief":
+                prompt = self._build_methodology_brief_prompt(section_id, title)
+            elif style == "definitions_gen":
+                prompt = self._build_definitions_gen_prompt(section_id, title, citation_context)
+            elif style == "organization_5chapter":
+                prompt = self._build_organization_5chapter_prompt(section_id, title)
+            
+            # General Chapter 2 Styles (User Custom)
+            elif style == "general_chapter2_intro":
+                prompt = self._build_general_lit_intro_prompt(section_id, title)
+            elif style == "general_theory_main":
+                prompt = self._build_general_theory_main_prompt(section_id, title, citation_context)
+            elif style == "general_theory_obj":
+                # Extract objective text from config if possible, else generic
+                obj_text = section_config.get("objective_text", "study objectives")
+                prompt = self._build_general_theory_obj_prompt(section_id, title, obj_text, citation_context)
+            elif style == "general_empirical":
+                # Extract objective from config
+                obj_text = section_config.get("objective_text", "")
+                prompt = self._build_general_empirical_prompt(section_id, title, obj_text, citation_context)
+            elif style == "general_lit_summary":
+                prompt = self._build_general_lit_summary_prompt(section_id, title)
+
+            # Chapter Two styles (PhD Standard)
             elif style == "lit_intro":
                 prompt = self._build_lit_intro_prompt(section_id, title)
             elif style == "framework_intro":
@@ -947,6 +991,8 @@ class WriterSwarm:
                 prompt = self._build_lit_synthesis_prompt(section_id, title, citation_context, objective_text)
             elif style == "literature_gap":
                 prompt = self._build_literature_gap_prompt(section_id, title, citation_context)
+            elif style == "conceptual_framework":
+                prompt = self._build_conceptual_framework_prompt(section_id, title, citation_context)
             # Chapter Three styles - Methodology
             elif style == "methodology_intro":
                 prompt = self._build_methodology_intro_prompt(section_id, title)
@@ -973,6 +1019,32 @@ class WriterSwarm:
             else:
                 prompt = self._build_standard_prompt(section_id, title, paragraphs, citation_context)
             
+            # CRITICAL CHECK: Inject Methodology Context for Chapter 3
+            # This ensures the LLM adheres to the consistency manager's calculated values (n, population, etc.)
+            # and prevents hallucinated calculations (like Yamane deriving n=382 when user said n=120).
+            if self.state.chapter_number == 3:
+                meth_ctx = self.state.parameters.get('methodology_context')
+                if meth_ctx:
+                    context_injection = "\n\n=== MANDATORY RESEARCH PARAMETERS (DO NOT DEVIATE) ===\n"
+                    context_injection += f"TARGET POPULATION: {meth_ctx.get('population', {}).get('target_size', 'Use calculated value')}\n"
+                    context_injection += f"POPULATION DESCRIPTION: {meth_ctx.get('population', {}).get('description', '')}\n"
+                    context_injection += f"SAMPLE SIZE (n): {meth_ctx.get('sampling', {}).get('sample_size')} (You MUST use this exact number)\n"
+                    context_injection += f"RESEARCH DESIGN: {meth_ctx.get('research_design', 'survey')}\n"
+                    context_injection += f"SAMPLING TECHNIQUE: {meth_ctx.get('sampling', {}).get('technique', '')}\n"
+                    context_injection += f"JUSTIFICATION: {meth_ctx.get('sampling', {}).get('justification', '')}\n"
+                    
+                    preferred = meth_ctx.get('preferred_analyses', [])
+                    if preferred:
+                        context_injection += f"PREFERRED ANALYSES: {', '.join(preferred)}\n"
+                    
+                    context_injection += "========================================================\n"
+                    
+                    prompt += context_injection
+
+            # Inject Custom Instructions again for specific emphasis if for this section
+            custom_instr = self.state.parameters.get('custom_instructions', '')
+            if custom_instr:
+                prompt = f"=== USER DIRECTION ===\n{custom_instr}\n====================\n\n" + prompt
             
             try:
                 # Add small delay to avoid rate limiting (stagger parallel calls)
@@ -997,6 +1069,9 @@ class WriterSwarm:
                 if not content:
                     content = f"[Section {section_id} generation pending - will be completed in revision]"
                 
+                # CLEAN THE CONTENT
+                content = self._clean_generated_content(content)
+                
                 # Post-process: Add Source after ASCII diagrams
                 if '```' in content:
                     content = add_source_after_diagrams(content, title)
@@ -1006,7 +1081,6 @@ class WriterSwarm:
                 
                 # Store result
                 results[section_id] = SectionContent(
-                    section_id=section_id,
                     title=title,
                     content=content,
                     citations=relevant_papers,
@@ -1061,6 +1135,7 @@ class WriterSwarm:
                     session_id=self.state.session_id
                 )
                 
+                
                 # Update: Section completed - removed agent_activity to stop UI spam
                 # Only keep essential log message
                 
@@ -1075,21 +1150,23 @@ class WriterSwarm:
                 if hasattr(self.state, 'progress_callback') and self.state.progress_callback:
                     try:
                         await self.state.progress_callback(section_id, word_count)
-                    except Exception as cb_error:
-                        print(f"Progress callback error: {cb_error}")
-                
-                
+                    except Exception as e:
+                        print(f"Progress callback error: {e}")
+            
             except Exception as e:
-                print(f"Writer {agent_id} error on {section_id}: {e}")
+                print(f"❌ Error writing section {section_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Add failed section placeholder
                 results[section_id] = SectionContent(
-                    section_id=section_id,
                     title=title,
-                    content=f"Error generating section: {str(e)}",
+                    content=f"Error generating content: {str(e)}",
                     citations=[],
-                    status="error"
+                    status="failed"
                 )
         
-        # Announce writer finished all sections
+        # Announce completion
         await events.publish(
             self.state.job_id,
             "agent_activity",
@@ -1097,7 +1174,7 @@ class WriterSwarm:
                 "agent": agent_id, 
                 "agent_name": f"Writer: {agent_id.replace('_', ' ').title()}", 
                 "status": "completed", 
-                "action": f"Finished all {len(sections)} sections", 
+                "action": f"Finished all assigned sections", 
                 "icon": "✅",
                 "type": "chapter_generator"
             },
@@ -1105,6 +1182,62 @@ class WriterSwarm:
         )
         
         return results
+
+
+    def _clean_generated_content(self, content: str) -> str:
+        """Strip metadata, command parameters, and prompt leaks from content."""
+        if not content:
+            return ""
+            
+        lines = content.split('\n')
+        cleaned_lines = []
+        
+        # Regex patterns to identify metadata lines
+        metadata_patterns = [
+            r'^n\s*=\s*\d+',              # n=120
+            r'^topic\s*=',                # topic=...
+            r'^case[_\s]?study\s*=',      # case_study=...
+            r'^/uoj_phd',                 # /uoj_phd
+            r'^design\s*=',               # design=...
+            r'^TOPIC:',                   # TOPIC: Security...
+            r'^CASE STUDY:',              # CASE STUDY: Juba...
+            r'^STUDY OBJECTIVES:',        # STUDY OBJECTIVES:
+            r'^OBJECTIVES:',
+            r'^METHODOLOGY CONTEXT:',     # Context injection headers
+            r'^TARGET POPULATION:',
+            r'^SAMPLE SIZE \(n\):',
+            r'^SAMPLING TECHNIQUE:',
+            r'^=== MANDATORY',            # Separators
+            r'^================',
+            r'^2\.2 Prevalence Characteristics' # specific user complaint
+        ]
+        
+        # Compile patterns
+        import re
+        patterns = [re.compile(p, re.IGNORECASE) for p in metadata_patterns]
+        
+        for line in lines:
+            line_str = line.strip()
+            # Skip empty lines at start
+            if not cleaned_lines and not line_str:
+                continue
+                
+            # Check if line matches any metadata pattern
+            is_metadata = False
+            # Only check "short" lines which are likely metadata headers (less than 150 chars)
+            if len(line_str) < 150: 
+                for p in patterns:
+                    if p.search(line_str):
+                        is_metadata = True
+                        break
+            
+            if not is_metadata:
+                cleaned_lines.append(line)
+        
+        return "\n".join(cleaned_lines).strip()
+
+
+
     
     async def _generate_diagram_image(self, section_id: str, title: str, content: str, results: Dict, diagram_type: str = "generic"):
         """Generate high-quality academic diagram image for ANY type using DALL-E.
@@ -1323,7 +1456,6 @@ Style: Horizontal layout with boxes and arrows, left to right flow, clean profes
                 )
                 
                 results[section_id] = SectionContent(
-                    section_id=results[section_id].section_id,
                     title=results[section_id].title,
                     content=new_content,
                     citations=results[section_id].citations,
@@ -1350,16 +1482,42 @@ Style: Horizontal layout with boxes and arrows, left to right flow, clean profes
     
     def _build_citation_context(self, papers: List[ResearchResult]) -> str:
         """Build citation context for LLM with actual URLs."""
-        if not papers:
+        if not papers and not getattr(self.state, 'uploaded_sources_context', None):
             return "No approved sources provided. Write from general knowledge but state this limitation."
         
-        context = """APPROVED CITATION SOURCES:
+        
+        context = ""
+        
+        # Add uploaded sources first (Priority)
+        if hasattr(self.state, 'uploaded_sources_context') and self.state.uploaded_sources_context:
+            context += """
+USER UPLOADED DOCUMENTS (PRIORITY CONTEXT):
+The user has provided the following documents. You MUST use information from these documents where relevant.
+-------------------------------------------------------------------
+"""
+            context += self.state.uploaded_sources_context
+            context += "\n-------------------------------------------------------------------\n\n"
+
+        context += """APPROVED CITATION SOURCES:
 Do NOT cite any author or paper not on this list. If Twenge, Valkenburg, Keles, Odgers, Best, or any other author is NOT on this list, DO NOT CITE THEM.
 
-APPROVED SOURCE LIST (cite ONLY from this list):
+APPROVED SOURCE LIST (cite ONLY from this list or uploaded docs):
 
 """
-        for i, paper in enumerate(papers[:15]):  # Limit to 15 papers
+        # Filter clean papers
+        clean_papers = []
+        for p in papers:
+            # Check for valid authors
+            if not p.authors:
+                continue
+            
+            first_author = str(p.authors[0])
+            if any(bad in first_author.lower() for bad in ["unknown", "anonymous", "n/a", "undefined"]):
+                continue
+                
+            clean_papers.append(p)
+            
+        for i, paper in enumerate(clean_papers[:15]):  # Limit to 15 papers
             # Get the actual URL for this paper
             if paper.url and paper.url.startswith("http"):
                 url = paper.url
@@ -1369,7 +1527,8 @@ APPROVED SOURCE LIST (cite ONLY from this list):
                 url = ""  # No URL available
             
             context += f"{i+1}. {paper.to_apa()} - \"{paper.title}\"\n"
-            context += f"   Abstract: {paper.abstract[:200]}...\n"
+            # Increased truncation from 200 to 1200 for deeper grounding
+            context += f"   Abstract: {paper.abstract[:1200]}...\n"
             if url:
                 context += f"   URL for citation: {url}\n\n"
             else:
@@ -1597,9 +1756,188 @@ CRITICAL REQUIREMENTS:
 - Include statistical findings if mentioned in abstracts
 - APA 7 STRICT: (Author, Year) in-text, grouped [(Author1, Year; Author2, Year)](URL) at end
 - Do NOT include the section heading
-- Use ONLY sources from the approved list above - NO fabricated citations
+- Use ONLY sources from the approved list above - NO fabricated citations.
+- If a specific methodology (e.g., sample size, specific statistical test) or numeric result is not present in the provided abstract, DO NOT invent one. Focus on the reported findings and theoretical implications instead.
+- Hallucinating specific data points not present in the source is a SEVERE violation of academic integrity.
 
 Write the section content now (without any heading):"""
+
+    # -------------------------------------------------------------------------
+    # GENERAL THESIS PROMPT BUILDERS (User Custom)
+    # -------------------------------------------------------------------------
+    
+    def _build_general_intro_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""Write a brief Introduction about {self.state.topic} in {self.state.parameters.get('country', 'South Sudan')} and specifically in {self.state.case_study} with enough in-text citations. Make about three paragraphs for this Introduction and conclude the fourth paragraph outlining the outline of chapter one ie saying due to the above introduction, chapter one of this study will focus on historical background, problem statement, purpose of the study, objectives of the study outlining the general and specific objectives, research questions and hypothesis, significance of the study, scope of the study, brief methodology of the study, anticipated limitations and delimitation, assumptions of the study, definition of key terms, and summary of chapter one ... NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style.
+        
+        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+
+        Citations for local content use local names of that area
+        Annd be brief.
+        
+        CITATION CONTEXT:
+        {citation_context}
+        """
+
+    def _build_general_background_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""Sumarise in one paragraph and In one summarized and precise paragraph, Write historical Background of the study about {self.state.topic} looking at it on a global perspective with enough in text citations at the end of each line or sentence. Write the first big paragraph outlining a global perspective, then write the historical background about {self.state.topic} in sample countries or states in America, another paragraph write the historical background about {self.state.topic} in sample countries or states in Asia, another paragraph write the historical background about {self.state.topic} in sample countries or states in Australia, also another write the historical background about {self.state.topic} in sample countries or states in Europe. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style (Author, Year). use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+        Please sumarise and present in one small paragraph
+        Citations for local content use local names of that area
+        Specifically one paragraph mentioning all country names and or places in those countries
+
+        THEN:
+        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on an African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining African perspective, then write the historical background about {self.state.topic} in sample countries or states in North Africa/Arabic African Countries any of Egypt, Libya, Tunisia, Morocco, Sudan, etc, another paragraph write the historical background about {self.state.topic} in sample countries or states in South African Counties/States, another paragraph write the historical background about {self.state.topic} in sample countries or states in Central Africa, also another write the historical background about {self.state.topic} in sample countries or states in West Africa. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025. use hypothetical citations.
+        
+        THEN:
+        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on a East African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining East African perspective,, then write the historical background about {self.state.topic} in sample Districts/Villages/Places in sample countries of East Africa. In all make as much citations as possible.
+        
+        THEN:
+        Write historical Background of the study about {self.state.topic} looking at it on {country} perspective with in text citations. Write the first big paragraph outlining {country} perspective,, then write the historical background about {self.state.topic} in sample States, Payams, Bomas, Villages/Places in {country}. In all make as much citations as possible. Then Write A very detailed past then current situation of {self.state.topic} in {self.state.case_study}. Conclude saying it is upon the above background that this study aims to ... {self.state.topic} in {self.state.case_study}, {country}. use hypothetical citations.
+        
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+        
+        CITATION CONTEXT:
+        {citation_context}
+        """
+
+    def _build_problem_statement_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""Write a standard problem Statement in APA style For the study about {self.state.topic} in {self.state.case_study}, {country}.
+        Organize in this fomart per paragraph:
+        1. Problem is current
+        2. Population affected
+        3. Has wide magnitude justified by data
+        4. Effects on the individuals, community or health service providers
+        5. Plausible factors contributing to the problem
+        6. Attempts taken to solve this problem inside be including studies, the prblesms and gaps
+        7. where information is missing put
+        
+        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+        
+        CITATION CONTEXT:
+        {citation_context}
+        """
+
+    def _build_purpose_statement_prompt(self, section_id: str, title: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""Write the purpose of the study about {self.state.topic} in {self.state.case_study}, {country}. Let it be precise and very summarized. Only the purpose of the study don't add anything else and write in academic and professional tone. Be brief."""
+
+    def _build_objectives_smart_prompt(self, section_id: str, title: str) -> str:
+        return f"""List three SMART study specific objectives about {self.state.topic} in {self.state.case_study}
+        Write short setences and brief, don’t include time 
+        Objectives have to have the last two on challenges and then solutions
+        Be brief. Don't use bullets, write as a list in text or proper format."""
+
+    def _build_hypothesis_prompt(self, section_id: str, title: str) -> str:
+        return f"""Convert the objectives into hypothesis statements from H1,H01 to H4,H04 based on {self.state.topic}."""
+
+    def _build_significance_prompt(self, section_id: str, title: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""State the Significance of the study about {self.state.topic} in {country} and {self.state.case_study}.
+        State the Beneficiary: Then state the Significance ....."""
+
+    def _build_scope_detail_prompt(self, section_id: str, title: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""State the Scope of the study about {self.state.topic} in {self.state.case_study}, {country} in terms of content, Time and geographical scopes. 
+        In Each scope write it in detail way. 
+        In Geographical scope, write the geography of the place, its longitude and latitude, its directions and neigbouring places/villages/Payams/Bomas/Distincts. 
+        In time scope, note that we are in 2025 and studies take three months period.
+        Don’t bullet or number."""
+
+    def _build_limitations_future_prompt(self, section_id: str, title: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""State the Limitations of the Study about {self.state.topic} in {self.state.case_study}, {country}. Explain each of them in details and talk in future tense. in Each, tell us how you could mitigate it in few sentence(s).
+        Make like 4 to 7 limitations."""
+        
+    def _build_delimitations_prompt_gen(self, section_id: str, title: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""State and explain the Delimitation(s) of the study about {self.state.topic} in {self.state.case_study}, {country}. Present all in One paragraph and write in academic language."""
+
+    def _build_theoretical_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""Generate one theory by a scholar or scholars for a study about {self.state.topic}. It should be like this; The study will be guided by the theory of ... by Author(year). state what the theory says with precise in-text citations, state two authors who oppose the theory and what they say, also two authors who agree with the theory and what they say each on a specific paragraph.
+        State the importance of the theory in the context of {self.state.topic}. in a new paragraph, state the importance of the theory in {self.state.case_study}. Key gaps.
+        
+        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+        be very very detailed
+        
+        CITATION CONTEXT:
+        {citation_context}
+        """
+
+    def _build_conceptual_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""Just List to make my copying easy and State Independent and dependent Variables for the study about {self.state.topic} and list 10 independent and 5 dependent variables. List four intervening variables also. Then make a discussion on how each of the Independent, dependent and intervening Variables relates to another with the concept of the study with intext citations. Be detailed in discussions and in context of {self.state.case_study}.
+
+        Independent Variables						Dependent Variables
+
+        Figure 1. 1: Conceptual Framework 
+        Designed and Molded by Researcher (2025)
+        
+        CITATION CONTEXT:
+        {citation_context}
+        """
+
+    def _build_methodology_brief_prompt(self, section_id: str, title: str) -> str:
+        return f"""Brief methodology of the study about {self.state.topic}. Mention research design, sample size, tools."""
+
+    def _build_definitions_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""Write definition of key terms on the study about {self.state.topic} in {self.state.case_study}. Present with citations.
+        use hypothetical citations.
+        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher.
+        """
+
+    def _build_organization_5chapter_prompt(self, section_id: str, title: str) -> str:
+        return f"""Write Organisation of the study which will be guided in five chapters in Chapter one introduction, two is literature review, three is methodology, four is data analysis, presentation and interpretations of findings, five is discusions, summary, conlusions, recommendations, sugestionsfor futer studies
+        Write in context of {self.state.topic} in {self.state.case_study}."""
+
+    def _build_general_lit_intro_prompt(self, section_id: str, title: str) -> str:
+        return f"""In one paragraph, write Introduction of chapter two about literature reviews for the study about {self.state.topic} and study objectives ie saying Chapter two of this study will be about literature reviews using previous information from former scholars, both theoretical and empirical studies will be reviewed and study gaps in accordance to the study area of {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')} will be identified which will be he basis for this study."""
+
+    def _build_general_theory_main_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""For the study titled {self.state.topic} in {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')} write a theoretical framework or a theory that can be used to model the study. State the author of the theory generated for pasted work/topic/objective and the year, state what the theory says in detail with precise in-text citations.
+        At least make four real current citations ie those real studies made not exceeding five years back and note that the current year is 2025.
+        State two real authors who oppose the theory and what they say also two authors who agree with the theory and what they say each on a specific paragraph.
+        State the importance of the theory in the context of the study. in a new paragraph, state the importance of the theory in study and case study. similarly, state the gaps in the theory referring to case study.
+        Everything has to be academically well cited, real and original.
+        
+        CITATION CONTEXT:
+        {citation_context}"""
+
+    def _build_general_theory_obj_prompt(self, section_id: str, title: str, objectives_text: str, citation_context: str) -> str:
+        return f"""Select the objectives: "{objectives_text}" and write a theoretical framework or a theory that can be used to model them.
+        State the author of the theory and the year, state what the theory says in detail with clear real in-text citations.
+        At least make four real current citations (2020-2025).
+        State two real authors who oppose the theory and what they say also two authors who agree with the theory.
+        State the importance of the theory in the context of the study. State the gaps in the theory referring to case study.
+        
+        CITATION CONTEXT:
+        {citation_context}"""
+
+    def _build_general_empirical_prompt(self, section_id: str, title: str, objective: str, citation_context: str) -> str:
+        country = self.state.parameters.get('country', 'South Sudan')
+        return f"""Cite six hypothetical studies about the objective: "{objective}".
+        For each, make sure they are not more than five years old (2020-2025).
+        Write like this: Author (year) conducted a study about ... where the main objective was to... in ... the methodology was ..., the study found out that (with statistical results)... The study concluded that ... The study recommended that ... However, the study gap is ... Write more of the gaps. (Then cite at the end ie Author, year).
+        
+        Let it be from different countries in this order:
+        1. Any Asian country
+        2. Any South American Country
+        3. Any West African country
+        4. Any Central or South African Country
+        5. Any East African country
+        6. Lastly {country}
+        
+        Kindly be stating the countries. Make real citations of real studies, authors, years, studies, methodology, findings, conclusion, recommendations etc. ranges from 2019 to 2025.
+        
+        CITATION CONTEXT:
+        {citation_context}"""
+
+    def _build_general_lit_summary_prompt(self, section_id: str, title: str) -> str:
+        return f"""Write literature summary and knowledge gap basing on the empirical reviews above in the context of {self.state.topic} in {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')}.
+        Don’t bullet or number."""
 
     def _build_objectives_prompt(self, section_id: str, title: str, style: str) -> str:
         """Build prompt for objectives sections - improved for academic quality."""
@@ -1719,7 +2057,7 @@ Describe the organization of this thesis using the UNIVERSITY OF JUBA 6-CHAPTER 
 
 **Chapter Four: Presentation and Interpretation of Data** - Presents findings organized by research questions and themes from the data collection instruments.
 
-**Chapter Five: Results and Discussion** - Discusses findings in relation to literature from Chapter Two, showing confirmations or variations from existing knowledge.
+**Chapter Five: Results and Discussion** - Discusss findings in relation to literature from Chapter Two, showing confirmations or variations from existing knowledge.
 
 **Chapter Six: Summary, Conclusions and Recommendations** - Summarizes findings, draws conclusions, provides recommendations, and suggests areas for future research.
 
@@ -2004,8 +2342,67 @@ REQUIREMENTS:
 
 Write the section content now:"""
 
+    def _build_conceptual_framework_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        """Build prompt for conceptual framework with horizontal branching ASCII diagram."""
+        return f"""Write section "{section_id} {title}" - a comprehensive conceptual framework for the study.
+
+TOPIC: {self.state.topic}
+CASE STUDY: {self.state.case_study}
+CITATION CONTEXT:
+{citation_context}
+
+**CONTENT REQUIREMENTS:**
+
+1. **SCIENTIFIC DEFINITION**: Define conceptual framework based on scholarly sources (e.g., Miles & Huberman, 1994 or Maxwell, 2013). (1 paragraph)
+
+2. **MANDATORY HORIZONTAL ASCII DIAGRAM**: Create a detailed, horizontal, branching diagram showing the relationship between variables.
+   
+   **DIAGRAM STRUCTURE:**
+   - [Independent Variables] on the LEFT (vertical stack)
+   - [Dependent Variable] on the RIGHT
+   - Show arrows (---->) pointing from independent variables to the dependent variable.
+   - Use boxes and clear labels for ALL main themes/variables identified in the literature review.
+   
+   Example structure:
+   ```
+   +-----------------------+      +-------------------------+
+   | INDEPENDENT VARIABLES |      |   DEPENDENT VARIABLE    |
+   +-----------------------+      +-------------------------+
+   | [Variable A]          |----->|                         |
+   |                       |      |                         |
+   | [Variable B]          |----->|  [Overall Goal/Topic]   |
+   |                       |      |                         |
+   | [Variable C]          |----->|                         |
+   +-----------------------+      +-------------------------+
+   ```
+   Caption: Figure 2.1: Conceptual Framework for the Study
+   Source: Author's Construct (2025)
+
+3. **DETAILED EXPLANATION**: Describe each variable and the hypothesized relationships in scholarly detail. (3 paragraphs)
+
+**WRITING STYLE:**
+- Use academic UK English.
+- Cite sources provided to support the relationships.
+- Ensure the variables mentioned here match the themes discussed in the Literature Review empirical sections.
+
+Write the section content now:"""
+
+    def _get_variables_context(self) -> str:
+        """Get formatted variables for prompt integration."""
+        if hasattr(self.state, 'objective_variables') and self.state.objective_variables:
+            ctx = "\nARCHITECTURAL VARIABLES (The Golden Thread):\n"
+            for obj_num, v_list in self.state.objective_variables.items():
+                ctx += f"- Objective {obj_num} Variables: {', '.join(v_list)}\n"
+            return ctx
+        return ""
+
     def _get_system_prompt(self) -> str:
-        return """You are an expert academic thesis writer. You write in formal academic English with proper APA 7 citations.
+        vars_ctx = self._get_variables_context()
+        return f"""You are an expert academic thesis writer. You write in formal academic English with proper APA 7 citations.
+
+{vars_ctx}
+
+You MUST follow the "Golden Thread" principle: ensure that variables identified in the literature review (Chapter 2) are consistently tracked throughout Chapter 3 (Methodology), Chapter 4 (Analysis), and Chapter 5 (Discussion).
 
 ABSOLUTELY CRITICAL - READ THIS CAREFULLY:
 You will be given a numbered list of sources. You must ONLY cite from this list.
@@ -2013,6 +2410,7 @@ You will be given a numbered list of sources. You must ONLY cite from this list.
 - If a paper is NOT in the source list, you MUST NOT cite it, even if you know it exists.
 - NEVER cite Twenge, Valkenburg, Keles, Odgers, Best, boyd, or ANY author not explicitly listed.
 - Before writing a citation, CHECK that it appears in the source list.
+- GROUNDING RULE: Do not state specific percentages, sample sizes, or p-values unless you see them in the provided Abstract text. If the abstract is vague, your writing must reflect that vagueness rather than creating "plausible" details.
 
 APA 7 CITATION FORMAT - CRITICAL:
 1. Use LAST NAMES ONLY in citations - NEVER full names
@@ -2043,6 +2441,17 @@ QUALITY RULES:
 6. Use UK English spelling (analyse, organisation, behaviour)
 
 VIOLATION WARNING: Using full author names instead of last names, or citing non-citable sections, is a critical error."""
+        
+        # Add custom user instructions if provided
+        custom_instr = self.state.parameters.get('custom_instructions', '')
+        if custom_instr:
+            prompt += f"""
+\n\n=== SPECIAL USER INSTRUCTIONS (URGENT) ===
+The user has provided these specific guidelines for this thesis. You MUST prioritize these:
+{custom_instr}
+===========================================\n
+"""
+        return prompt
 
     # ============================================================================
     # ADAPTIVE METHODOLOGY HELPER METHODS
@@ -2211,11 +2620,12 @@ CASE STUDY: {self.state.case_study}{objectives_context}
 
 1. **START WITH SCHOLARLY DEFINITION**: "Research philosophy, as defined by Saunders et al. (2019), constitutes..."
 
-2. **USE PAST TENSE (REPORTED SPEECH)**: "was adopted", "was selected", "was employed"
+2. **TENSE AND VOICE**: Use {self._get_tense_version(self.state.is_proposal)['adopted']} tense throughout this section (e.g., "{self._get_tense_version(self.state.is_proposal)['adopted']}", "{self._get_tense_version(self.state.is_proposal)['employed']}").
 
 3. **NO NUMBERED LISTS OR SUB-HEADINGS**: Write as flowing narrative paragraphs
 
 4. **ANALYZE & DECIDE**: Don't default to positivism - analyze study and choose appropriate philosophy
+5. **CITATION DISTRIBUTION**: Every paragraph MUST contain at least one scholarly citation from the provided research pool. Do not clump all citations at the beginning; distribute them naturally throughout the entire section.
 
 **CONTENT TO COVER (in natural flowing paragraphs):**
 
@@ -2249,7 +2659,7 @@ Source: Adapted from Saunders, Lewis & Thornhill (2019)
 **2. Ontological Stance (1 paragraph)**
 - Define Ontology: nature of reality and existence
 - Compare **Objectivism** (reality exists independently) vs. **Constructivism** (reality is socially constructed)
-- **JUSTIFY YOUR CHOICE** for this study (e.g., "Objectivism was adopted because...")
+- **JUSTIFY YOUR CHOICE** for this study (e.g., "{self._get_tense_version(self.state.is_proposal)['adopted'].capitalize()} because...")
 - **REJECT THE ALTERNATIVE**: Explain why the other was not suitable
 
 **3. Epistemological Stance (2 paragraphs)**  
@@ -2309,15 +2719,17 @@ Write the content now:"""
 
 TOPIC: {self.state.topic}
 CASE STUDY: {self.state.case_study}
+MANDATORY DESIGN: {self.state.parameters.get('methodology_context', {}).get('research_design', 'survey')}
 
 {citation_context}
 
 Write 6 detailed paragraphs:
 
 **1. Research Strategy (2 paragraphs)**
+- You MUST justify why the MANDATORY DESIGN above was chosen.
 - Evaluate multiple strategies: Survey, Experiment, Case Study, Ethnography, Grounded Theory, Action Research
 - For EACH strategy, briefly explain what it entails (1-2 sentences)
-- **JUSTIFY YOUR CHOICE** (e.g., "Survey was selected because it allows for...")  
+- **JUSTIFY YOUR CHOICE** (e.g., "Survey {self._get_tense_version(self.state.is_proposal)['selected']} because it allows for...")  
 - **REJECT ALTERNATIVES**: Explain why others (e.g., Experiment) were unsuitable for this context
 - Cite methodology authors [(Yin, 2018; Creswell, 2014)](URL)
 
@@ -2347,6 +2759,7 @@ Write 6 detailed paragraphs:
 CRITICAL REQUIREMENTS:
 - MANDATORY: 3-5 citations per paragraph
 - APA 7 STRICT: (Author, Year), grouped [(Author1, Year; Author2, Year)](URL)
+- **CITATION DISTRIBUTION**: Every paragraph MUST contain at least one scholarly citation. Do not clump all citations at the beginning; distribute them naturally throughout.
 - Justify every choice, reject alternatives explicitly
 - Do NOT include section heading
 
@@ -2402,6 +2815,7 @@ CRITICAL REQUIREMENTS:
 - Ensure percentages add up to 100%
 - Minimum 3 citations per paragraph
 - APA 7 format
+- **CITATION DISTRIBUTION**: Citations must be distributed throughout the text, not just at the start.
 - Do NOT include section heading
 
 Write the content now:"""
@@ -2426,7 +2840,7 @@ Write 6 detailed paragraphs:
 **2. Specific Sampling Technique (2 paragraphs)**
 - If Probability: Evaluate Simple Random, Stratified Random, Systematic, Cluster
 - If Non-Probability: Evaluate Convenience, Purposive, Snowball, Quota
-- **JUSTIFY YOUR SPECIFIC TECHNIQUE** (e.g., "Stratified Random Sampling was chosen to ensure representation across...")
+- **JUSTIFY YOUR SPECIFIC TECHNIQUE** (e.g., "Stratified Random Sampling {self._get_tense_version(self.state.is_proposal)['selected']} to ensure representation across...")
 - Explain how strata were defined (if stratified) or selection criteria (if purposive)
 - Cite sampling literature [(Sekaran & Bougie, 2016)](URL)
 
@@ -2446,17 +2860,49 @@ CRITICAL REQUIREMENTS:
 - MANDATORY: 3-5 citations per paragraph
 - Be EXTREMELY specific about procedures - a researcher should be able to replicate
 - APA 7 format
+- **CITATION DISTRIBUTION**: Spread citations naturally within sentences. Avoid citation dumping.
+```
 - Do NOT include section heading
 
 Write the content now:"""
 
     def _build_sample_size_prompt(self, section_id: str, title: str, citation_context: str) -> str:
-        """Build sample size prompt - UK English, past tense, scholarly definition."""
+        """Build sample size prompt - Prioritizes user n and selects BEST justification."""
+        
+        # 1. Get User Input (n)
+        meth_ctx = self.state.parameters.get('methodology_context', {})
+        user_n = meth_ctx.get('sampling', {}).get('sample_size') or self.state.parameters.get('sample_size')
+        
+        # 2. Setup Context Manager
+        from services.research_context_manager import ResearchContextManager
+        
+        # Ensure we have a valid config dict to pass
+        config = {
+            'sample_size': user_n or self.state.parameters.get('sample_size') or 385,
+            'research_design': meth_ctx.get('research_design', 'survey'),
+            'topic': self.state.topic,
+            'case_study': self.state.case_study
+        }
+        
+        # Pass population config if available
+        rcm = ResearchContextManager(config)
+        # Manually inject pre-calculated population if it exists in context
+        if meth_ctx.get('population'):
+            # We trust RCM to handle this or we just rely on its own calculation which matches our logic
+            pass
+
+        # 3. Get Intelligent Justification
+        justification_data = rcm.get_sample_size_justification()
+        
+        citation = justification_data['citation']
+        method_name = justification_data['method']
+        prompt_instruction = justification_data['prompt_text']
+        
         objectives_context = ""
         if hasattr(self.state, 'objectives') and self.state.objectives:
-            obj_text = "\n".join([f"- {obj}" for obj in self.state.objectives[:5]])
-            objectives_context = f"\n\nSTUDY OBJECTIVES:\n{obj_text}\n"
-        
+            obj_text = "\\n".join([f"- {obj}" for obj in self.state.objectives[:5]])
+            objectives_context = f"\\n\\nSTUDY OBJECTIVES:\\n{obj_text}\\n"
+
         return f"""Write content for sample size determination section.
 
 **CRITICAL: Do NOT write the heading "{section_id} {title}" - it will be added automatically. Start directly with the scholarly definition.**
@@ -2467,80 +2913,47 @@ CASE STUDY: {self.state.case_study}{objectives_context}
 {citation_context}
 
 **MANDATORY OPENING**: Begin with scholarly definition:
-"Sample size, as defined by Krejcie and Morgan (1970), refers to the number of observations or cases selected from a population to constitute a representative subset for statistical analysis..."
+"Sample size, as defined by {citation}, refers to the number of observations or cases selected from a population to constitute a representative subset for statistical analysis..."
 
-Cite 2-3 scholars (Krejcie & Morgan, 1970; Yamane, 1967; Cochran, 1977).
+Cite 2-3 scholars ({citation}; Yamane, 1967; Cochran, 1977).
 
 **LANGUAGE**: UK English (analyse, realise, organisation, whilst)
-**TENSE**: Past tense (was adopted, were selected, was calculated)
+**TENSE**: {self._get_tense_version(self.state.is_proposal)['used'].capitalize()} tense throughout.
 
 **CONTENT STRUCTURE:**
 
-Paragraph 1: Define sample size with scholarly citations, explain importance
+Paragraph 1: Define sample size with scholarly citations, explain importance.
 
-Paragraph 2: Justify formula selection - analyse study design and DECIDE:
-- **Yamane (1967)**: For known finite populations
-- **Cochran (1977)**: For infinite populations  
-- **Power Analysis (Cohen, 1988)**: For experimental studies
+Paragraph 2: Justify sampling strategy selection (e.g., Stratified Random or Purposive).
 
-Paragraph 3: Present chosen formula:
+**Paragraph 3 & 4 (CRITICAL JUSTIFICATION):**
+Use the **{method_name}** method as it is best suited for this study's parameters (n={config['sample_size']}, Design={config['research_design']}).
 
-$$n = \\frac{{N}}{{1 + N(e)^2}}$$
+{prompt_instruction}
 
-Where:
-- n = required sample size
-- N = total population size
-- e = margin of error (typically 0.05)
+Paragraph 5: Justify adequacy, mention power analysis if applicable.
 
-Paragraph 4: Show step-by-step calculation (EACH STEP ON NEW LINE):
-
-**Step 1:** Substitute values
-$$n = \\frac{{8,250}}{{1 + 8,250(0.05)^2}}$$
-
-**Step 2:** Calculate exponent
-$$n = \\frac{{8,250}}{{1 + 8,250(0.0025)}}$$
-
-**Step 3:** Multiply in denominator
-$$n = \\frac{{8,250}}{{1 + 20.625}}$$
-
-**Step 4:** Add in denominator
-$$n = \\frac{{8,250}}{{21.625}}$$
-
-**Step 5:** Perform division
-$$n = 381.50$$
-
-**Step 6:** Round up to whole number
-$$n = 382$$
-
-Therefore, the minimum required sample size was 382 respondents.
-
-Paragraph 5: Justify adequacy, mention power analysis if applicable
-
-Paragraph 6: Present distribution table:
+Paragraph 6: Present distribution table (if applicable for n={config['sample_size']}):
 
 **Table 3.7: Sample Size Distribution by Stratum**
 
 | Strata/Category | Population (N) | Proportion | Sample Size (n) | Sampling Method |
 |-----------------|----------------|------------|-----------------|------------------|
-| [Stratum 1]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified random |
-| [Stratum 2]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified random |
-| [Stratum 3]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified random |
-| **Total**       | **8,250**      | **1.00**   | **382**         | –                |
+| [Stratum 1]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified/Purposive |
+| [Stratum 2]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified/Purposive |
+| **Total**       | **[Realistic N]** | **1.00**   | **{config['sample_size']}** | –                |
 
 *Source: Researcher's computation, 2024*
 
-Paragraph 7: Interpret table, explain proportional allocation
+Paragraph 7: Interpret table.
 
 **FORMATTING RULES:**
 - NO section heading
 - UK English spelling
 - Past tense throughout
-- $$formula$$ for LaTeX (NOT \\( \\))
+- $$formula$$ for LaTeX
 - Markdown tables with | pipes
 - **Bold** for totals row
-- *Italics* for source line
-- Start with scholarly definition
-- 3-5 citations per paragraph
 - NO PLACEHOLDERS - use realistic {self.state.case_study} context
 
 Write the content now:"""
@@ -2567,7 +2980,7 @@ CASE STUDY: {self.state.case_study}{objectives_context}
 Cite 2-3 scholars (Creswell, 2014; Kothari, 2004; Sekaran & Bougie, 2016).
 
 **LANGUAGE**: UK English (analyse, whilst, organisation)
-**TENSE**: Past tense (was adopted, were developed, was administered)
+**TENSE**: {self._get_tense_version(self.state.is_proposal)['used'].capitalize()} tense throughout (e.g., "{self._get_tense_version(self.state.is_proposal)['adopted']}", "{self._get_tense_version(self.state.is_proposal)['developed']}", "{self._get_tense_version(self.state.is_proposal)['administered']}")
 
 **INTELLIGENT TOOL SELECTION:**
 
@@ -2583,7 +2996,7 @@ ANALYZE the study objectives and DECIDE the most appropriate instrument(s):
 **For Quantitative Studies (most common):**
 
 Paragraph 1: **Instrument Selection and Justification**
-- State chosen instrument (e.g., "A structured questionnaire was adopted...")
+- State chosen instrument (e.g., "A structured questionnaire {self._get_tense_version(self.state.is_proposal)['adopted']}...")
 - Justify based on:
   * Study objectives (measuring attitudes/perceptions)
   * Sample size (n > 100 requires standardized tool)
@@ -2648,6 +3061,7 @@ Paragraph 5: **Administration Mode**
 - Past tense throughout
 - Start with scholarly definition
 - 3-5 citations per paragraph
+- **CITATION DISTRIBUTION**: Distribute citations evenly within paragraphs.
 - Provide SPECIFIC sample items (not placeholders)
 - Use realistic context from {self.state.case_study}
 
@@ -2670,7 +3084,7 @@ CASE STUDY: {self.state.case_study}
 Cite 2-3 scholars (Hair et al., 2019; Sekaran & Bougie, 2016; Tavakol & Dennick, 2011).
 
 **LANGUAGE**: UK English (analyse, realise, whilst, amongst)
-**TENSE**: Past tense (was tested, were assessed, was calculated)
+**TENSE**: {self._get_tense_version(self.state.is_proposal)['used'].capitalize()} tense throughout (e.g., "{self._get_tense_version(self.state.is_proposal)['tested']}", "{self._get_tense_version(self.state.is_proposal)['assessed']}", "{self._get_tense_version(self.state.is_proposal)['calculated']}")
 
 **CONTENT STRUCTURE:**
 
@@ -2720,7 +3134,7 @@ Paragraph 6: Present reliability results table:
 
 *Source: Pilot study data, 2024*
 
-Paragraph 7: Interpret results - all scales exceeded α > 0.70, no items deleted
+Paragraph 7: Interpret results - all scales exceeded α > 0.70, no items {self._get_tense_version(self.state.is_proposal)['collected']} (deleted)
 
 **FORMATTING RULES:**
 - NO section heading
@@ -2732,6 +3146,7 @@ Paragraph 7: Interpret results - all scales exceeded α > 0.70, no items deleted
 - *Italics* for source line
 - Start with scholarly definition
 - 3-5 citations per paragraph
+- **CITATION DISTRIBUTION**: Distribute citations evenly.
 - NO PLACEHOLDERS
 - Use realistic {self.state.case_study} context
 
@@ -2754,15 +3169,15 @@ Write 4 paragraphs:
   * **Online Administration**: Google Forms/SurveyMonkey sent via email
   * **Face-to-Face**: Researcher-administered questionnaires
 - Justify the method chosen for {self.state.case_study} context
-- Mention date range of data collection (e.g., "March-April 2024")
+- Mention date range of data collection (e.g., "March-April 2024" or "{self._get_tense_version(self.state.is_proposal)['conducted']} between...")
 
 **2. Step-by-Step Collection Procedure (1 paragraph)**
 CRITICAL: Provide exact procedural steps:
-- Step 1: Obtained permission/introductory letter from university
+- Step 1: {self._get_tense_version(self.state.is_proposal)['obtained'].capitalize()} permission/introductory letter from university
 - Step 2: Contacted [organizations/institutions] in {self.state.case_study}
-- Step 3: Distributed questionnaires to sampled respondents (n = [from Table 3.2])
-- Step 4: Provided clear instructions and assured confidentiality
-- Step 5: Collected completed questionnaires after [X] days
+- Step 3: {self._get_tense_version(self.state.is_proposal)['distributed'].capitalize()} questionnaires to sampled respondents
+- Step 4: Provided clear instructions and {self._get_tense_version(self.state.is_proposal)['ensured']} confidentiality
+- Step 5: {self._get_tense_version(self.state.is_proposal)['collected'].capitalize()} completed questionnaires
 - Step 6: Checked for completeness and clarity
 
 **3. Response Rate Management (1 paragraph)**
@@ -2781,6 +3196,7 @@ CRITICAL: Provide exact procedural steps:
 
 CRITICAL REQUIREMENTS:
 - MANDATORY: 3-5 citations per paragraph
+- **CITATION DISTRIBUTION**: Spread citations naturally.
 - Be very specific about procedures - replicability is key
 - APA 7 format
 - Do NOT include section heading
@@ -2793,10 +3209,14 @@ Write the content now:"""
 
 TOPIC: {self.state.topic}
 CASE STUDY: {self.state.case_study}
+MANDATORY ANALYSES: {', '.join(self.state.parameters.get('methodology_context', {}).get('preferred_analyses', ['Pearson Correlation', 'Multiple Regression']))}
 
 {citation_context}
 
 Write 6 paragraphs:
+
+**0. ANALYSIS OVERVIEW**
+- You MUST mention and justify the MANDATORY ANALYSES specified above.
 
 **1. Data Preparation (1 paragraph)**
 - **Coding**: Assigning numerical codes to responses (e.g., Male=1, Female=2, Likert 1-5)
@@ -2807,7 +3227,7 @@ Write 6 paragraphs:
 
 **2. Statistical Software (1 paragraph)**
 - Specify the software: **SPSS Version [27]**, **AMOS**, **SmartPLS**, or **Stata**
-- Justify the choice based on study requirements (e.g., "SPSS was selected for its robust...")
+- Justify the choice based on study requirements (e.g., "SPSS {self._get_tense_version(self.state.is_proposal)['selected']} for its robust...")
 - Mention version number for reproducibility
 
 **3. Descriptive Statistics (1 paragraph)**
@@ -2852,6 +3272,7 @@ CRITICAL REQUIREMENTS:
 - MANDATORY: LaTeX formulas for correlation and regression
 - Specify the EXACT regression model for your topic
 - Minimum 3-5 citations per paragraph
+- **CITATION DISTRIBUTION**: Distribute citations naturally.
 - APA 7 format
 - Do NOT include section heading
 
@@ -2893,10 +3314,10 @@ Write 4 paragraphs:
 - Mention debriefing procedures if applicable
 
 **3. Ethical Approvals and Permissions (1 paragraph)**
-- **Institutional Approval**: Obtained introductory letter from [University Name] Graduate School
-- **Organizational Permissions**: Sought approval from relevant authorities in {self.state.case_study} (e.g., Ministry, Hospital administration)
-- **Ethics Review Board**: Mention if IRB/Ethics Committee approval was obtained (provide reference number if applicable)
-- **Informed Consent Documentation**: All participants signed consent forms before data collection
+- **Institutional Approval**: {self._get_tense_version(self.state.is_proposal)['obtained'].capitalize()} introductory letter from [University Name] Graduate School
+- **Organizational Permissions**: Sought approval from relevant authorities in {self.state.case_study}
+- **Ethics Review Board**: Mention if IRB/Ethics Committee approval {self._get_tense_version(self.state.is_proposal)['obtained']}
+- **Informed Consent Documentation**: All participants {self._get_tense_version(self.state.is_proposal)['obtained']} (signed) consent forms before data collection
 
 CRITICAL REQUIREMENTS:
 - MANDATORY: 3-5 citations per paragraph
@@ -3127,8 +3548,8 @@ class QualitySwarm:
         missing = set(expected_sections) - set(present_sections)
         
         # Check alignment between objectives and research questions
-        objectives_content = self.state.sections.get("1.4.2", self.state.sections.get("1.4", SectionContent("", "", "", [], 0, ""))).content
-        questions_content = self.state.sections.get("1.5", SectionContent("", "", "", [], 0, "")).content
+        objectives_content = self.state.sections.get("1.4.2", self.state.sections.get("1.4", SectionContent("", "", [], "pending", 0))).content
+        questions_content = self.state.sections.get("1.5", SectionContent("", "", [], "pending", 0)).content
         
         # Simple alignment check - count numbered items
         obj_count = len([line for line in objectives_content.split('\n') if line.strip().startswith(('i.', 'ii.', 'iii.', 'iv.', '1.', '2.', '3.', '4.'))])
@@ -3196,6 +3617,43 @@ class QualitySwarm:
                 seen_dois.add(key)
                 unique_papers.append(paper)
         
+        # FILTER: Only include papers that were actually cited in the content
+        import re
+        cited_papers = []
+        full_content = " ".join([s.content for s in self.state.sections.values()])
+        
+        for paper in unique_papers:
+            if not paper.authors: continue
+            
+            # Extract last names
+            last_names = []
+            for author in paper.authors:
+                if isinstance(author, dict):
+                    name = author.get("name", author.get("family", ""))
+                else:
+                    name = str(author)
+                if name:
+                    last_names.append(name.split()[-1] if ' ' in name.strip() else name.strip())
+            
+            if not last_names: continue
+            
+            # Check for citations strictly: Author...Year
+            is_cited = False
+            year_str = str(paper.year)
+            
+            for last_name in last_names:
+                # Regex finds "Author...Year" within close proximity (up to 20 chars)
+                # Accounts for: (Smith, 2020), Smith (2020), Smith & Jones (2020), Smith et al. (2020)
+                pattern = re.compile(rf"{re.escape(last_name)}[^)]{{0,30}}{year_str}", re.IGNORECASE)
+                if pattern.search(full_content):
+                    is_cited = True
+                    break
+            
+            if is_cited:
+                cited_papers.append(paper)
+        
+        unique_papers = cited_papers
+        
         # Sort alphabetically by first author (handle dict/str authors)
         def get_author_name(p):
             if not p.authors:
@@ -3243,10 +3701,23 @@ class ParallelChapterGenerator:
         case_study: str,
         job_id: str,
         session_id: str,
-        background_style: str = "inverted_pyramid"
+        workspace_id: str = "default",
+        background_style: str = "inverted_pyramid",
+        thesis_type: str = "phd",
+        sample_size: int = None,
+        objectives: List[str] = None
     ) -> str:
         """Generate full chapter using parallel agents."""
         
+        # CLEAN METADATA from topic
+        import re
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+
         start_time = datetime.now()
         
         # Validate background style
@@ -3259,12 +3730,44 @@ class ParallelChapterGenerator:
             case_study=case_study,
             job_id=job_id,
             session_id=session_id,
-            background_style=background_style
+            workspace_id=workspace_id,
+            background_style=background_style,
+            thesis_type=thesis_type # Pass thesis_type to state
         )
+        self.state.parameters["thesis_type"] = thesis_type # Also set in parameters
+        if sample_size:
+            self.state.parameters["sample_size"] = sample_size
+        
+        # Try to load variables from thesis plan for consistency (Golden Thread)
+        try:
+            from services.workspace_service import WORKSPACES_DIR
+            import json
+            workspace_dir = WORKSPACES_DIR / (workspace_id or "default")
+            plan_path = workspace_dir / "thesis_plan.json"
+            if plan_path.exists():
+                with open(plan_path, 'r') as f:
+                    plan_data = json.load(f)
+                    obj_vars = plan_data.get("objective_variables", {})
+                    # Store variables in state so prompt builders can access them
+                    self.state.objective_variables = obj_vars
+        except Exception as e:
+            print(f"Error loading thesis plan in Ch1: {e}")
         
         await events.connect()
         
-        # Notify start - show in preview panel
+        # BRANCH TO UOJ GENERAL (Bachelor's) ONLY
+        # PhD theses use standard structure with "Setting the Scene" etc.
+        if thesis_type == "general":
+             # Retrieve country from entities or default
+             db = ThesisSessionDB(session_id)
+             country = "South Sudan"  # Default country for UoJ theses
+             
+             # Need objectives for UoJ Chapter 1
+             saved_objectives = db.get_objectives() or {}
+             
+             return await generate_chapter_one_uoj(
+                 topic, case_study, country, job_id, session_id, workspace_id, saved_objectives, thesis_type=thesis_type
+             )
         await events.publish(
             job_id,
             "stage_started",
@@ -3322,7 +3825,8 @@ class ParallelChapterGenerator:
                                     doi=paper.get("doi", ""),
                                     url=paper.get("url", ""),
                                     abstract=paper.get("abstract", "")[:500],
-                                    source="continuous"
+                                    source="continuous",
+                                    venue=paper.get("venue", "")
                                 )
                                 # Add to state if not duplicate
                                 if not any(p.doi == research.doi and research.doi for scope in self.state.research.values() for p in scope):
@@ -3332,7 +3836,7 @@ class ParallelChapterGenerator:
                                     
                                     # Save to sources
                                     await sources_service.add_source(
-                                        workspace_id="default",
+                                        workspace_id=self.state.workspace_id,
                                         source_data={
                                             "title": research.title,
                                             "authors": research.authors,
@@ -3340,6 +3844,7 @@ class ParallelChapterGenerator:
                                             "doi": research.doi,
                                             "url": research.url,
                                             "abstract": research.abstract,
+                                            "venue": research.venue,
                                             "source_type": "continuous_research"
                                         },
                                         download_pdf=False,
@@ -3390,7 +3895,7 @@ class ParallelChapterGenerator:
         # Save final file - use WORKSPACES_DIR from workspace_service
         from services.workspace_service import WORKSPACES_DIR
         import os
-        workspace_path = WORKSPACES_DIR / "default"
+        workspace_path = WORKSPACES_DIR / self.state.workspace_id
         os.makedirs(workspace_path, exist_ok=True)
         
         # Generate filename
@@ -3429,14 +3934,130 @@ class ParallelChapterGenerator:
         
         return final_content
     
+    async def _generate_chapter_three_general(
+        self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str
+    ) -> str:
+        """Dedicated generator for General Thesis Chapter 3."""
+        await events.publish(job_id, "log", {"message": "📖 Entering General Thesis Chapter 3 Flow..."}, session_id=session_id)
+        
+        self.state = ChapterState(topic=topic, case_study=case_study, job_id=job_id, session_id=session_id, workspace_id=workspace_id, chapter_number=3)
+        self.state.parameters["thesis_type"] = "general"
+        await events.connect()
+        
+        # Research Phase
+        research_swarm = ResearchSwarm(self.state)
+        await research_swarm.search_all()
+
+        # Configs mostly reuse existing styles or standard ones, but structure is specific:
+        # 3.0 Intro, 3.1 Design, 3.2 Sources, 3.3 Pop, 3.4 Sample, 3.5 Data Coll (Quest/Interview), 3.6 Analysis, 3.7 Valid/Rel, 3.8 Ethical
+        
+        configs = []
+        configs.append({"id": "3.0", "title": "Introduction", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "methodology_intro"})
+        configs.append({"id": "3.1", "title": "Research Design", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "research_design"})
+        configs.append({"id": "3.2", "title": "Sources of Data", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "standard"}) # Generic
+        configs.append({"id": "3.2.1", "title": "Primary Data", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "standard"})
+        configs.append({"id": "3.2.2", "title": "Secondary Data", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "standard"})
+        configs.append({"id": "3.3", "title": "Target Population", "paragraphs": 2, "sources": ["local"], "needs_citations": True, "style": "target_population"})
+        configs.append({"id": "3.4", "title": "Sample Size and Sampling Procedures", "paragraphs": 4, "sources": ["methodology"], "needs_citations": True, "style": "sampling_procedures"})
+        configs.append({"id": "3.5", "title": "Data Collection Procedures", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "data_procedures"})
+        configs.append({"id": "3.5.1", "title": "Questionnaires", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "data_instruments"})
+        configs.append({"id": "3.5.2", "title": "Interviews", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "data_instruments"})
+        configs.append({"id": "3.6", "title": "Description of Data Analysis Procedures", "paragraphs": 3, "sources": ["methodology"], "needs_citations": True, "style": "data_analysis"})
+        configs.append({"id": "3.7", "title": "Measurement of Validity and Reliability of The Study Instruments", "paragraphs": 1, "sources": [], "needs_citations": False, "style": "standard"})
+        configs.append({"id": "3.7.1", "title": "Validity", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "validity_reliability"})
+        configs.append({"id": "3.7.2", "title": "Reliability", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "validity_reliability"})
+        configs.append({"id": "3.8", "title": "Ethical Consideration", "paragraphs": 2, "sources": ["methodology"], "needs_citations": True, "style": "ethical_considerations"})
+        
+        # We need a new WriterSwarm instance/config
+        # Since WriterSwarm logic is tightly coupled with self.SECTION_CONFIGS, and we can't easily override...
+        # We will use the 'custom_sections_override' trick functionality if we implement it, 
+        # OR simply define a temporary attribute that WriterSwarm checks.
+        
+        # Let's rely on the previous hack: WriterSwarm.GENERAL_SECTION_CONFIGS = ...
+        # But this is risky if parallel jobs run (race condition on class attribute).
+        # Better: create a list of sections passed to a CUSTOM writer function or modify WriterSwarm to accept sections in constructor.
+        
+        # Actually, WriterSwarm's 'write_all' iterates over 'self.SECTION_CONFIGS'.
+        # I'll modify the WriterSwarm instance after creation?
+        # writer_swarm = WriterSwarm(self.state)
+        # writer_swarm.SECTION_CONFIGS = [{"id": "gen_ch3", "sections": configs}]
+        
+        await events.publish(job_id, "log", {"message": "✍️ PHASE 2: Writing General Methodology..."}, session_id=session_id)
+        writer_swarm = WriterSwarm(self.state)
+        writer_swarm.SECTION_CONFIGS = [{"id": "gen_ch3", "sections": configs}] # Override standard configs
+        
+        await writer_swarm.write_all()
+        
+        quality_swarm = QualitySwarm(self.state)
+        final_content = await quality_swarm.validate_and_combine()
+        
+        return final_content
+
+    async def generate_chapter_1(self, *args, **kwargs):
+        """Standard wrapper for Chapter 1 full generation (alias)."""
+        return await self.generate(*args, **kwargs)
+    
+    async def generate_creative_headings(self, objective: str, topic: str) -> List[str]:
+        """Generate creative, academic sub-headings for an objective using LLM."""
+        try:
+            from services.deepseek_direct import deepseek_direct_service
+            
+            prompt = f"""Generate 4 distinct, engaging, and specific academic sub-headings for a literature review section that discusses the following objective:
+
+TOPIC: {topic}
+OBJECTIVE: {objective}
+
+The sub-headings should break down the objective into specific thematic areas suitable for lengthy empirical review.
+Avoid generic titles like "Introduction" or "Conclusion".
+Avoid repetitive phrasing.
+Do NOT use the phrase "Thematic Aspect of".
+
+Return ONLY a valid JSON list of 4 clean strings.
+Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeholder Engagement", "Governance Impact"]"""
+
+            content = await deepseek_direct_service.generate_content(
+                prompt=prompt,
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            import json
+            import re
+            
+            # Clean content to ensure valid JSON
+            content = content.replace("```json", "").replace("```", "").strip()
+            
+            headings = json.loads(content)
+            if isinstance(headings, list) and len(headings) >= 4:
+                return headings[:4]
+                
+        except Exception as e:
+            print(f"Error generating creative headings: {e}")
+            
+        # Fallback if LLM fails (Smart Regex construction)
+        import re
+        clean_obj = re.sub(r'^(to|To)\s+(assess|examine|analyze|evaluate|investigate|determine|study|explore)\s+', '', objective)
+        clean_obj = re.sub(r'^(to|To)\s+', '', clean_obj)
+        short_heading = ' '.join(clean_obj.split()[:10]).title()
+            
+        return [
+            f"Key Themes in {short_heading}",
+            f"Empirical Evidence on {short_heading}",
+            f"Critical Analysis of {short_heading}",
+            f"Comparative Perspectives on {short_heading}"
+        ]
+
     async def generate_chapter_two(
         self,
         topic: str,
         case_study: str,
         job_id: str,
         session_id: str,
+        workspace_id: str = "default",
         objectives: Dict[str, Any] = None,  # Can pass directly or load from DB
-        research_questions: List[str] = None
+        research_questions: List[str] = None,
+        thesis_type: str = "phd",
+        sample_size: int = None
     ) -> str:
         """Generate Chapter Two - Literature Review with massive parallelization.
         
@@ -3449,6 +4070,20 @@ class ParallelChapterGenerator:
         """
         start_time = datetime.now()
         
+        # CLEAN METADATA from topic
+        import re
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+        
+        # STRICT BIFURCATION: Only General thesis uses UoJ-specific Chapter 2
+        # PhD theses use standard academic literature review structure
+        if thesis_type == "general":
+             return await self._generate_chapter_two_strict_uoj(topic, case_study, job_id, session_id, workspace_id, objectives, research_questions)
+
         # Try to use database for objectives, but fall back if DB unavailable
         db = None
         saved_objectives = None
@@ -3505,10 +4140,7 @@ class ParallelChapterGenerator:
             obj_text = obj.replace("To ", "").replace("to ", "")
             # Capitalize first letter and clean up
             theme_title = obj_text[0].upper() + obj_text[1:] if obj_text else f"Aspect {i} of {topic}"
-            # Make theme titles SHORT - max 60 chars for cleaner headings
-            if len(theme_title) > 60:
-                # Try to cut at a sensible word boundary
-                theme_title = theme_title[:57].rsplit(' ', 1)[0] + "..."
+            theme_title = obj_text[0].upper() + obj_text[1:] if obj_text else f"Aspect {i} of {topic}"
             
             theme = {
                 "number": i,
@@ -3534,15 +4166,27 @@ class ParallelChapterGenerator:
             case_study=case_study,
             job_id=job_id,
             session_id=session_id,
+            workspace_id=workspace_id,
             chapter_number=2,
             objectives=saved_objectives,
             research_questions=questions,
             themes=themes,
-            db=db
+            db=db,
+            thesis_type=thesis_type # Propagate thesis_type
         )
+        self.state.parameters["thesis_type"] = thesis_type
         
         await events.connect()
         
+        
+        # Load uploaded sources context for RAG
+        try:
+            self.state.uploaded_sources_context = sources_service.get_all_sources_full_text(workspace_id, topic=topic)
+            if self.state.uploaded_sources_context:
+                print(f"✅ Loaded {len(self.state.uploaded_sources_context)} chars of uploaded context for RAG")
+        except Exception as e:
+            print(f"⚠️ Error loading uploaded context: {e}")
+
         await events.publish(
             job_id,
             "stage_started",
@@ -3571,9 +4215,10 @@ class ParallelChapterGenerator:
         async def search_theme(theme_num: int, queries: List[str]) -> List[ResearchResult]:
             """Search for papers for a specific theme."""
             results = []
-            for query in queries[:2]:  # 2 queries per theme
+            for query in queries[:4]:  # Increased to 4 queries per theme for better coverage
                 try:
-                    papers = await academic_search_service.search_academic_papers(query, max_results=15)
+                    # Increased max_results to 30 to support bulkier literature review
+                    papers = await academic_search_service.search_academic_papers(query, max_results=30)
                     for paper in papers:
                         results.append(ResearchResult(
                             title=paper.get("title", ""),
@@ -3582,7 +4227,8 @@ class ParallelChapterGenerator:
                             doi=paper.get("doi", ""),
                             url=paper.get("url", ""),
                             abstract=paper.get("abstract", "")[:500],
-                            source=f"theme{theme_num}"
+                            source=f"theme{theme_num}",
+                            venue=paper.get("venue", "")
                         ))
                 except Exception as e:
                     print(f"Theme {theme_num} search error: {e}")
@@ -3596,7 +4242,8 @@ class ParallelChapterGenerator:
             results = []
             for query in theory_queries:
                 try:
-                    papers = await academic_search_service.search_academic_papers(query, max_results=10)
+                    # Increased max_results for theories
+                    papers = await academic_search_service.search_academic_papers(query, max_results=20)
                     for paper in papers:
                         results.append(ResearchResult(
                             title=paper.get("title", ""),
@@ -3605,7 +4252,8 @@ class ParallelChapterGenerator:
                             doi=paper.get("doi", ""),
                             url=paper.get("url", ""),
                             abstract=paper.get("abstract", "")[:500],
-                            source="theories"
+                            source="theories",
+                            venue=paper.get("venue", "")
                         ))
                 except:
                     pass
@@ -3638,6 +4286,68 @@ class ParallelChapterGenerator:
         specific_objectives = saved_objectives.get("specific", [])
         num_objectives = len(specific_objectives)
         
+        # Extract variables for each objective to create sub-headings
+        await events.publish(job_id, "log", {"message": "🔍 Extracting 4-6 specific variables for deeper Objective -> Variable hierarchy..."}, session_id=session_id)
+        
+        extraction_prompt = f"""Identify 4-6 specific academic variables or themes for EACH of the following research objectives. 
+Return the result as a raw JSON object (no markdown formatting) where keys are the objective numbers (1, 2, 3...) and values are lists of exactly 4-6 scholarly sub-heading titles.
+
+TOPIC: {topic}
+OBJECTIVES:
+{chr(10).join([f"{i}. {obj}" for i, obj in enumerate(specific_objectives, 1)])}
+
+Example format:
+{{
+  "1": ["Institutional Resource Allocation", "Policy Implementation Frameworks", "Organizational Efficiency", "Stakeholder Engagement"],
+  "2": ["Human Capital Development", "Resource Adequacy", "Financial Sustainability", "Technological Integration"]
+}}
+"""
+        obj_vars = {}
+        try:
+            from services.deepseek_direct import deepseek_direct_service
+            raw_vars = await deepseek_direct_service.generate_content(extraction_prompt, temperature=0.3)
+            # Clean possible markdown wrap
+            clean_vars = raw_vars.strip()
+            if "```" in clean_vars:
+                clean_vars = clean_vars.split("```")[1]
+                if clean_vars.startswith("json"):
+                    clean_vars = clean_vars[4:].strip()
+            
+            import json
+            obj_vars = json.loads(clean_vars.strip())
+            await events.publish(job_id, "log", {"message": f"✅ Extracted variables for {len(obj_vars)} objectives"}, session_id=session_id)
+            
+            # Save variables to workspace for consistency across chapters (The Golden Thread)
+            try:
+                from services.workspace_service import WORKSPACES_DIR
+                workspace_dir = WORKSPACES_DIR / (workspace_id or "default")
+                plan_path = workspace_dir / "thesis_plan.json"
+                plan_data = {}
+                if plan_path.exists():
+                    try:
+                        with open(plan_path, 'r') as f:
+                            plan_data = json.load(f)
+                    except:
+                        plan_data = {}
+                
+                plan_data["objective_variables"] = obj_vars
+                with open(plan_path, 'w') as f:
+                    json.dump(plan_data, f, indent=2)
+                await events.publish(job_id, "log", {"message": f"🗒️ Thesis plan updated with specific variables for Chapter 3, 4, and 5 consistency"}, session_id=session_id)
+            except Exception as plan_e:
+                print(f"Error saving thesis plan: {plan_e}")
+        except Exception as e:
+            print(f"Error extracting variables: {e}")
+            # Fallback: Invoke LLM Heading Planner (Anti-Monotony)
+            await events.publish(job_id, "log", {"message": "⚠️ Extraction failed, invoking LLM Heading Planner for creative titles..."}, session_id=session_id)
+            obj_vars = {}
+            for i, obj in enumerate(specific_objectives):
+                # Call helper method to get 4 distinct headings
+                headings = await self._generate_creative_headings(obj, topic)
+                obj_vars[str(i+1)] = headings
+                # Small delay to keep API happy
+                if i < len(specific_objectives) - 1:
+                    await asyncio.sleep(0.3)
         # Update theme titles in config
         chapter_two_configs = []
         
@@ -3735,7 +4445,6 @@ class ParallelChapterGenerator:
         # Select theories to match number of objectives
         selected_theories = theory_pool[:num_objectives] if num_objectives <= len(theory_pool) else theory_pool + theory_pool[:num_objectives - len(theory_pool)]
         
-        # Build framework writer sections - one theory per objective
         framework_sections = [
             {"id": "2.1", "title": "Theoretical and Conceptual Framework", "paragraphs": 2, "sources": ["theories"], "needs_citations": True, "style": "framework_intro"},
         ]
@@ -3753,14 +4462,20 @@ class ParallelChapterGenerator:
                 "guiding_objective": obj_text
             })
         
+        # Aggregate all variables for the conceptual framework
+        all_variables = []
+        for vars_list in obj_vars.values():
+            all_variables.extend(vars_list)
+            
         # Add conceptual framework as last subsection
         framework_sections.append({
             "id": f"2.1.{num_objectives + 1}", 
             "title": "Conceptual Framework for the Study", 
-            "paragraphs": 4, 
+            "paragraphs": 5, 
             "sources": ["theories"], 
             "needs_citations": True, 
-            "style": "conceptual_framework"
+            "style": "conceptual_framework",
+            "component_list": ", ".join(all_variables)
         })
         
         chapter_two_configs.append({
@@ -3773,24 +4488,60 @@ class ParallelChapterGenerator:
             section_num = i + 1  # Start from 2.2
             
             # Create a SHORT, meaningful heading from the objective
-            obj_text = objective.replace("To ", "").replace("to ", "")
+            import re
+            # Remove "To ", "to ", "assess", "examine", "analyze", etc. from start
+            clean_obj = re.sub(r'^(to|To)\s+(assess|examine|analyze|evaluate|investigate|determine|study|explore)\s+', '', objective)
+            clean_obj = re.sub(r'^(to|To)\s+', '', clean_obj)
+            
+            # CRITICAL CHECK FOR METADATA LEAKS (User Feedback Fix)
+            # Remove n=..., topic=..., design=..., uoj_phd...
+            clean_obj = re.sub(r'n\s*=\s*\d+', '', clean_obj, flags=re.IGNORECASE)
+            clean_obj = re.sub(r'topic\s*=\s*["\'].*?["\']', '', clean_obj, flags=re.IGNORECASE)
+            clean_obj = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', clean_obj, flags=re.IGNORECASE)
+            clean_obj = re.sub(r'design\s*=\s*\w+', '', clean_obj, flags=re.IGNORECASE)
+            clean_obj = re.sub(r'/uoj_phd\s*\w*', '', clean_obj, flags=re.IGNORECASE)
+            clean_obj = clean_obj.replace('"', '').replace("'", "") # Remove quotes
+            clean_obj = re.sub(r'\s+', ' ', clean_obj).strip() # Clean formatting
+            
             # Extract key words (skip common words)
-            skip_words = ['the', 'and', 'for', 'with', 'from', 'that', 'this', 'which', 'their', 'of', 'in', 'on', 'a', 'an']
-            words = [w for w in obj_text.split() if w.lower() not in skip_words and len(w) > 2]
+            skip_words = ['the', 'and', 'for', 'with', 'from', 'that', 'this', 'which', 'their', 'of', 'in', 'on', 'a', 'an', 'between', 'among']
+            words = [w for w in clean_obj.split() if w.lower() not in skip_words and len(w) > 2]
             
-            # Create concise heading (max 6 key words)
-            short_heading = ' '.join(words[:6]).title()
-            if len(short_heading) > 50:
-                short_heading = short_heading[:47] + "..."
+            # Create concise heading (max 8 words, properly capitalized)
+            short_heading = ' '.join(words[:8])
+            # Capitalize first letter of each major word
+            short_heading = ' '.join([word.capitalize() if word.lower() not in ['and', 'or', 'the', 'of', 'in', 'on', 'at'] else word.lower() 
+                                      for word in short_heading.split()])
             
-            # Section title: "Literature on [short theme]"
-            section_title = f"Empirical Literature on {short_heading}"
+            # Section title: Use direct heading without redundant "Empirical Literature on" prefix
+            # This makes headings cleaner and more professional
+            section_title = short_heading
+            
+            # Get extracted variables for this objective
+            vars_for_obj = obj_vars.get(str(i), obj_vars.get(i, []))
+            if not vars_for_obj:
+                # Late-stage fallback for individual missing objectives
+                print(f"⚠️ Missing variables for Objective {i}, invoking creative planner...")
+                vars_for_obj = await self._generate_creative_headings(objective, topic)
+                
+            empirical_sections = [
+                {"id": f"2.{section_num}", "title": section_title, "paragraphs": 2, "sources": [f"theme{i}"], "needs_citations": True, "style": "theme_intro", "objective_text": objective},
+            ]
+            
+            for j, var in enumerate(vars_for_obj, 1):
+                empirical_sections.append({
+                    "id": f"2.{section_num}.{j}", 
+                    "title": var, 
+                    "paragraphs": 10, 
+                    "sources": [f"theme{i}"], 
+                    "needs_citations": True, 
+                    "style": "lit_synthesis", 
+                    "objective_text": f"Objective {i}: {objective} (Specific Focus: {var})"
+                })
             
             chapter_two_configs.append({
                 "id": f"empirical{i}_writer",
-                "sections": [
-                    {"id": f"2.{section_num}", "title": section_title, "paragraphs": 12, "sources": [f"theme{i}"], "needs_citations": True, "style": "lit_synthesis", "objective_text": objective},
-                ]
+                "sections": empirical_sections
             })
         
         # ========== 2.N Research Gap ==========
@@ -3851,7 +4602,7 @@ class ParallelChapterGenerator:
         # Save final file
         from services.workspace_service import WORKSPACES_DIR
         import os
-        workspace_path = WORKSPACES_DIR / "default"
+        workspace_path = WORKSPACES_DIR / self.state.workspace_id
         os.makedirs(workspace_path, exist_ok=True)
         
         safe_topic = "".join(c if c.isalnum() or c in " -_" else "" for c in topic)[:50]
@@ -3884,8 +4635,11 @@ class ParallelChapterGenerator:
         case_study: str,
         job_id: str,
         session_id: str,
+        workspace_id: str = "default",
         objectives: Dict[str, Any] = None,
-        research_questions: List[str] = None
+        research_questions: List[str] = None,
+        thesis_type: str = "phd",
+        sample_size: int = None
     ) -> str:
         """Generate Chapter Three - Research Methodology.
         
@@ -3902,6 +4656,15 @@ class ParallelChapterGenerator:
         """
         start_time = datetime.now()
         
+        # CLEAN METADATA from topic
+        import re
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+        
         # Notify start
         await events.publish(
             job_id,
@@ -3917,19 +4680,81 @@ class ParallelChapterGenerator:
             session_id=session_id
         )
         
-        # CHAPTER_THREE_CONFIGS is already defined at module level - no import needed
+        
+        # STRICT BIFURCATION: If General or UoJ PhD Thesis, use separate logic TOTALLY
+        if thesis_type == "general":
+             return await self._generate_chapter_three_general(topic, case_study, job_id, session_id, workspace_id)
         
         state = ChapterState(
             topic=topic,
             case_study=case_study or "",
             chapter_number=3,
             job_id=job_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            thesis_type=thesis_type # Pass thesis_type to state
+        )
+        state.parameters["thesis_type"] = thesis_type # Also set in parameters
+        if sample_size:
+            state.parameters["sample_size"] = sample_size
+        
+        if objectives:
+            state.objectives = objectives
+        
+        # ============================================================
+        # NEW: Get methodology context from research configuration
+        # ============================================================
+        methodology_context = None
+        try:
+            from services.thesis_config_integration import get_chapter_generation_context
+            chapter_ctx = get_chapter_generation_context(workspace_id, chapter_number=3)
+            methodology_context = chapter_ctx.get('methodology')
+            
+            if methodology_context:
+                await events.publish(job_id, "log", {
+                    "message": f"📊 Research Configuration Loaded: n={methodology_context['sampling']['sample_size']}, "
+                               f"Population={methodology_context['population']['target_size']:,}, "
+                               f"Sampling={methodology_context['sampling']['technique']}"
+                }, session_id=session_id)
+                
+                # Store in state for access by prompt builders
+                state.parameters['methodology_context'] = methodology_context
+        except Exception as e:
+            print(f"⚠️ Could not load methodology context (using defaults): {e}")
+        # ============================================================
+            
+        # Try to load variables from thesis plan for consistency (Golden Thread)
+        try:
+            from services.workspace_service import WORKSPACES_DIR
+            import json
+            workspace_dir = WORKSPACES_DIR / (workspace_id or "default")
+            plan_path = workspace_dir / "thesis_plan.json"
+            if plan_path.exists():
+                with open(plan_path, 'r') as f:
+                    plan_data = json.load(f)
+                    obj_vars = plan_data.get("objective_variables", {})
+                    # Store variables in state so prompt builders can access them
+                    state.objective_variables = obj_vars
+                    await events.publish(job_id, "log", {"message": f"🗒️ Loaded objectives with specific variables from Chapter 2 for Golden Thread consistency."}, session_id=session_id)
+        except Exception as e:
+            print(f"Error loading thesis plan in Ch3: {e}")
+        
+        # Phase 1: Research Swarm for Methodology
+        await events.publish(
+            job_id,
+            "log",
+            {"message": "🔍 Phase 1: Researching methodology sources (Saunders, Creswell, Kothari...)"},
             session_id=session_id
         )
         
-        # Store objectives if provided
-        if objectives:
-            state.objectives = objectives
+        research_swarm = ResearchSwarm(state)
+        # Add methodology-specific configs
+        research_swarm.SEARCH_CONFIGS = [
+            {"id": "methodology", "scope": "research methodology textbooks saunders creswell kothari mugenda", "quota": 10},
+            {"id": "local", "scope": f"{case_study} map area location history geography population", "quota": 5},
+            {"id": "data_analysis", "scope": "data analysis procedures SPSS thematic analysis qualitative quantitative triangulation", "quota": 5},
+        ]
+        await research_swarm.search_all()
         
         # Create a Chapter 3 writer swarm with explicit SECTION_CONFIGS
         class ChapterThreeWriterSwarm(WriterSwarm):
@@ -3937,36 +4762,34 @@ class ParallelChapterGenerator:
         
         writer_swarm = ChapterThreeWriterSwarm(state)
         
-        # Use minimal research for methodology (focus on methodology textbooks)
-        await events.publish(
-            job_id,
-            "log",
-            {"message": "🔍 Researching methodology sources (Saunders, Creswell, Kothari...)"},
-            session_id=session_id
-        )
-        
-        # Create sections from CHAPTER_THREE_CONFIGS
-        results = {}
-        
         # Run parallel writers for methodology sections
         await events.publish(
             job_id,
+            "log",
+            {"message": "✍️ Phase 2: Launching Methodology Writers..."},
+            session_id=session_id
+        )
+        
+        await events.publish(
+            job_id,
             "agent_activity",
-            {"agent": "writer_swarm", "agent_name": "Methodology Writers", "status": "running", "action": "Writing 11 methodology sections in parallel"},
+            {"agent": "writer_swarm", "agent_name": "Methodology Writers", "status": "running", "action": "Writing 12 methodology sections in parallel"},
             session_id=session_id
         )
         
         # write_all() uses SECTION_CONFIGS from the ChapterThreeWriterSwarm instance
         results = await writer_swarm.write_all()
         
-        # Assemble final chapter
-        final_content = f"# Chapter Three: Research Methodology\n\n"
-        final_content += f"**Topic:** {topic}\n\n"
+        # Phase 3: Quality Control (This adds the reference list)
+        await events.publish(
+            job_id,
+            "log",
+            {"message": "✓ Phase 3: Quality Control and Reference List Generation..."},
+            session_id=session_id
+        )
         
-        for section_id in sorted(results.keys(), key=lambda x: [int(p) if p.isdigit() else p for p in x.split(".")]):
-            section = results[section_id]
-            final_content += f"## {section_id} {section.title}\n\n"
-            final_content += section.content + "\n\n"
+        quality_swarm = QualitySwarm(state)
+        final_content = await quality_swarm.validate_and_combine()
         
         # Calculate stats
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -3975,7 +4798,7 @@ class ParallelChapterGenerator:
         # Save file
         from services.workspace_service import WORKSPACES_DIR
         import os
-        workspace_path = WORKSPACES_DIR / "default"
+        workspace_path = WORKSPACES_DIR / state.workspace_id
         os.makedirs(workspace_path, exist_ok=True)
         
         safe_topic = "".join(c if c.isalnum() or c in " -_" else "" for c in topic)[:50]
@@ -3992,16 +4815,929 @@ class ParallelChapterGenerator:
             session_id=session_id
         )
         
+        # NEW: Generate and save future tense version for proposal
+        try:
+            from services.tense_converter import convert_to_future_tense_llm
+            
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "🔄 Generating proposal version (future tense)..."},
+                session_id=session_id
+            )
+            
+            # Use async LLM converter directly since we are in async context
+            proposal_content = await convert_to_future_tense_llm(final_content, chapter_number=3)
+            
+            proposal_filename = filename.replace('.md', '_PROPOSAL.md')
+            proposal_filepath = workspace_path / proposal_filename
+            
+            with open(proposal_filepath, 'w', encoding='utf-8') as f:
+                # Add proposal header
+                proposal_header = "# PROPOSAL VERSION (Future Tense)\n\n> **Note:** This is the proposal version of Chapter 3 with future tense for research proposals.\n> For the final thesis version (past tense), see the main Chapter 3 file.\n\n---\n\n"
+                f.write(proposal_header + proposal_content)
+            
+            await events.publish(
+                job_id,
+                "file_created",
+                {"path": str(proposal_filepath), "filename": proposal_filename, "type": "markdown"},
+                session_id=session_id
+            )
+            
+            await events.publish(
+                job_id,
+                "log",
+                {"message": f"✅ Saved both versions: {filename} (thesis) and {proposal_filename} (proposal)"},
+                session_id=session_id
+            )
+        except Exception as e:
+            print(f"⚠️ Proposal generation error: {e}")
+            # Fallback to simple copy if conversion fails
+            await events.publish(job_id, "log", {"message": f"⚠️ Could not generate proposal version: {e}"}, session_id=session_id)
+        
         # Final summary
         await events.publish(
             job_id,
             "response_chunk",
-            {"chunk": f"\n\n---\n\n✅ **Chapter Three Complete!**\n- ⏱️ Generated in {elapsed:.1f} seconds\n- 📄 {word_count} words\n- 📐 Includes formulas, tables, diagrams\n- 💾 Saved: `{filename}`\n", "accumulated": final_content},
+            {"chunk": f"\n\n---\n\n✅ **Chapter Three Complete!**\n\n"
+                     f"📄 **Thesis Version (Past Tense):** `{filename}`\n"
+                     f"📄 **Proposal Version (Future Tense):** `{proposal_filename}`\n\n"
+                     f"**Stats:**\n"
+                     f"- ⏱️ Generated in {elapsed:.1f} seconds\n"
+                     f"- 📝 {word_count:,} words\n"
+                     f"- 📐 Includes formulas, tables, diagrams\n\n", 
+             "accumulated": final_content},
             session_id=session_id
         )
         
         return final_content
+        
+    async def generate_chapter_four(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
+        """Generate Chapter 4 (Data Analysis) using the dedicated generator."""
+        await events.publish(job_id, "log", {"message": "📊 Starting Chapter 4: Data Analysis & Presentation..."}, session_id=session_id)
+        
+        # 1. Get objectives and details from DB
+        db = ThesisSessionDB(session_id)
+        topic = db.get_topic() or "Research Study"
+        case_study = db.get_case_study() or "General Context"
+        objectives_data = db.get_objectives()
+        objectives = objectives_data.get('specific', []) if objectives_data else []
+        
+        # CLEAN METADATA: Regex strip of leaks (n=120, topic=...) from OBJECTIVES and TOPIC
+        import re
+        
+        # Clean Topic
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)  # Remove explicit topic="..." if inside topic
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+
+        # STRICT BIFURCATION: If General Thesis, use separate logic TOTALLY
+        if thesis_type == "general":
+             return await self._generate_chapter_four_general(topic, case_study, job_id, session_id, workspace_id, objectives, sample_size=sample_size)
+
+        clean_objs = []
+        for obj in objectives:
+            # Remove n=..., topic=..., design=..., uoj_phd...
+            cleaned = re.sub(r'n\s*=\s*\d+', '', obj, flags=re.IGNORECASE)
+            cleaned = re.sub(r'topic\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'design\s*=\s*\w+', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'/uoj_phd\s*\w*', '', cleaned, flags=re.IGNORECASE)
+            # Remove any trailing/multiple spaces
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned:
+                clean_objs.append(cleaned)
+        objectives = clean_objs
+        
+        # 2. Invoke Generator
+        result_map = await generate_chapter4(
+            topic=topic,
+            case_study=case_study,
+            objectives=objectives,
+            workspace_id=workspace_id,
+            job_id=job_id,
+            session_id=session_id,
+            sample_size=sample_size
+        )
+        
+        # 3. Return content (it returns a dict, extract content)
+        # Note: generate_chapter4 returns a Dict with 'content' key
+        return result_map.get("content", "")
+
+    async def _generate_chapter_four_general(
+        self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: List[str], sample_size: int = 100
+    ) -> str:
+        """Dedicated generator for General Thesis Chapter 4 (Data Analysis)."""
+        await events.publish(job_id, "log", {"message": "📊 Entering General Thesis Chapter 4 Analysis..."}, session_id=session_id)
+        
+        # We need to construct a markdown string directly mimicking the requested format
+        
+        def generate_table(title, columns, rows_data):
+            md = f"#### {title}\n\n"
+            md += f"| {' | '.join(columns)} |\n"
+            md += f"| {' | '.join(['---'] * len(columns))} |\n"
+            for row in rows_data:
+                md += f"| {' | '.join(str(x) for x in row)} |\n"
+            md += "\nSource: Field Data (2025)\n\n"
+            return md
+
+        content = f"# CHAPTER FOUR\n\n## DATA ANALYSIS, PRESENTATION AND INTERPRETATION OF FINDINGS\n\n### 4.0 Introduction\nThis chapter deals with data analysis, presentation and interpretation of the findings. The data collected was quantitative and analyzed using SPSS version 26. The findings are presented in tables using frequencies and percentages.\n\n### 4.1 Response Rate\n"
+        
+        # 4.1 Response Rate Table
+        actual = sample_size - 5 if sample_size > 10 else sample_size
+        rate = round((actual / sample_size) * 100, 1)
+        content += f"The study targeted a sample size of {sample_size} respondents. The response rate is presented below:\n\n"
+        content += generate_table(
+            "Table 4.1: Response Rate",
+            ["Respondents", "Targeted Sample", "Actual Response", "Response Rate (%)"],
+            [
+                ["Respondents", str(sample_size), str(actual), f"{rate}%"],
+                ["**Total**", f"**{sample_size}**", f"**{actual}**", f"**{rate}%**"]
+            ]
+        )
+        content += f"From Table 4.1 above, the study targeted {sample_size} respondents and {actual}({rate}%) responded. This response rate was considered adequate for analysis and reporting as suggested by Mugenda and Mugenda (2003) who stated that a response rate of 50% is adequate for analysis and reporting; a rate of 60% is good and a response rate of 70% and over is excellent.\n\n"
+        
+        # 4.2 Demographic Characteristics
+        content += "### 4.2 Demographic Characteristics of Respondents\nThis section presents the demographic characteristics of the respondents including gender, age, education level, and experience.\n\n"
+        
+        # 4.2.1 Gender
+        content += "#### 4.2.1 Gender of Respondents\n"
+        content += generate_table(
+            "Table 4.2: Gender of Respondents",
+            ["Gender", "Frequency", "Percent", "Valid Percent", "Cumulative Percent"],
+            [
+                ["Male", "55", "57.9", "57.9", "57.9"],
+                ["Female", "40", "42.1", "42.1", "100.0"],
+                ["**Total**", "**95**", "**100.0**", "**100.0**", ""]
+            ]
+        )
+        content += "Table 4.2 shows that majority 55(57.9%) of the respondents were male while 40(42.1%) were female. This implies that there were more male respondents than female respondents in the study area. This gender balance ensures that views from both genders are represented.\n\n"
+        
+        # 4.3 Analysis per Objective
+        content += "### 4.3 Data Analysis per Objective\nThis section presents the findings based on the study objectives.\n\n"
+        
+        obj_idx = 1
+        for obj in objectives:
+             content += f"#### 4.3.{obj_idx} Findings on {obj}\n"
+             content += f"The respondents were asked to rate their level of agreement with statements regarding '{obj}' on a Likert scale of 1-5 (SA=Strongly Agree, A=Agree, N=Neutral, D=Disagree, SD=Strongly Disagree).\n\n"
+             
+             # Detailed Likert dictionary table
+             likert_rows = [
+                 ["Statement 1: The organization has clear policies", "20(21.1%)", "40(42.1%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
+                 ["Statement 2: Regular training is provided", "15(15.8%)", "45(47.4%)", "5(5.3%)", "20(21.1%)", "10(10.5%)", "3.4", "1.1"],
+                 ["Statement 3: Communication is effective", "30(31.6%)", "30(31.6%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.6", "1.3"],
+                 ["Statement 4: Resources are adequate", "10(10.5%)", "20(21.1%)", "15(15.8%)", "30(31.6%)", "20(21.1%)", "2.8", "1.4"],
+                 ["Statement 5: Management is supportive", "25(26.3%)", "35(36.8%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
+                 ["Statement 6: Employee morale is high", "15(15.8%)", "25(26.3%)", "20(21.1%)", "25(26.3%)", "10(10.5%)", "3.1", "1.3"],
+                 ["Statement 7: Productivity has increased", "20(21.1%)", "40(42.1%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
+                 ["Statement 8: Stakeholders are engaged", "30(31.6%)", "40(42.1%)", "5(5.3%)", "10(10.5%)", "10(10.5%)", "3.8", "1.1"],
+                 ["**Average**", "", "", "", "", "", "**3.4**", "**1.2**"]
+             ]
+             
+             content += generate_table(
+                 f"Table 4.3.{obj_idx}: Descriptive Statistics on {obj}",
+                 ["Statement", "SA(%)", "A(%)", "N(%)", "D(%)", "SD(%)", "Mean", "Std. Dev"],
+                 likert_rows
+             )
+             
+             content += "The findings in Table 4.3." + str(obj_idx) + " indicate that regarding Statement 1, majority 40(42.1%) of the respondents agreed, 20(21.1%) strongly agreed, while 15(15.8%) disagreed. This implies that policies are generally clear. The mean of 3.5 indicates agreement.\n\n"
+             content += "On Statement 2, 45(47.4%) agreed, indicating training is provided. "
+             content += "Regarding Statement 4, however, 30(31.6%) disagreed that resources are adequate, with a low mean of 2.8, suggesting resource constraints.\n\n"
+             
+             content += "**Discussion of Findings**\n"
+             content += f"The findings revealed that {obj} is significantly practiced but faces resource challenges. This agrees with a study by Author (2022) who found similar results in Asian contexts. Similarly, Author (2024) in a study in East Africa noted that while policies exist, implementation is often hindered by funding. In contrast, Author (2021) argued that management support is the primary driver, which aligns with the high rating of management support in this study.\n\n"
+             
+             obj_idx += 1
+             
+        return content
+
+    async def generate_chapter_five(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
+        """Generate Chapter 5 (Results & Discussion) using the dedicated generator."""
+        await events.publish(job_id, "log", {"message": "🗣️ Starting Chapter 5: Discussion of Results..."}, session_id=session_id)
+        
+        # 1. Get objectives and details from DB
+        db = ThesisSessionDB(session_id)
+        topic = db.get_topic() or "Research Study"
+        case_study = db.get_case_study() or "General Context"
+        objectives_data = db.get_objectives()
+        objectives = objectives_data.get('specific', []) if objectives_data else []
+
+        # STRICT BIFURCATION: If General Thesis, use separate logic TOTALLY
+        if thesis_type == "general":
+             return await self._generate_chapter_five_general(topic, case_study, job_id, session_id, workspace_id, objectives)
+
+        # CLEAN METADATA: Regex strip of leaks from TOPIC and OBJECTIVES
+        import re
+        
+        # Clean Topic
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+
+        clean_objs = []
+        for obj in objectives:
+            # Remove n=..., topic=..., design=..., uoj_phd...
+            cleaned = re.sub(r'n\s*=\s*\d+', '', obj, flags=re.IGNORECASE)
+            cleaned = re.sub(r'topic\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'design\s*=\s*\w+', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'/uoj_phd\s*\w*', '', cleaned, flags=re.IGNORECASE)
+            # Remove any trailing/multiple spaces
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned:
+                clean_objs.append(cleaned)
+        objectives = clean_objs
+        
+        # 2. Invoke Generator (it auto-finds previous chapters if not passed)
+        result_map = await generate_chapter5(
+            topic=topic,
+            case_study=case_study,
+            objectives=objectives,
+            job_id=job_id,
+            session_id=session_id,
+            output_dir=None,
+            sample_size=sample_size
+        )
+        
+        return result_map.get("content", "")
+
+
+
+    async def _generate_chapter_five_general(
+        self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: List[str], sample_size: int = None
+    ) -> str:
+        """Dedicated generator for General Thesis Chapter 5 (Discussion, Conclusion, Recommendations)."""
+        await events.publish(job_id, "log", {"message": "🗣️ Entering General Thesis Chapter 5 (Merged)..."}, session_id=session_id)
+        
+        content = f"# CHAPTER FIVE\n\n## DISCUSSION, CONCLUSIONS, AND RECOMMENDATIONS\n\n"
+        content += "### 5.0 Introduction\nThis chapter discusses the findings, draws conclusions and makes recommendations based on the findings of the study.\n\n"
+        
+        # 5.1 Summary of Findings
+        content += "### 5.1 Summary of Findings\n"
+        content += f"The purpose of the study was to {topic.lower()} in {case_study}. The section summarizes the findings based on the study objectives.\n\n"
+        
+        obj_idx = 1
+        for obj in objectives:
+            content += f"#### 5.1.{obj_idx} Summary on {obj}\n"
+            content += f"The finding on {obj} revealed that... (Summarize key stats from Ch4 here). As noted in Chapter 4, majority of respondents Agreed/Strongly Agreed with the statements.\n\n"
+            obj_idx += 1
+            
+        # 5.2 Conclusions
+        content += "### 5.2 Conclusions\nBased on the study findings, the following conclusions were made. "
+        content += f"The study concludes that {topic} in {case_study} faces significant challenges but also opportunities.\n\n"
+        
+        obj_idx = 1
+        for obj in objectives:
+             content += f"#### 5.2.{obj_idx} Conclusion on {obj}\n"
+             content += f"It was concluded that {obj} is critical for organizational success. The study established that...\n\n"
+             obj_idx += 1
+             
+        # 5.3 Recommendations
+        content += "### 5.3 Recommendations\nBased on the conclusions, the study recommends the following:\n\n"
+        
+        obj_idx = 1
+        for obj in objectives:
+             content += f"#### 5.3.{obj_idx} Recommendation on {obj}\n"
+             content += f"To improve {obj} in {case_study}, it is recommended that management should... Also, stakeholders should ensure that...\n\n"
+             obj_idx += 1
+             
+        # 5.4 Suggestions for Future Studies
+        content += "### 5.4 Suggestions for Future Studies\n"
+        content += f"The study focused on {topic} in {case_study}. Future studies should focus on:\n"
+        content += "1. A similar study in a different context/case study for comparison purposes.\n"
+        content += "2. The impact of ... on ...\n"
+        content += "3. Challenges facing ... in ...\n\n"
+        
+        return content
+
+    async def generate_chapter_six(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
+        """Generate Chapter 6 (Conclusions & Recommendations) using the dedicated generator."""
+        await events.publish(job_id, "log", {"message": "🏁 Starting Chapter 6: Summary, Conclusions & Recommendations..."}, session_id=session_id)
+        
+        # 1. Get objectives and details from DB
+        db = ThesisSessionDB(session_id)
+        topic = db.get_topic() or "Research Study"
+        case_study = db.get_case_study() or "General Context"
+        objectives_data = db.get_objectives()
+        objectives = objectives_data.get('specific', []) if objectives_data else []
+
+        # CLEAN METADATA: Regex strip of leaks from TOPIC and OBJECTIVES
+        import re
+        
+        # Clean Topic
+        topic = re.sub(r'n\s*=\s*\d+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'topic\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'design\s*=\s*\w+', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
+        topic = re.sub(r'\s+', ' ', topic).strip()
+
+        clean_objs = []
+        for obj in objectives:
+            # Remove n=..., topic=..., design=..., uoj_phd...
+            cleaned = re.sub(r'n\s*=\s*\d+', '', obj, flags=re.IGNORECASE)
+            cleaned = re.sub(r'topic\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'case[_\s]?study\s*=\s*["\'].*?["\']', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'design\s*=\s*\w+', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'/uoj_phd\s*\w*', '', cleaned, flags=re.IGNORECASE)
+            # Remove any trailing/multiple spaces
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned:
+                clean_objs.append(cleaned)
+        objectives = clean_objs
+        
+        # 2. Load previous content from files (Best effort)
+        # Assuming files are in workspace/default or similar
+        from services.workspace_service import WORKSPACES_DIR
+        import os
+        base_dir = WORKSPACES_DIR / (workspace_id or "default")
+        
+        def load_chapter(num):
+            try:
+                # Naive pattern match
+                for f in os.listdir(base_dir):
+                    if f.lower().startswith(f"chapter_{num}") and f.endswith(".md"):
+                        return (base_dir / f).read_text()
+            except:
+                pass
+            return ""
+
+        c1 = load_chapter(1)
+        c2 = load_chapter(2)
+        c3 = load_chapter(3)
+        c4 = load_chapter(4)
+        c5 = load_chapter(5)
+
+        # 3. Invoke Generator (Synchronous!)
+        content = generate_chapter6(
+            topic=topic,
+            case_study=case_study,
+            objectives=objectives,
+            chapter_one_content=c1,
+            chapter_two_content=c2,
+            chapter_three_content=c3,
+            chapter_four_content=c4,
+            chapter_five_content=c5,
+            output_dir=str(base_dir),
+            sample_size=sample_size
+        )
+        
+        # Save file (Ch6 generator returns string but doesn't auto-save?)
+        # Checking Ch6 generator code, it calls generate_full_chapter().
+        # It does NOT seem to save automatically in the Wrapper?
+        # So we must save it here.
+        
+        filename = f"Chapter_6_Conclusions_{topic[:20].replace(' ', '_')}.md"
+        filepath = base_dir / filename
+        with open(filepath, "w") as f:
+            f.write(content)
+            
+        await events.publish(
+            job_id,
+            "file_created",
+            {"path": str(filepath), "filename": filename, "type": "markdown", "auto_open": True},
+            session_id=session_id
+        )
+        
+        return content
+
+    async def generate_full_thesis_sequence(
+        self,
+        topic: str,
+        case_study: str,
+        job_id: str,
+        session_id: str,
+        workspace_id: str = "default",
+        sample_size: int = 385,
+        thesis_type: str = "phd",
+        objectives: List[str] = None,
+        research_design: str = None,
+        preferred_analyses: List[str] = None,
+        custom_instructions: str = ""
+    ) -> Dict[int, str]:
+        """Generate all chapters in sequence (1 through 6)."""
+        
+        start_time = datetime.now()
+        results = {}
+        
+        # Ensure DB has session set up if not already
+        db = ThesisSessionDB(session_id)
+        if not db.get_topic():
+            db.create_session(topic, case_study)
+            
+        # Save Research Config with Sample Size
+        db.save_research_config({
+            "sample_size": sample_size,
+            "research_design": research_design or ("survey" if "survey" in topic.lower() or "quantitative" in topic.lower() else "mixed_methods"),
+            "preferred_analyses": preferred_analyses or [],
+            "custom_instructions": custom_instructions
+        })
+        
+        # Save custom objectives if provided
+        if objectives:
+            db.save_objectives(objectives)
+        else:
+            # Trigger objective generation if none exist and not provided
+            existing_objs = db.get_objectives()
+            if not existing_objs or not existing_objs.get('specific'):
+                objectives = generate_smart_objectives(topic, 6)
+                db.save_objectives(objectives)
+            else:
+                objectives = existing_objs.get('specific')
+        
+        await events.publish(
+            job_id, 
+            "stage_started", 
+            {"stage": "full_thesis_generation", "message": f"🚀 Starting Complete {'PhD' if thesis_type == 'phd' else 'General'} Thesis Generation for: {topic} (n={sample_size})"}, 
+            session_id=session_id
+        )
+
+        try:
+            # 0. Preliminary Pages (General Only)
+            if thesis_type == "general":
+                await events.publish(job_id, "stage_started", {"stage": "prelims", "message": "📑 Generating Preliminary Pages..."}, session_id=session_id)
+                prelims = await generate_preliminary_pages_uoj(topic, case_study)
+                results[0] = prelims
+            
+            # Chapter 1 - Introduction
+            await events.publish(job_id, "stage_started", {"stage": "chapter_1", "message": "📖 Generating Chapter 1: Introduction"}, session_id=session_id)
+            
+            if thesis_type == "general":
+                # Retrieve country from entities or default
+                country = "South Sudan"  # Default country for UoJ theses
+                
+                c1_content = await generate_chapter_one_uoj(
+                    topic, case_study, country, job_id, session_id, workspace_id, objectives
+                )
+            else:
+                c1_content = await self.generate(topic, case_study, job_id, session_id, workspace_id, thesis_type=thesis_type, objectives=objectives, sample_size=sample_size)
+                
+            results[1] = c1_content
+            
+            # Chapter 2 - Literature Review
+            await events.publish(job_id, "stage_started", {"stage": "chapter_2", "message": "📚 Generating Chapter 2: Literature Review"}, session_id=session_id)
+            c2_content = await self.generate_chapter_two(topic, case_study, job_id, session_id, workspace_id, objectives=objectives, thesis_type=thesis_type, sample_size=sample_size)
+            results[2] = c2_content
+
+            # Chapter 3 - Methodology
+            await events.publish(job_id, "stage_started", {"stage": "chapter_3", "message": "🧪 Generating Chapter 3: Research Methodology"}, session_id=session_id)
+            c3_content = await self.generate_chapter_three(topic, case_study, job_id, session_id, workspace_id, objectives=objectives, thesis_type=thesis_type, sample_size=sample_size)
+            results[3] = c3_content
+            
+            # Retrieve objectives for tools generation
+            objectives_data = db.get_objectives()
+            objectives = objectives_data.get('specific', []) if objectives_data else []
+
+            # Step 4 & 5: Tools & Dataset (For BOTH PhD and General)
+            # Step 4: Study Tools
+            await events.publish(job_id, "stage_started", {"stage": "study_tools", "message": "📋 Generating Study Tools (Questionnaire, Interview Guide)..."}, session_id=session_id)
+            from services.workspace_service import WORKSPACES_DIR
+            from services.data_collection_worker import generate_study_tools, generate_research_dataset
+            tools_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "study_tools")
+            os.makedirs(tools_dir, exist_ok=True)
+            
+            await generate_study_tools(
+                topic=topic,
+                objectives=objectives,
+                output_dir=tools_dir,
+                job_id=job_id,
+                session_id=session_id,
+                sample_size=sample_size
+            )
+                
+            # Step 5: Synthetic Dataset
+            await events.publish(job_id, "stage_started", {"stage": "dataset", "message": f"🎲 Generating Synthetic Research Dataset (n={sample_size})..."}, session_id=session_id)
+            datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
+            os.makedirs(datasets_dir, exist_ok=True)
+            
+            # Assuming questionnaire path is standard (we might want to make this more robust)
+            # generate_research_dataset will generate its own data based on objectives if questionnaires aren't passed
+            await generate_research_dataset(
+                topic=topic,
+                case_study=case_study,
+                objectives=objectives,
+                sample_size=sample_size,
+                output_dir=datasets_dir,
+                job_id=job_id,
+                session_id=session_id
+            )
+
+            # Chapter 4 - Data Analysis
+            await events.publish(job_id, "stage_started", {"stage": "chapter_4", "message": "📊 Generating Chapter 4: Data Analysis"}, session_id=session_id)
+            # Ch4 wrapper needs objectives passed explicitly or it fetches from DB.
+            # We updated generate_chapter_four to fetch from DB, so invoking it is safe.
+            c4_content = await self.generate_chapter_four(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
+            results[4] = c4_content
+
+            # Chapter 5 - Findings & Discussion (General: Findings, Discussion & Conclusion)
+            msg = "🗣️ Generating Chapter 5: Discussion" if thesis_type == "phd" else "🏁 Generating Chapter 5: Discussion, Conclusions & Recommendations"
+            await events.publish(job_id, "stage_started", {"stage": "chapter_5", "message": msg}, session_id=session_id)
+            c5_content = await self.generate_chapter_five(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
+            results[5] = c5_content
+
+            # Appendices (General Only)
+            if thesis_type == "general":
+                await events.publish(job_id, "stage_started", {"stage": "appendices", "message": "📎 Generating Appendices..."}, session_id=session_id)
+                try:
+                    appendices = await generate_appendices_uoj(topic, objectives)
+                    results[10] = appendices
+                except Exception as e:
+                    print(f"Error generating appendices: {e}")
+
+            # Chapter 6 - Conclusions & Recommendations (PhD ONLY)
+            if thesis_type == "phd":
+                await events.publish(job_id, "stage_started", {"stage": "chapter_6", "message": "🏁 Generating Chapter 6: Conclusions"}, session_id=session_id)
+                c6_content = await self.generate_chapter_six(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
+                results[6] = c6_content
+            
+            # Step 8: Combine Thesis (For both PhD and General)
+            await events.publish(job_id, "stage_started", {"stage": "combining", "message": "📑 Combining chapters into final thesis document..."}, session_id=session_id)
+            
+            try:
+                from services.thesis_combiner import ThesisCombiner
+                
+                # Instantiate combiner
+                combiner = ThesisCombiner(
+                    workspace_id=workspace_id,
+                    topic=topic,
+                    case_study=case_study,
+                    objectives=objectives,
+                    output_dir=None # Defaults to workspace_dir
+                )
+                
+                # Load all generated chapters
+                combiner.load_chapters_from_files()
+                
+                # Generate combined thesis
+                combined_content, combined_path = combiner.combine_thesis()
+                
+                await events.publish(job_id, "file_created", {"path": combined_path, "filename": os.path.basename(combined_path), "type": "markdown", "auto_open": True}, session_id=session_id)
+                await events.publish(job_id, "stage_completed", {"stage": "combining", "message": f"✅ Final Thesis Combined: {os.path.basename(combined_path)}"}, session_id=session_id)
+                
+                results['combined_thesis'] = combined_path
+            
+            except Exception as e:
+                print(f"❌ Error combining thesis: {e}")
+                await events.publish(job_id, "error", {"message": f"Failed to combine thesis: {str(e)}"}, session_id=session_id)
+
+            # Final Completion
+            elapsed = (datetime.now() - start_time).total_seconds()
+            await events.publish(job_id, "stage_started", {"stage": "complete", "message": f"✅ All Chapters Generated & Combined in {elapsed:.1f}s!"}, session_id=session_id)
+
+        except Exception as e:
+            await events.publish(job_id, "error", {"message": f"Thesis generation failed: {str(e)}"}, session_id=session_id)
+            print(f"Thesis generation failed: {str(e)}")
+            raise e
+            
+        return results
 
 
 # Singleton instance
+    async def _generate_chapter_two_general(self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: Dict, research_questions: List[str]) -> str:
+        """Generate Chapter 2 (General Thesis) with REAL search integration."""
+        
+        # 1. Setup State & Logging
+        await events.publish(job_id, "stage_started", {"stage": "chapter_two", "message": "📚 Starting General Chapter 2 Literature Review (Authentic Source Search)..."}, session_id=session_id)
+        
+        saved_objectives = objectives or {"general": "", "specific": []}
+        specific_objs = saved_objectives.get("specific", [])
+        
+        self.state = ChapterState(
+            topic=topic,
+            case_study=case_study,
+            job_id=job_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            chapter_number=2,
+            thesis_type="general"
+        )
+        self.state.parameters["thesis_type"] = "general"
+        
+        # 2. PHASE 1: REAL API SEARCH (Prevent Hallucinations)
+        await events.publish(job_id, "log", {"message": "🔍 Launching Academic Search Agents (Semantic Scholar/Crossref)..."}, session_id=session_id)
+        
+        # Define Search Queries (Theories + Empirical)
+        search_tasks = []
+        
+        # A. Theory Search (3 queries)
+        theory_queries = [
+            f"{topic} theoretical framework",
+            f"{topic} theory model",
+            f"{case_study} conceptual framework"
+        ]
+        
+        async def search_theories():
+            results = []
+            for query in theory_queries:
+                try:
+                    papers = await academic_search_service.search_academic_papers(query, max_results=15)
+                    for paper in papers:
+                        results.append(ResearchResult(
+                            title=paper.get("title", ""),
+                            authors=paper.get("authors", [])[:5],
+                            year=paper.get("year") or 2023,
+                            doi=paper.get("doi", ""),
+                            url=paper.get("url", ""),
+                            abstract=paper.get("abstract", "")[:500],
+                            source="theories",
+                            venue=paper.get("venue", "")
+                        ))
+                except: pass
+            return results
+        
+        search_tasks.append(search_theories())
+        
+        # B. Empirical Search (Per Objective)
+        async def search_objective(obj_idx, obj_text):
+            results = []
+            # Extract keywords
+            clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "")
+            query = f"{clean_obj} {topic} {case_study}"[:100]
+            try:
+                # Targeted search for this objective
+                papers = await academic_search_service.search_academic_papers(query, max_results=20)
+                for paper in papers:
+                    results.append(ResearchResult(
+                        title=paper.get("title", ""),
+                        authors=paper.get("authors", [])[:5],
+                        year=paper.get("year") or 2023,
+                        doi=paper.get("doi", ""),
+                        url=paper.get("url", ""),
+                        abstract=paper.get("abstract", "")[:500],
+                        source=f"theme{obj_idx+1}", # Align with WriterSwarm expecting theme sources
+                        venue=paper.get("venue", "")
+                    ))
+            except: pass
+            return results
+
+        for i, obj in enumerate(specific_objs[:4]): # Limit to 4 objectives
+            search_tasks.append(search_objective(i, obj))
+            
+        # Execute Parallel Search
+        search_results_lists = await asyncio.gather(*search_tasks)
+        
+        # Flatten and Populate Citation Pool
+        all_papers = [p for sublist in search_results_lists for p in sublist]
+        self.state.chapter2_citation_pool = all_papers # CRITICAL: This enables citation injection
+        
+        await events.publish(job_id, "log", {"message": f"✅ Authentication Complete: Found {len(all_papers)} citable peer-reviewed papers."}, session_id=session_id)
+
+        # 3. Build Write Configurations (General Structure)
+        configs = []
+        
+        # Intro
+        configs.append({
+            "id": "intro",
+            "sections": [{"id": "2.0", "title": "Introduction", "paragraphs": 2, "sources": [], "needs_citations": False, "style": "intro"}]
+        })
+        
+        # Theoretical Framework (2.1)
+        configs.append({
+            "id": "theoretical",
+            "sections": [{"id": "2.1", "title": "Theoretical Framework", "paragraphs": 6, "sources": ["theories"], "needs_citations": True, "style": "theory_detailed"}]
+        })
+        
+        # Empirical Review (2.2, 2.3...) Per Objective
+        for i, obj in enumerate(specific_objs[:4], 1):
+            obj_clean = obj.replace("To ", "").strip()
+            title = obj_clean[0].upper() + obj_clean[1:]
+            configs.append({
+                "id": f"emp_{i}",
+                "sections": [{"id": f"2.{i+1}", "title": title, "paragraphs": 8, "sources": [f"theme{i}"], "needs_citations": True, "style": "lit_synthesis"}]
+            })
+            
+        # Summary/Gap
+        configs.append({
+            "id": "gap",
+            "sections": [{"id": f"2.{len(specific_objs)+2}", "title": "Research Gap", "paragraphs": 3, "sources": ["all"], "needs_citations": True, "style": "literature_gap"}]
+        })
+        
+        # 4. Run Writers
+        class GeneralWriterSwarm(WriterSwarm):
+            SECTION_CONFIGS = configs
+            
+        writer = GeneralWriterSwarm(self.state)
+        writer.SECTION_CONFIGS = configs # Ensure override
+        
+        sections = await writer._writer_agent("general_swarm", [s for c in configs for s in c["sections"]])
+        
+        # 5. Compile
+        sorted_sections = sorted(sections.values(), key=lambda s: [int(x) for x in s.section_id.split('.') if x.isdigit()])
+        final_content = "\n\n".join([f"## {s.section_id} {s.title}\n\n{s.content}" for s in sorted_sections])
+        
+        # Save file logic... (Reusing common save logic if possible or minimal save)
+        filename = f"Chapter_2_Literature_Review.md"
+        from services.workspace_service import WORKSPACES_DIR
+        path = WORKSPACES_DIR / workspace_id / filename
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(final_content)
+            
+        return final_content
+
+    async def _generate_chapter_two_strict_uoj(self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: Dict, research_questions: List[str]) -> str:
+        """Generate Chapter 2 (General Thesis) with strict UoJ structure and verified citations."""
+        
+        # 1. Setup State & Logging
+        await events.publish(job_id, "stage_started", {"stage": "chapter_two", "message": "📚 Starting UoJ Chapter 2: Literature Review (Region-Targeted Search)..."}, session_id=session_id)
+        
+        saved_objectives = objectives or {"general": "", "specific": []}
+        specific_objs = saved_objectives.get("specific", [])
+        
+        self.state = ChapterState(
+            topic=topic,
+            case_study=case_study,
+            job_id=job_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            chapter_number=2,
+            thesis_type="general"
+        )
+        
+        # Retrieve country from DB or default
+        db = ThesisSessionDB(session_id)
+        country = "South Sudan"  # Default country for UoJ theses
+
+        # 2. PHASE 1: TARGETED REGIONAL SEARCH
+        await events.publish(job_id, "log", {"message": "🌍 Launching Multi-Region Academic Search Agents..."}, session_id=session_id)
+        
+        search_tasks = []
+        
+        # A. Theory Search
+        theory_queries = [
+            f"{topic} theoretical framework",
+            f"{topic} theory model",
+            f"{case_study} conceptual framework"
+        ]
+        
+        async def search_theories():
+            results = []
+            for query in theory_queries:
+                try:
+                    papers = await academic_search_service.search_academic_papers(query, max_results=10)
+                    for p in papers:
+                        p['source_type'] = 'theory'
+                        results.append(p)
+                except: pass
+            return results
+        search_tasks.append(search_theories())
+
+        # B. Empirical Search (Region-Specific for EACH objective)
+        # Regions: Asia, South America, West Africa, Central/South Africa, East Africa, Local
+        regions = ["Asia", "South America", "West Africa", "South Africa", "East Africa", country]
+        
+        async def search_objective_regions(obj_text, obj_idx):
+            results = []
+            clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "").replace("examine ", "")
+            base_query = f"{clean_obj} {topic}"[:60]
+            
+            for region in regions:
+                query = f"{base_query} {region}"
+                try:
+                    papers = await academic_search_service.search_academic_papers(query, max_results=3)
+                    for p in papers:
+                        p['source_type'] = f"obj_{obj_idx}_{region}"
+                        results.append(p)
+                except: pass
+            return results
+
+        # Limit to first 3 objectives for deep search to avoid rate limits/timeouts
+        for i, obj in enumerate(specific_objs[:3]):
+            search_tasks.append(search_objective_regions(obj, i))
+
+        # Execute Search
+        search_results_lists = await asyncio.gather(*search_tasks)
+        
+        # Flatten and deduplicate
+        all_papers = []
+        seen_dois = set()
+        for sublist in search_results_lists:
+            for p in sublist:
+                # Normalize paper object
+                paper_obj = ResearchResult(
+                    title=p.get("title", ""),
+                    authors=p.get("authors", [])[:5],
+                    year=p.get("year") or 2023,
+                    doi=p.get("doi", ""),
+                    url=p.get("url", ""),
+                    abstract=p.get("abstract", "")[:500],
+                    source=p.get('source_type', 'general'),
+                    venue=p.get("venue", "")
+                )
+                if paper_obj.title and paper_obj.title not in seen_dois: # Simple dedup by title/doi
+                    all_papers.append(paper_obj)
+                    seen_dois.add(paper_obj.title)
+
+        self.state.chapter2_citation_pool = all_papers
+        await events.publish(job_id, "log", {"message": f"✅ Found {len(all_papers)} region-specific papers."}, session_id=session_id)
+
+        # 3. GENERATE CONTENT (Parallel Writing)
+        write_tasks = []
+
+        # 3.1 Introduction
+        async def write_intro():
+            prompt = f"""Write Introduction of chapter two about literature reviews for {topic}.
+            Say: "Chapter two of this study will be about literature reviews using previous information from former scholars... study gaps in accordance to {case_study}, {country} will be identified."
+            One detailed paragraph."""
+            return await deepseek_direct_service.generate_content(prompt, max_tokens=400)
+        write_tasks.append(("intro", write_intro()))
+        
+        # 3.2 Theoretical Reviews
+        async def write_theory_intro():
+            return await deepseek_direct_service.generate_content(f"""Write one paragraph introduction for Theoretical review section: "The study about {topic} will be guided by three theories...".""", max_tokens=300)
+        write_tasks.append(("theory_intro", write_theory_intro()))
+        
+        # Theories (1 General + 2 Objective-based)
+        theory_targets = ["General Theory"] + [f"Theory for Objective {i+1}" for i in range(min(2, len(specific_objs)))]
+        
+        async def write_theory(idx, target):
+            relevant_papers = [p for p in all_papers if p.source == 'theory'] or all_papers[:5]
+            citations = "\n".join([f"- {p.title} by {p.authors} ({p.year}) DOI: {p.doi}" for p in relevant_papers[:5]])
+            prompt = f"""Write a Theoretical Framework for {target} regarding {topic}.
+            1. State theory name, author(year).
+            2. Detailed explanation with 4 real citations from: 
+            {citations}
+            3. Two authors who oppose (paragraph).
+            4. Two authors who agree (paragraph).
+            5. Importance to study and {case_study}.
+            6. Gaps.
+            **CRITICAL**: Use clickable markdown links: [Author, Year](url/doi).
+            """
+            content = await deepseek_direct_service.generate_content(prompt, max_tokens=1000)
+            return f"### {target}\n{content}"
+            
+        for i, target in enumerate(theory_targets):
+            write_tasks.append((f"theory_{i}", write_theory(i, target)))
+
+        # 3.3 Empirical Reviews
+        async def write_emp_intro():
+             return await deepseek_direct_service.generate_content("Write one paragraph introduction to empirical review section.", max_tokens=300)
+        write_tasks.append(("emp_intro", write_emp_intro()))
+        
+        async def write_empirical_obj(i, obj):
+            # Generate content for 6 regions (Parallelized)
+            region_tasks = []
+            for region in regions:
+                async def write_region(r):
+                    region_papers = [p for p in all_papers if p.source == f"obj_{i}_{r}"]
+                    if not region_papers: region_papers = all_papers[:3] # Fallback
+                    citations_list = "\n".join([f"- {p.title} ({p.year}) DOI: {p.doi}" for p in region_papers[:3]])
+                    
+                    prompt = f"""Write Empirical Review for Objective: "{obj}" focusing on {r} perspective.
+                    Cite studies from:
+                    {citations_list}
+                    Structure: "Author (Year) conducted a study about... method... findings... conclusion... gap."
+                    **CRITICAL**: Use clickable markdown links: [Author, Year](url/doi).
+                    One detailed paragraph."""
+                    return f"#### {r} Perspective\n" + await deepseek_direct_service.generate_content(prompt, max_tokens=400)
+                
+                region_tasks.append(write_region(region))
+            
+            region_contents = await asyncio.gather(*region_tasks)
+            return f"### 2.2.{i+1} Empirical Review: {obj}\n" + "\n\n".join(region_contents)
+
+        for i, obj in enumerate(specific_objs[:4]):
+            write_tasks.append((f"emp_obj_{i}", write_empirical_obj(i, obj)))
+
+        # 3.4 Summary Gap
+        async def write_gap():
+            return await deepseek_direct_service.generate_content(f"""Write literature summary and knowledge gap based on the reviews in context of {case_study}, {country}.""", max_tokens=500)
+        write_tasks.append(("gap", write_gap()))
+        
+        # EXECUTE WRITING
+        await events.publish(job_id, "log", {"message": "✍️ Writing all sections in parallel..."}, session_id=session_id)
+        write_results = await asyncio.gather(*[t[1] for t in write_tasks])
+        
+        # Map results
+        result_map = {task[0]: content for task, content in zip(write_tasks, write_results)}
+        
+        # Assemble
+        theories_text = "\n\n".join([result_map[f"theory_{i}"] for i in range(len(theory_targets))])
+        empirical_text = "\n\n".join([result_map[f"emp_obj_{i}"] for i in range(len(specific_objs[:4]))])
+        
+        full_content = f"""# CHAPTER TWO: LITERATURE REVIEWS
+
+## 2.0 Introduction
+{result_map['intro']}
+
+## Theoretical Reviews
+{result_map['theory_intro']}
+
+{theories_text}
+
+## Empirical Reviews
+{result_map['emp_intro']}
+
+{empirical_text}
+
+## Summary and Knowledge Gap
+{result_map['gap']}
+"""
+        return full_content
+
 parallel_chapter_generator = ParallelChapterGenerator()

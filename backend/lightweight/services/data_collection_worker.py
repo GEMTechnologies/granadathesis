@@ -36,9 +36,38 @@ class DataCollectionWorker:
         self.case_study = case_study
         self.questionnaire_content = questionnaire_content
         self.methodology_content = methodology_content
+        self.methodology_content = methodology_content
         self.objectives = objectives or []
+        self.objective_variables = {}
         
+        # Load Golden Thread variables
+        try:
+            import json
+            from services.workspace_service import WORKSPACES_DIR
+            
+            # Use specific workspace directory if provided, else scan default
+            # We assume the caller provides the correct workspace context
+            workspace_id = getattr(self, 'workspace_id', 'default')
+            plan_path = WORKSPACES_DIR / workspace_id / "thesis_plan.json"
+            
+            if not plan_path.exists():
+                # Fallback to scanning for the first available plan ONLY if workspace_id is default
+                if workspace_id == 'default':
+                    for path in WORKSPACES_DIR.iterdir():
+                        if path.is_dir() and (path / "thesis_plan.json").exists():
+                            plan_path = path / "thesis_plan.json"
+                            break
+                        
+            if plan_path.exists():
+                with open(plan_path, 'r', encoding='utf-8') as f:
+                    plan_data = json.load(f)
+                    self.objective_variables = plan_data.get("objective_variables", {})
+                print(f"📊 Worker loaded {len(self.objective_variables)} objective variables from {plan_path}")
+        except Exception as e:
+            print(f"⚠️ Worker failed to load variables: {e}")
+            
         # Parse questionnaire to extract items
+        self.demographic_questions = self._extract_demographics()
         self.demographic_questions = self._extract_demographics()
         self.likert_sections = self._extract_likert_sections()
         
@@ -134,13 +163,13 @@ class DataCollectionWorker:
             # No questionnaire content - use objectives-based fallback
             return self._create_sections_from_objectives()
         
-        # Split content by section headers (### SECTION X: ...)
-        section_pattern = r'###\s+SECTION\s+([A-Z]):\s*([^\n]+)'
+        # Split content by section headers (### SECTION X: ... or #### Objective X: ...)
+        section_pattern = r'(?:###\s+SECTION\s+([A-Z]):\s*|####\s+Objective\s+(\d+):\s*)([^\n]+)'
         section_matches = list(re.finditer(section_pattern, content, re.IGNORECASE))
         
         for i, match in enumerate(section_matches):
-            letter = match.group(1).upper()
-            title = match.group(2).strip()
+            letter = match.group(1).upper() if match.group(1) else chr(ord('A') + int(match.group(2)))
+            title = match.group(3).strip()
             
             # Skip demographics section
             if 'demographic' in title.lower():
@@ -153,23 +182,26 @@ class DataCollectionWorker:
             
             # Extract items from markdown table: | No. | Statement | ...
             items = []
-            # Pattern matches: | 1 | Statement text | or | 1   | Text |
-            table_pattern = r'\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|'
+            # Pattern matches: | 1.1 | Statement text | or | 1 | Text |
+            table_pattern = r'\|\s*(\d+(?:\.\d+)?)\s*\|\s*([^|]+?)\s*\|'
             
             for item_match in re.finditer(table_pattern, section_content):
-                num = int(item_match.group(1))
+                num_str = item_match.group(1).strip()
                 text = item_match.group(2).strip()
                 
                 # Skip header rows and empty items
-                if text.lower() in ['statement', 'no.', 'no', 'sd', 'd', 'n', 'a', 'sa']:
+                if text.lower() in ['statement', 'no.', 'no', 'sd', 'd', 'n', 'a', 'sa', 'item']:
                     continue
                 if len(text) < 10:
                     continue
                     
+                # Create a clean variable name (replace dots with underscores)
+                var_num = num_str.replace('.', '_')
+                
                 items.append({
-                    'number': num,
-                    'text': text[:100],
-                    'variable': f"Q{letter}_{num}"
+                    'number': num_str,
+                    'text': text[:200],
+                    'variable': f"Q{letter}_{var_num}"
                 })
             
             if items:
@@ -191,18 +223,38 @@ class DataCollectionWorker:
         sections = []
         
         if self.objectives:
-            for i, obj in enumerate(self.objectives[:4], 1):
-                letter = chr(ord('A') + i)  # B, C, D, E
+            for i, obj in enumerate(self.objectives, 1):
+                letter = chr(ord('A') + i)  # B, C, D, E, F, G...
                 items = []
-                for j in range(1, 9):
-                    items.append({
-                        'number': j,
-                        'text': f"Item {j} measuring {obj[:40]}",
-                        'variable': f"Q{letter}_{j}"
-                    })
+                
+                # Use variables if available for this objective
+                obj_vars = self.objective_variables.get(str(i), self.objective_variables.get(i, []))
+                
+                if obj_vars:
+                    # Generate items for each variable (2 items per variable)
+                    for v_idx, variable in enumerate(obj_vars, 1):
+                        items.append({
+                            'number': (v_idx * 2) - 1,
+                            'text': f"I am satisfied with the {variable.lower()}",
+                            'variable': f"Q{letter}_{v_idx}_1"
+                        })
+                        items.append({
+                            'number': v_idx * 2,
+                            'text': f"The {variable.lower()} is effective",
+                            'variable': f"Q{letter}_{v_idx}_2"
+                        })
+                else:
+                    # Fallback to generic items (8 items per objective)
+                    for j in range(1, 9):
+                        items.append({
+                            'number': j,
+                            'text': f"Item {j} measuring {obj[:80]}",
+                            'variable': f"Q{letter}_{j}"
+                        })
+                        
                 sections.append({
                     'letter': letter,
-                    'title': obj[:50],
+                    'title': obj,
                     'items': items
                 })
         else:
@@ -642,7 +694,7 @@ Respond with ONLY the interview response text, no labels or formatting:"""
                         'section_title': section['title'],
                         'number': item['number'],
                         'text': item['text'],
-                        'full_label': f"{item['text'][:80]}..."  # Truncated for table display
+                        'full_label': item['text']
                     }
             
             with open(mapping_path, 'w', encoding='utf-8') as f:
@@ -797,7 +849,8 @@ async def generate_research_dataset(
     job_id: str = None,
     session_id: str = None,
     generate_interviews: bool = True,
-    output_dir: str = None
+    output_dir: str = None,
+    **kwargs
 ) -> Dict[str, Any]:
     """Main function to generate research dataset.
     
@@ -885,7 +938,8 @@ async def generate_study_tools(
     objectives: List[str] = None,
     output_dir: str = None,
     job_id: str = None,
-    session_id: str = None
+    session_id: str = None,
+    sample_size: int = None
 ) -> Dict[str, Any]:
     """Generate research study tools (questionnaire, interview guide, FGD guide, observation checklist).
     
@@ -916,42 +970,71 @@ async def generate_study_tools(
                 pass
         print(message)
     
-    await publish_log("📋 Generating structured questionnaire...")
+    await publish_log("📋 Generating structured questionnaire and transmittal letter...")
     
     # ===================== QUESTIONNAIRE =====================
-    questionnaire_content = f"""# Research Questionnaire
+    questionnaire_content = f"""# TRANSMITTAL LETTER
+    
+Dear Respondent,
+
+I am conducting a research study on **{topic}**. This study involves a total of **{sample_size or 385} participants**. 
+
+Your participation in this study is highly valued. The information you provide will be used for academic purposes only and will be handled with the utmost confidentiality.
+
+Thank you for your time and contribution.
+
+Yours faithfully,
+
+Researcher
+
+---
+
+# Research Questionnaire
 ## {topic}
 
 ---
 
 ### SECTION A: DEMOGRAPHIC INFORMATION
 
-**Instructions:** Please tick (✓) or fill in the appropriate response.
+**Instructions:** Please encircle the letter corresponding to your response.
 
 1. **Age Group:**
-   - [ ] 18-25 years
-   - [ ] 26-35 years
-   - [ ] 36-45 years
-   - [ ] 46-55 years
-   - [ ] 56 years and above
+A. 18-25 years
+B. 26-35 years
+C. 36-45 years
+D. 46-55 years
+E. 56 years and above
 
 2. **Gender:**
-   - [ ] Male
-   - [ ] Female
+A. Male
+B. Female
 
 3. **Highest Level of Education:**
-   - [ ] Primary
-   - [ ] Secondary/O-Level
-   - [ ] Certificate/Diploma
-   - [ ] Bachelor's Degree
-   - [ ] Master's Degree or higher
+A. Diploma
+B. Bachelors
+C. Masters
+D. PhD
+E. Other
 
-4. **Years of Experience (if applicable):**
-   - [ ] Less than 1 year
-   - [ ] 1-3 years
-   - [ ] 4-6 years
-   - [ ] 7-10 years
-   - [ ] More than 10 years
+4. **Years of Experience:**
+A. Less than 2 years
+B. 2-5 years
+C. 6-10 years
+D. 11-15 years
+E. Above 15 years
+
+5. **Current Position/Rank:**
+A. Senior Manager
+B. Middle Manager
+C. Supervisor
+D. Staff
+E. Other
+
+6. **Type of Organization:**
+A. Public Sector
+B. Private Sector
+C. NGO/Civil Society
+D. Other
 
 ---
 

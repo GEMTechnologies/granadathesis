@@ -380,7 +380,8 @@ class CentralBrain:
         message: str,
         session_id: str,
         workspace_id: str = "default",
-        conversation_history: List[Dict] = None
+        conversation_history: List[Dict] = None,
+        job_id: str = None
     ) -> Dict[str, Any]:
         """
         Run the full agent workflow for a user message.
@@ -408,12 +409,53 @@ class CentralBrain:
             user_message=message,
             session_id=session_id,
             workspace_id=workspace_id,
+            job_id=job_id,
             user_name=ctx.user_preferences.get("name"),
             user_preferences=ctx.user_preferences,
             conversation_history=conversation_history or []
         )
         
+        # NEW: List available files in workspace for agent context
+        try:
+            from services.workspace_service import WORKSPACES_DIR
+            ws_path = WORKSPACES_DIR / workspace_id
+            if ws_path.exists():
+                files = [f.name for f in ws_path.glob("*") if f.is_file() and not f.name.startswith(".")]
+                agent_context.available_files = files
+        except Exception as e:
+            print(f"⚠️ Failed to list workspace files for brain: {e}")
+        
         print(f"🧠 Central Brain: Starting agent workflow for: {message[:50]}...", flush=True)
+
+        # NEW: Auto-generate a title based on the first message if needed
+        try:
+            from services.session_service import session_service
+            session = session_service.get_session(session_id)
+            if session:
+                metadata = session.get("metadata", {})
+                current_title = metadata.get("title", "New Conversation")
+                if current_title == "New Conversation" or not current_title:
+                    new_title = message.strip()[:40]
+                    if len(message) > 40: new_title += "..."
+                    metadata["title"] = new_title
+                    session_service.db.update_metadata(session_id, metadata)
+                    
+                    # Also update conversation_memory metadata if it exists
+                    from services.workspace_service import WORKSPACES_DIR
+                    # Use coupled workspace_id from agent_context
+                    conv_dir = WORKSPACES_DIR / agent_context.workspace_id / "conversations" / session_id
+                    if conv_dir.exists():
+                        meta_path = conv_dir / "metadata.json"
+                        if meta_path.exists():
+                            import json
+                            with open(meta_path, 'r') as f:
+                                c_meta = json.load(f)
+                            c_meta["title"] = new_title
+                            with open(meta_path, 'w') as f:
+                                json.dump(c_meta, f, indent=2)
+                    print(f"📝 Auto-updated title to: {new_title}")
+        except Exception as e:
+            print(f"⚠️ Failed to auto-update title: {e}")
         
         # Step 1: ALWAYS run Understanding Agent first
         agent_context = await agent_spawner.spawn_and_run(
@@ -447,9 +489,7 @@ class CentralBrain:
                 agent_context
             )
         
-        print(f"🧠 Central Brain: Workflow complete. Goals: {len(agent_context.goals)}, Actions: {len(agent_context.completed_actions)}", flush=True)
-        
-        return {
+        result = {
             "success": True,
             "intent": agent_context.intent,
             "goals": agent_context.goals,
@@ -458,6 +498,10 @@ class CentralBrain:
             "gathered_data": agent_context.gathered_data,
             "action_plan": agent_context.action_plan
         }
+        
+        print(f"🧠 Central Brain: Workflow complete. Goals: {len(agent_context.goals)}, Actions: {len(agent_context.completed_actions)}", flush=True)
+        
+        return result
 
 
 # Global instance

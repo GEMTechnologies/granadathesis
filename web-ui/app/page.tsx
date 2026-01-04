@@ -3,6 +3,9 @@
 import React from 'react';
 import { ManusStyleLayout } from '../components/layout/ManusStyleLayout';
 
+import { redirect } from 'next/navigation';
+
 export default function HomePage() {
-  return <ManusStyleLayout />;
+  redirect('/workspace/default');
+  return null;
 }

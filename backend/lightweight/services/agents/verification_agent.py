@@ -23,8 +23,8 @@ class VerificationAgent(BaseAgent):
     - Suggest improvements
     """
     
-    def __init__(self, agent_type: AgentType, session_id: str, parent_id: Optional[str] = None):
-        super().__init__(agent_type, session_id, parent_id)
+    def __init__(self, agent_type: AgentType, session_id: str, parent_id: Optional[str] = None, job_id: Optional[str] = None):
+        super().__init__(agent_type, session_id, parent_id, job_id)
     
     async def run(self, context: AgentContext) -> AgentContext:
         """
@@ -52,12 +52,19 @@ class VerificationAgent(BaseAgent):
         await self.report_status(AgentStatus.WORKING, "🎯 Checking goal completion...")
         goals_met = self._check_goals(context)
         
+        # Perform anti-hallucination check
+        await self.report_status(AgentStatus.WORKING, "🛡️ Verifying citation integrity and anti-hallucination status...")
+        hallucination_results = self._verify_hallucinations(context)
+        if hallucination_results.get("issues"):
+            issues.extend(hallucination_results["issues"])
+            
         # Add verification results to context
         context.gathered_data["verification"] = {
             "issues": issues,
             "suggestions": suggestions,
             "goals_met": goals_met,
-            "quality_score": self._calculate_quality_score(issues, goals_met)
+            "quality_score": self._calculate_quality_score(issues, goals_met),
+            "hallucination_check": hallucination_results
         }
         
         if issues:
@@ -97,6 +104,55 @@ class VerificationAgent(BaseAgent):
                 issues.append("Summary may not be coherent")
         
         return {"issues": issues, "suggestions": suggestions}
+    
+    def _verify_hallucinations(self, context: AgentContext) -> Dict:
+        """
+        Cross-reference all citations in completed actions against provided research papers.
+        Detects "shadow citations" (invented authors/years).
+        """
+        import re
+        issues = []
+        found_citations = []
+        
+        # Get all approved citations from gathered data or search results
+        approved_citations = set()
+        for paper in context.search_results:
+            if hasattr(paper, 'to_apa'):
+                # Extract (Author, Year) pattern
+                apa = paper.to_apa()
+                # Remove brackets for easier matching
+                approved_citations.add(apa.replace('(', '').replace(')', ''))
+        
+        # Also check gathered_data for a "research" key if structure varies
+        research_data = context.gathered_data.get("research", {})
+        if isinstance(research_data, dict):
+            for scope, papers in research_data.items():
+                for p in papers:
+                    if hasattr(p, 'to_apa'):
+                        approved_citations.add(p.to_apa().replace('(', '').replace(')', ''))
+        
+        # Scan completed actions for citation patterns
+        for action in context.completed_actions:
+            content = action.get("content", "")
+            if not isinstance(content, str): continue
+            
+            # Match (Author, Year) or Author (Year)
+            # This is a broad regex to catch most APA-style citations
+            citations = re.findall(r'\(([A-Z][a-z]+ [e\s]t\s?al\.,?\s\d{4}|[A-Z][a-z]+,?\s\d{4})\)', content)
+            found_citations.extend(citations)
+            
+        # Compare found vs approved
+        for cite in found_citations:
+            clean_cite = cite.replace('(', '').replace(')', '').strip()
+            # Basic matching - if not a perfect match, flag it
+            if not any(clean_cite in approved for approved in approved_citations) and approved_citations:
+                 issues.append(f"Potential hallucination: Citation '{cite}' found in text but not in approved source list.")
+        
+        return {
+            "issues": issues,
+            "total_citations_found": len(found_citations),
+            "approved_cache_size": len(approved_citations)
+        }
     
     def _check_goals(self, context: AgentContext) -> Dict[str, bool]:
         """Check if goals have been met."""

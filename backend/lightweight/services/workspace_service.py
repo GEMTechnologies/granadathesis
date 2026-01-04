@@ -20,8 +20,7 @@ import os
 if os.path.exists("/thesis_data"):
     WORKSPACES_DIR = Path("/thesis_data")
 else:
-    # Fallback for local execution - use absolute path to ensure consistency
-    # This is the thesis_data folder in the project root
+    # Use project root thesis_data
     WORKSPACES_DIR = Path("/home/gemtech/Desktop/thesis/thesis_data")
 
 

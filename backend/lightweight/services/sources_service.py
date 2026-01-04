@@ -211,6 +211,7 @@ class SourcesService:
 @{entry_type}{{{source['citation_key']},
   author = {{{author_str}}},
   title = {{{source['title']}}},
+  journal = {{{source.get('venue', '')}}},
   year = {{{source['year']}}},
   doi = {{{source.get('doi', '')}}},
   url = {{{source.get('url', '')}}},
@@ -297,6 +298,66 @@ class SourcesService:
         
         return "\n".join(context_parts)
     
+    def get_all_sources_full_text(self, workspace_id: str, max_chars_per_source: int = 6000, topic: str = "") -> str:
+        """
+        Get concatenated full text from all available sources for deep RAG context.
+        If topic is provided, tries to extract chunks relevant to the topic.
+        """
+        sources = self.list_sources(workspace_id)
+        if not sources:
+            return ""
+            
+        full_context = ["## UPLOADED/LOCAL SOURCES CONTEXT\n"]
+        
+        for source in sources:
+            # STRICT FILTER: Skip sources with "Unknown" or missing authors as per user request
+            authors = source.get("authors", [])
+            if not authors:
+                continue
+            
+            author_str = str(authors[0]) if isinstance(authors[0], str) else str(authors[0].get("name", ""))
+            if any(bad in author_str.lower() for bad in ["unknown", "anonymous", "n/a", "undefined"]):
+                continue
+
+            text_file = source.get("text_file")
+            if text_file:
+                text_path = self._get_sources_dir(workspace_id) / text_file
+                if text_path.exists():
+                    try:
+                        text = text_path.read_text(encoding='utf-8')
+                        
+                        # Smart Extraction: If topic provided, find relevant chunks
+                        snippet = ""
+                        if topic and len(text) > 1000:
+                            topic_words = [w for w in topic.lower().split() if len(w) > 4][:3]
+                            found_indices = []
+                            for word in topic_words:
+                                idx = text.lower().find(word)
+                                if idx != -1:
+                                    found_indices.append(idx)
+                            
+                            if found_indices:
+                                # Extract around the first major match
+                                start_idx = max(0, min(found_indices) - 2000)
+                                end_idx = min(len(text), start_idx + max_chars_per_source)
+                                snippet = f"...[Relevant Section found for '{topic}']...\n" + text[start_idx:end_idx]
+                            else:
+                                snippet = text[:max_chars_per_source]
+                        else:
+                            snippet = text[:max_chars_per_source]
+                        
+                        full_context.append(f"""
+### SOURCE: {source.get('title', 'Untitled')} ({source.get('year', 'N/A')})
+ABSTRACT: {source.get('abstract', '')[:500]}
+CONTENT_SNIPPET:
+{snippet}
+...
+""")
+                    except Exception:
+                        pass
+        
+        return "\n".join(full_context)
+    
     async def search_and_save(
         self,
         workspace_id: str,
@@ -359,6 +420,94 @@ class SourcesService:
             "saved": saved,
             "saved_count": len(saved)
         }
+    
+    async def add_pdf_source(
+        self,
+        workspace_id: str,
+        pdf_path: Path,
+        metadata: Optional[Dict] = None,
+        original_filename: Optional[str] = None
+    ) -> Dict:
+        """
+        Add uploaded PDF as source with extracted metadata.
+        
+        Args:
+            workspace_id: Workspace ID
+            pdf_path: Path to PDF file
+            metadata: Optional pre-extracted metadata
+            original_filename: Original filename (for display)
+            
+        Returns:
+            Added source dict
+        """
+        from services.pdf_metadata_extractor import pdf_metadata_extractor
+        from services.bibliography_service import bibliography_service
+        
+        # Extract metadata if not provided
+        if not metadata:
+            print(f"📄 Extracting metadata from: {pdf_path.name}")
+            metadata = pdf_metadata_extractor.extract_metadata(pdf_path)
+        
+        sources_dir = self._get_sources_dir(workspace_id)
+        pdfs_dir = sources_dir / "pdfs"
+        pdfs_dir.mkdir(exist_ok=True)
+        
+        # Use original filename if provided, otherwise use PDF name
+        display_name = original_filename or pdf_path.name
+        safe_filename = "".join(c for c in display_name.replace('.pdf', '')[:50] if c.isalnum() or c in ' -_').strip()
+        
+        # Copy PDF to workspace with safe filename
+        dest_path = pdfs_dir / f"{safe_filename}.pdf"
+        
+        # Handle duplicate filenames
+        counter = 1
+        while dest_path.exists():
+            dest_path = pdfs_dir / f"{safe_filename}_{counter}.pdf"
+            counter += 1
+        
+        import shutil
+        shutil.copy(pdf_path, dest_path)
+        
+        # Create source entry
+        source_id = str(uuid.uuid4())[:8]
+        source = {
+            "id": source_id,
+            "title": metadata.get("title", display_name.replace('.pdf', '').replace('_', ' ').title()),
+            "authors": metadata.get("authors", ["Unknown Author"]),
+            "year": metadata.get("year") or datetime.now().year,
+            "type": "pdf",
+            "doi": metadata.get("doi", ""),
+            "abstract": metadata.get("abstract", ""),
+            "file_path": f"pdfs/{dest_path.name}",
+            "page_count": metadata.get("page_count", 0),
+            "file_size": metadata.get("file_size", 0),
+            "added_at": datetime.now().isoformat(),
+            "text_extracted": True,
+            "full_text": metadata.get("full_text", "")[:5000],  # Store first 5000 chars
+            "original_filename": original_filename or pdf_path.name,
+        }
+        
+        # Generate citation key
+        source["citation_key"] = self._generate_citation_key(source)
+        
+        # Save extracted text
+        if metadata.get("full_text"):
+            extracted_dir = sources_dir / "extracted"
+            extracted_dir.mkdir(exist_ok=True)
+            text_path = extracted_dir / f"{safe_filename}.txt"
+            text_path.write_text(metadata["full_text"], encoding='utf-8')
+            source["text_file"] = f"extracted/{safe_filename}.txt"
+        
+        # Add to index
+        index = self._load_index(workspace_id)
+        index["sources"].append(source)
+        self._save_index(workspace_id, index)
+        
+        # Update bibliography
+        await bibliography_service.update_bibliography(workspace_id, source)
+        
+        print(f"✅ Added PDF source: {source['title'][:50]}")
+        return source
     
     def delete_source(self, workspace_id: str, source_id: str) -> bool:
         """Delete a source from the workspace."""
