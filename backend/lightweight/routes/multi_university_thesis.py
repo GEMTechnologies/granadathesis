@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .services.universities.university_manager import UniversityManager
 from .services.universities.uoj_phd import UoJPhDGenerator
+from .services.universities.uoj_general import UoJGeneralGenerator
 
 router = APIRouter(prefix="/api/thesis", tags=["thesis"])
 
@@ -30,6 +31,7 @@ class ThesisGenerationRequest(BaseModel):
     title: str
     author_name: str
     supervisor: str
+    workspace_id: Optional[str] = "default"
     topic: Optional[str] = None
     objectives: Optional[List[str]] = None
     abstract: Optional[str] = None
@@ -44,8 +46,13 @@ class TopicBasedThesisRequest(BaseModel):
     author_name: str
     supervisor: str
     topic: str
+    workspace_id: Optional[str] = "default"
     objectives: Optional[List[str]] = None
     abstract: Optional[str] = None
+    # Enhanced fields for General Flow
+    case_study: Optional[str] = None
+    country: Optional[str] = None
+    sample_size: Optional[int] = None
 
 
 class ThesisGenerationResponse(BaseModel):
@@ -135,7 +142,7 @@ async def generate_thesis(request: ThesisGenerationRequest):
             raise HTTPException(status_code=400, detail=validation_message)
 
         # Generate thesis based on university type
-        workspace_id = "default"  # In production, use actual workspace ID
+        workspace_id = request.workspace_id or "default"
         
         if request.university_type == "uoj_phd":
             generator = UoJPhDGenerator(workspace_id)
@@ -194,7 +201,7 @@ async def generate_thesis_from_topic(request: TopicBasedThesisRequest):
                 detail="Missing required fields: title, author_name, supervisor, topic"
             )
 
-        workspace_id = "default"  # In production, use actual workspace ID
+        workspace_id = request.workspace_id or "default"
 
         # Generate thesis based on university type
         if request.university_type == "uoj_phd":
@@ -211,6 +218,27 @@ async def generate_thesis_from_topic(request: TopicBasedThesisRequest):
             
             file_path = generator.generate_from_topic(topic_data)
             metadata = generator.get_metadata()
+            
+        elif request.university_type == "uoj_general":
+            generator = UoJGeneralGenerator(workspace_id)
+            
+            topic_data = {
+                "title": request.title,
+                "author_name": request.author_name,
+                "supervisor": request.supervisor,
+                "topic": request.topic,
+                "objectives": request.objectives or [],
+                "abstract": request.abstract or "",
+                
+                # New fields
+                "case_study": request.case_study,
+                "country": request.country,
+                "sample_size": request.sample_size
+            }
+            
+            file_path = generator.generate_from_topic(topic_data)
+            metadata = generator.get_metadata()
+            
         else:
             # For other universities, use standard generation
             chapters = {}

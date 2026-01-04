@@ -20,8 +20,10 @@ node_modules/
 .frontend.pid
 
 # Markdown files (as requested)
+# But allow workflow files in .agent directory and generated files in thesis_data
 *.md
-**/*.md
+!.agent/**
+!thesis_data/**/*.md
 
 # IDEs
 .vscode/

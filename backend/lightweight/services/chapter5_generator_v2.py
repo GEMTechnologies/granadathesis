@@ -56,10 +56,14 @@ async def generate_chapter5_v2(
     case_study: str,
     objectives: List[str],
     chapter_two_filepath: str = None,
+    chapter_three_filepath: str = None,
     chapter_four_filepath: str = None,
     output_dir: str = None,
     job_id: str = None,
-    session_id: str = None
+    session_id: str = None,
+    workspace_id: str = "default",
+    sample_size: int = None,
+    **kwargs
 ) -> Dict[str, Any]:
     """
     Generate Chapter 5 using LLM with Chapter 2 and 4 content.
@@ -73,17 +77,18 @@ async def generate_chapter5_v2(
     from services.deepseek_direct import deepseek_direct_service
     from core.events import events
     
-    output_dir = output_dir or "/home/gemtech/Desktop/thesis/thesis_data/default"
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    from services.workspace_service import WORKSPACES_DIR
     
-    # Define all possible search directories
+    # Standard output dir logic
+    if not output_dir or "default" in str(output_dir):
+        output_dir = str(WORKSPACES_DIR / "default")
+    
+    # Define all possible search directories based on WORKSPACES_DIR
     search_dirs = [
         Path(output_dir),
         Path(output_dir) / "chapters",
-        Path("/home/gemtech/Desktop/thesis/thesis_data/default"),
-        Path("/home/gemtech/Desktop/thesis/thesis_data/default/chapters"),
-        Path("/home/gemtech/Desktop/thesis/backend/lightweight/thesis_data/default"),
-        Path("/home/gemtech/Desktop/thesis/backend/lightweight/thesis_data/default/chapters"),
+        WORKSPACES_DIR / "default",
+        WORKSPACES_DIR / "default" / "chapters",
     ]
     
     # ============ LOAD CHAPTER 2 CONTENT ============
@@ -105,6 +110,29 @@ async def generate_chapter5_v2(
                     await events.publish(job_id, "log", {"message": f"📖 Loaded Chapter 2: {p.name}"}, session_id=session_id)
                 break
     
+                if job_id and session_id:
+                    await events.publish(job_id, "log", {"message": f"📖 Loaded Chapter 2: {p.name}"}, session_id=session_id)
+                break
+    
+    # ============ LOAD CHAPTER 3 CONTENT ============
+    chapter_three_content = ""
+    ch3_search_paths = [chapter_three_filepath] if chapter_three_filepath else []
+    for d in search_dirs:
+        if d.exists():
+            ch3_search_paths.extend(list(d.glob("Chapter_3*.md")))
+            ch3_search_paths.extend(list(d.glob("chapter_3*.md")))
+            
+    for path in ch3_search_paths:
+        if path and isinstance(path, (str, Path)):
+            p = Path(path) if isinstance(path, str) else path
+            if p.exists():
+                with open(p, 'r', encoding='utf-8') as f:
+                    chapter_three_content = f.read()
+                print(f"✓ Loaded Chapter 3: {p}")
+                if job_id and session_id:
+                    await events.publish(job_id, "log", {"message": f"🔬 Loaded Chapter 3: {p.name}"}, session_id=session_id)
+                break
+
     # ============ LOAD CHAPTER 4 CONTENT ============
     chapter_four_content = ""
     ch4_search_paths = [chapter_four_filepath] if chapter_four_filepath else []
@@ -128,6 +156,25 @@ async def generate_chapter5_v2(
     chapter_content = "# CHAPTER FIVE\n\n# RESULTS AND DISCUSSION\n\n"
     
     # --- 5.0 Introduction ---
+    # Try to load Golden Thread variables for context
+    objective_variables = {}
+    try:
+        plan_path = Path(output_dir) / "thesis_plan.json"
+        if plan_path.exists():
+            import json
+            with open(plan_path, 'r') as f:
+                plan_data = json.load(f)
+                objective_variables = plan_data.get("objective_variables", {})
+    except Exception:
+        pass
+
+    vars_ctx = ""
+    if objective_variables:
+        vars_ctx = "\nARCHITECTURAL VARIABLES (The Golden Thread):\n"
+        for o_num, v_list in objective_variables.items():
+            vars_ctx += f"- Objective {o_num}: {', '.join(v_list)}\n"
+            
+    # --- 5.0 Introduction ---
     if job_id and session_id:
         await events.publish(job_id, "log", {"message": "✍️ Generating 5.0 Introduction..."}, session_id=session_id)
     
@@ -135,9 +182,15 @@ async def generate_chapter5_v2(
 
 TOPIC: {topic}
 CASE STUDY: {case_study}
+SAMPLE SIZE: {sample_size if sample_size else 385} respondents
 
 OBJECTIVES OF THE STUDY:
 {chr(10).join([f'{i+1}. {obj}' for i, obj in enumerate(objectives)])}
+
+METHODOLOGY SUMMARY (from Chapter 3):
+{chapter_three_content[:2000] if chapter_three_content else "Quantitative study using questionnaires."}
+
+{vars_ctx}
 
 Write 4-5 substantial paragraphs (about 800 words total) that:
 1. State the purpose of this chapter - to discuss and interpret the findings from Chapter 4 in relation to the literature reviewed in Chapter 2
@@ -190,13 +243,19 @@ CRITICAL REQUIREMENTS:
 
 TOPIC: {topic}
 CASE STUDY: {case_study}
+SAMPLE SIZE: {sample_size if sample_size else 385} respondents
 OBJECTIVE BEING DISCUSSED: {objective}
+
+METHODOLOGY CONTEXT:
+{chapter_three_content[:1500] if chapter_three_content else "Quantitative survey based study."}
 
 RELEVANT LITERATURE FROM CHAPTER 2:
 {lit_excerpt[:8000] if lit_excerpt else "Use general academic literature on this topic."}
 
 RELEVANT FINDINGS FROM CHAPTER 4:
 {findings_excerpt[:8000] if findings_excerpt else "Discuss findings related to this objective based on typical research patterns."}
+
+{vars_ctx}
 
 Write 8-10 substantial paragraphs (about 2000 words) that:
 
@@ -370,5 +429,6 @@ async def generate_chapter5(
         chapter_four_filepath=chapter_four_filepath,
         output_dir=output_dir,
         job_id=job_id,
-        session_id=session_id
+        session_id=session_id,
+        sample_size=kwargs.get('sample_size')
     )

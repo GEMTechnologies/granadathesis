@@ -20,10 +20,8 @@ class CompleteThesisGenerator:
     
     def __init__(self, workspace_id: str = "default"):
         self.workspace_id = workspace_id
-        if workspace_id == "default":
-            self.workspace_path = Path("/home/gemtech/Desktop/thesis")
-        else:
-            self.workspace_path = Path(f"/home/gemtech/Desktop/thesis/workspaces/{workspace_id}")
+        from services.workspace_service import WORKSPACES_DIR
+        self.workspace_path = WORKSPACES_DIR / workspace_id
         self.workspace_path.mkdir(parents=True, exist_ok=True)
         
     async def generate_complete_thesis(

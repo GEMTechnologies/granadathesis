@@ -92,7 +92,7 @@ class BrowserAutomation:
         )
         
         # Enable downloads
-        await self.context.set_default_timeout(30000)
+        self.context.set_default_timeout(30000)
         
         self.page = await self.context.new_page()
         
@@ -430,6 +430,16 @@ class BrowserAutomation:
         
         await self.page.goto(url, wait_until='networkidle')
         
+        # Take screenshot for preview
+        screenshot = await self._take_screenshot(f"scrape_{len(self.actions)}")
+        if self.stream_callback:
+            await self.stream_callback({
+                'type': 'browser_action',
+                'action': 'scrape',
+                'url': url,
+                'screenshot': screenshot
+            })
+        
         data = {}
         
         if target in ['article', 'all']:
@@ -554,16 +564,58 @@ class BrowserAutomation:
 browser_instances: Dict[str, BrowserAutomation] = {}
 
 
-async def get_browser(workspace_id: str, headless: bool = False) -> BrowserAutomation:
-    """Get or create browser instance for workspace."""
+async def get_browser(workspace_id: str, headless: bool = True) -> BrowserAutomation:
+    """
+    Get or create browser instance for workspace.
+    
+    Automatically connects a Redis stream callback if available.
+    """
+    import redis.asyncio as aioredis
+    import os
+    
+    # 1. Create instance if needed
     if workspace_id not in browser_instances:
         browser_instances[workspace_id] = BrowserAutomation(
             workspace_id=workspace_id,
             headless=headless
         )
-        await browser_instances[workspace_id].start()
     
-    return browser_instances[workspace_id]
+    browser = browser_instances[workspace_id]
+    
+    # 2. Define streaming callback
+    async def redis_stream_callback(data: dict):
+        """Publish browser event to Redis for frontend preview."""
+        try:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+            # Fix docker networking if needed
+            if redis_url.startswith("redis://redis:") and not os.path.exists("/.dockerenv"):
+                redis_url = redis_url.replace("redis://redis:", "redis://localhost:")
+                
+            redis = aioredis.from_url(redis_url, decode_responses=True)
+            
+            # Format event structure
+            event = {
+                "type": "message", 
+                "data": json.dumps(data)
+            }
+            
+            # Publish to browser-specific channel
+            await redis.publish(f"browser:{workspace_id}", json.dumps(event))
+            await redis.close()
+            
+        except Exception as e:
+            # Don't let stream errors break the browser
+            print(f"⚠️ Browser stream error: {e}")
+
+    # 3. Start if needed (and attach callback)
+    if not browser.page:
+        await browser.start(stream_callback=redis_stream_callback)
+    
+    # 4. If already started but missing callback, attach it
+    elif browser.stream_callback is None:
+        browser.stream_callback = redis_stream_callback
+        
+    return browser
 
 
 async def close_browser(workspace_id: str):

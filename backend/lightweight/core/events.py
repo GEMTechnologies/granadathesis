@@ -8,6 +8,19 @@ import time
 import redis.asyncio as redis
 import os
 
+
+class ExtendedJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'as_posix'):
+            return obj.as_posix()
+        try:
+            from pathlib import Path
+            if isinstance(obj, Path):
+                return str(obj)
+        except ImportError:
+            pass
+        return super().default(obj)
+
 class EventPublisher:
     def __init__(self):
         # Try to get from config first, then env var, then default
@@ -60,7 +73,7 @@ class EventPublisher:
             "job_id": job_id  # Include job_id in payload for frontend routing
         }
         
-        json_message = json.dumps(message)
+        json_message = json.dumps(message, cls=ExtendedJSONEncoder)
         
         # Publish to job-specific channel
         await self.redis.publish(f"job:{job_id}", json_message)

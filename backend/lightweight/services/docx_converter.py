@@ -58,9 +58,9 @@ class EnhancedDOCXConverter:
         
         # Try multiple paths to find workspace
         candidate_paths = [
-            Path(__file__).parent.parent.parent / "workspaces" / workspace_id,
-            Path(__file__).parent.parent.parent.parent / "workspaces" / workspace_id,
-            Path(".") / "workspaces" / workspace_id,
+            Path(__file__).parent.parent.parent / "thesis_data" / workspace_id,
+            Path(__file__).parent.parent.parent.parent / "thesis_data" / workspace_id,
+            Path(".") / "thesis_data" / workspace_id,
         ]
         
         self.workspace_dir = None
@@ -167,8 +167,9 @@ class EnhancedDOCXConverter:
                     # Reset when we hit a new major section (level 1 or 2)
                     self.in_references_section = False
                 
-                # Center "CHAPTER" and "INTRODUCTION" headings
-                if 'CHAPTER' in heading_text.upper() or heading_text.upper() in ['INTRODUCTION', 'REFERENCES']:
+                # Center "CHAPTER", "INTRODUCTION", and cover page elements
+                centered_keywords = ['CHAPTER', 'INTRODUCTION', 'REFERENCES', 'UNIVERSITY OF JUBA', 'DECLARATION', 'APPROVAL', 'DEDICATION', 'ACKNOWLEDGEMENTS', 'ABSTRACT', 'TABLE OF CONTENTS']
+                if any(kw in heading_text.upper() for kw in centered_keywords) or (level == 1 and len(heading_text) < 100):
                     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 
                 # Make heading text black and bold
@@ -592,7 +593,27 @@ class EnhancedDOCXConverter:
             
         # Parse inline formatting (bold, italic, links)
         p = self.doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        
+        # Auto-centering for cover page elements
+        centered_patterns = [
+            r'^\*\*BY\*\*$', 
+            r'^---+$', 
+            r'^DOCTOR OF PHILOSOPHY$', 
+            r'^University of Juba$',
+            r'^\*\*University of Juba\*\*$',
+            r'^[A-Z][a-z]+ \d{4}$' # Date like November 2026
+        ]
+        
+        is_centered = any(re.match(pattern, text.strip()) for pattern in centered_patterns)
+        # Also center if it's very short and bold
+        if not is_centered and text.startswith('**') and text.endswith('**') and len(text) < 60:
+            is_centered = True
+            
+        if is_centered:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            
         p.style = self.normal_style
         
         # Parse inline markdown
@@ -1097,13 +1118,20 @@ class EnhancedDOCXConverter:
     def _load_from_workspace(self, image_url: str) -> Optional[bytes]:
         """Try to load image from various workspace locations."""
         try:
-            # Extract filename
-            filename = Path(image_url).name
+            # Extract filename and relative path
+            image_path = Path(image_url)
+            filename = image_path.name
             if not filename:
                 return None
             
             # Try common image storage locations
             search_paths = [
+                # First try the path as-is relative to workspace (e.g., figures/bar_gender.png)
+                self.workspace_dir / image_url,
+                # Then try with chapters prefix (e.g., chapters/figures/bar_gender.png)
+                self.workspace_dir / "chapters" / image_url,
+                # Then try filename-only searches in common directories
+                self.workspace_dir / "chapters" / "figures" / filename,
                 self.workspace_dir / "images" / filename,
                 self.workspace_dir / "figures" / filename,
                 self.workspace_dir / filename,
@@ -1117,6 +1145,9 @@ class EnhancedDOCXConverter:
                     print(f"✓ Found image at: {path}")
                     return path.read_bytes()
             
+            # Log all paths tried for debugging
+            print(f"❌ File not found: {image_url}")
+            print(f"   Checked: {self.workspace_dir / image_url}")
             return None
         except Exception as e:
             print(f"Workspace lookup error: {e}")

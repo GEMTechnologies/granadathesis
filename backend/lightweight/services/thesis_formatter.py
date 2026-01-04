@@ -26,7 +26,8 @@ class ThesisFormatter:
     
     def __init__(self, workspace_id: str = "default"):
         self.workspace_id = workspace_id
-        self.workspace_path = Path(f"/home/gemtech/Desktop/thesis/workspaces/{workspace_id}")
+        from .workspace_service import WORKSPACES_DIR
+        self.workspace_path = WORKSPACES_DIR / workspace_id
         self.workspace_path.mkdir(parents=True, exist_ok=True)
         self.numbering_manager = None
         
@@ -133,9 +134,12 @@ class ThesisFormatter:
             self._add_chapter(chapter_num, chapters[chapter_num])
             self._page_break()
         
-        # 12. APPENDICES
-        if appendices:
-            self._add_appendices(appendices)
+        # 12. REFERENCES
+        self._add_references_page()
+        
+        # 13. APPENDICES
+        # Always use UoJ Appendices for consistency with user request
+        self._add_uoj_appendices()
         
         # Save document
         output_path = self.workspace_path / f"Complete_Thesis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
@@ -143,48 +147,91 @@ class ThesisFormatter:
         
         return str(output_path)
     
+    def _add_references_page(self):
+        """Add standard references page."""
+        self._add_page_section("REFERENCES")
+        self.doc.add_paragraph(
+            "All scholarly sources cited in this thesis are embedded as hyperlinks throughout the document. "
+            "A consolidated reference list in APA 7th Edition format is available in the exported document."
+        )
+        self._page_break()
+
+    def _add_uoj_appendices(self):
+        """Add UoJ specific appendices."""
+        self._add_page_section("APPENDICES")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        appendices = [
+            ("Appendix A: Research Questionnaire", f"The structured questionnaire used for data collection is available as a separate document:\n• **File:** `Questionnaire_{timestamp}.md`"),
+            ("Appendix B: Interview Guide", f"The semi-structured interview guide for qualitative data collection:\n• **File:** `Interview_Guide_{timestamp}.md`"),
+            ("Appendix C: Focus Group Discussion Guide", "The FGD protocol and questions:\n• **File:** See Interview Guide"),
+            ("Appendix D: Research Permit/Authorisation Letters", "[To be inserted by researcher]"),
+            ("Appendix E: Informed Consent Form", "[To be inserted by researcher]"),
+            ("Appendix F: Raw Data", "Statistical outputs and transcripts are available in:\n• **Folder:** `datasets/`")
+        ]
+        
+        for title, content in appendices:
+            self.doc.add_heading(title, level=2)
+            self.doc.add_paragraph(content)
+            self.doc.add_paragraph()  # Spacing
+            
+        # End marker
+        p = self.doc.add_paragraph("— END OF THESIS —")
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
     def _add_cover_page(self, title: str, author_name: str, index_no: str, 
                        school: str, department: str, degree: str):
-        """Add cover page with university header."""
+        """Add cover page with UoJ specific formatting."""
         doc = self.doc
         
-        # University header
-        self._add_centered_heading("UNIVERSITY OF JUBA", font_size=14, bold=True)
-        self._add_centered_heading(f"SCHOOL OF {school.upper()}", font_size=12, bold=True)
-        self._add_centered_heading(f"DEPARTMENT OF {department.upper()}", font_size=12, bold=True)
-        
-        # Spacing
-        doc.add_paragraph()
+        # 1. RESEARCH THESIS (Top)
+        self._add_centered_heading("RESEARCH THESIS", font_size=14, bold=True)
         doc.add_paragraph()
         
-        # Title
-        self._add_centered_heading(f"TOPIC: {title}", font_size=12, bold=True)
-        
-        # Spacing
-        doc.add_paragraph()
-        doc.add_paragraph()
-        doc.add_paragraph()
-        
-        # Author info
-        self._add_centered_paragraph(f"BY")
-        self._add_centered_paragraph(f"NAME: {author_name}")
-        self._add_centered_paragraph(f"INDEX NO: {index_no}")
-        
-        # Spacing
-        doc.add_paragraph()
-        doc.add_paragraph()
-        
-        # Submission statement
-        self._add_centered_paragraph(
-            f"A RESEARCH PROPOSAL SUBMITTED TO THE SCHOOL OF {school.upper()} "
-            f"IN PARTIAL FULFILMENT OF THE REQUIREMENT FOR THE AWARD OF A {degree.upper()}"
+        # 2. Submission Statement
+        p = self._add_centered_paragraph(
+            "A Thesis Submitted in Partial Fulfilment of the Requirements for the Award of the Degree of",
+            font_size=12
         )
+        doc.add_paragraph()
         
-        # Date at bottom
+        # 3. DOCTOR OF PHILOSOPHY
+        self._add_centered_heading("DOCTOR OF PHILOSOPHY", font_size=16, bold=True)
+        
+        # 4. in [Department/Field]
+        self._add_centered_paragraph("in", font_size=12)
+        # Use department or "Security Studies" if not provided
+        dept_text = department if department and department != "[DEPARTMENT NAME]" else "Security Studies"
+        self._add_centered_heading(dept_text, font_size=14, bold=True)
         doc.add_paragraph()
+        
+        # 5. Logo
+        logo_path = "/home/gemtech/Desktop/thesis/backend/lightweight/uoj_logo.png"
+        try:
+            if os.path.exists(logo_path):
+                # Add picture efficiently
+                doc.add_picture(logo_path, width=Inches(2.5))
+                # Center the last paragraph (which contains the image)
+                last_p = doc.paragraphs[-1]
+                last_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                self._add_centered_paragraph("[UOJ LOGO]", font_size=14)
+        except Exception as e:
+            print(f"Error adding logo: {e}")
+            self._add_centered_paragraph("[UOJ LOGO]", font_size=14)
+            
         doc.add_paragraph()
+        
+        # 6. University of Juba
+        self._add_centered_heading("University of Juba", font_size=16, bold=True)
         doc.add_paragraph()
-        self._add_centered_paragraph(datetime.now().strftime("%B, %Y"))
+        
+        # 7. Date
+        self._add_centered_paragraph("January 2026", font_size=12)
+        
+        # Spacing at bottom
+        doc.add_paragraph()
     
     def _add_approval_page(self, approval_text: str):
         """Add approval page."""

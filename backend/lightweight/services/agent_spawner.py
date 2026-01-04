@@ -54,12 +54,21 @@ class AgentContext:
     user_message: str
     session_id: str
     workspace_id: str
+    job_id: Optional[str] = None
+    
+    def __post_init__(self):
+        """Enforce session-to-workspace coupling if requested."""
+        if self.workspace_id == "default" or not self.workspace_id:
+            if self.session_id:
+                # Standard convention for this thesis system: ws_{session_id}
+                self.workspace_id = f"ws_{self.session_id[:12]}"
     
     # Understanding results
     intent: Optional[str] = None
     entities: Dict[str, Any] = field(default_factory=dict)
     goals: List[str] = field(default_factory=list)
     required_actions: List[str] = field(default_factory=list)
+    available_files: List[str] = field(default_factory=list)
     
     # Research results
     search_results: List[Dict] = field(default_factory=list)
@@ -82,6 +91,16 @@ class AgentContext:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+def AgentAction(action: str, parameters: Dict[str, Any] = None, description: str = "") -> Dict[str, Any]:
+    """Helper to create an action dictionary."""
+    return {
+        "action": action,
+        "parameters": parameters or {},
+        "description": description,
+        "status": "pending"
+    }
+
+
 class BaseAgent(ABC):
     """
     Base class for all agents.
@@ -97,12 +116,14 @@ class BaseAgent(ABC):
         self,
         agent_type: AgentType,
         session_id: str,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        job_id: Optional[str] = None
     ):
         self.id = f"{agent_type.value}_{uuid.uuid4().hex[:8]}"
         self.agent_type = agent_type
         self.session_id = session_id
         self.parent_id = parent_id
+        self.job_id = job_id or self.id
         self.status = AgentStatus.SPAWNING
         self.created_at = datetime.now()
         self.redis = None
@@ -136,11 +157,13 @@ class BaseAgent(ABC):
         
         status_data = {
             "agent_id": self.id,
+            "agent": self.agent_type.value,  # Frontend expects "agent"
             "agent_type": self.agent_type.value,
             "status": status.value,
             "message": message,
             "data": data or {},
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "job_id": self.job_id
         }
         
         print(f"🤖 [{self.agent_type.value.upper()}] {message}", flush=True)
@@ -159,7 +182,7 @@ class BaseAgent(ABC):
         if self.events:
             try:
                 await self.events.publish(
-                    self.id,
+                    self.job_id,  # Use job_id for channel consistency
                     "agent_activity",
                     status_data,
                     session_id=self.session_id
@@ -215,7 +238,8 @@ class AgentSpawner:
         self,
         agent_type: AgentType,
         session_id: str,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        job_id: Optional[str] = None
     ) -> BaseAgent:
         """
         Spawn a new agent instance.
@@ -239,7 +263,8 @@ class AgentSpawner:
         agent = agent_class(
             agent_type=agent_type,
             session_id=session_id,
-            parent_id=parent_id
+            parent_id=parent_id,
+            job_id=job_id
         )
         
         self.active_agents[agent.id] = agent
@@ -284,7 +309,8 @@ class AgentSpawner:
         Returns:
             Updated context after agent execution
         """
-        agent = await self.spawn(agent_type, session_id, parent_id)
+        job_id = getattr(context, 'job_id', None)
+        agent = await self.spawn(agent_type, session_id, parent_id, job_id=job_id)
         
         try:
             result = await agent.run(context)

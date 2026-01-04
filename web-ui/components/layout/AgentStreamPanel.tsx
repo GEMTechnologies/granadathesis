@@ -235,7 +235,7 @@ export function AgentStreamPanel({
                     </span>
                     <h5 className="font-medium text-sm flex-1">{result.title || 'No title'}</h5>
                   </div>
-                  <p className="text-xs text-gray-600 mb-2 line-clamp-2">{result.snippet || result.description || ''}</p>
+                  <p className="text-xs text-gray-600 mb-2 line-clamp-2">{result.content || result.snippet || result.description || ''}</p>
                   {result.url && (
                     <a
                       href={result.url}

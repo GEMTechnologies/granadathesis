@@ -1,7 +1,4 @@
 """
-Base Thesis Generator - Abstract base class for all universities
+Base Thesis Generator Module
 """
-
-from .base_generator import BaseThesisGenerator
-
-__all__ = ["BaseThesisGenerator"]
+# Class is defined in __init__.py to avoid circularity

@@ -123,13 +123,28 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
         setCodeOutput(null);
         try {
             const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-            const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/files/${encodeURIComponent(file.path)}`);
-            if (response.ok) {
-                const data = await response.json();
-                setContent(data.content || '');
-                setEditContent(data.content || '');
+            const fileType = getFileType(file.name);
+
+            if (fileType === 'spreadsheet') {
+                const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/spreadsheet/${encodeURIComponent(file.path)}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    setSpreadsheetData(data);
+                    // Also set content for row count calculations in footer
+                    if (data.data) setContent(JSON.stringify(data.data));
+                    else if (data.sheets) setContent(JSON.stringify(Object.values(data.sheets)[0]));
+                } else {
+                    setContent('Error loading spreadsheet data');
+                }
             } else {
-                setContent('Error loading file content');
+                const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/files/${encodeURIComponent(file.path)}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    setContent(data.content || '');
+                    setEditContent(data.content || '');
+                } else {
+                    setContent('Error loading file content');
+                }
             }
         } catch (error) {
             console.error('Failed to load file:', error);
@@ -608,29 +623,43 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
                         {fileType === 'spreadsheet' && (
                             <div className="h-full flex flex-col bg-gray-50">
                                 <div className="flex-1 overflow-auto p-4">
-                                    {content ? (
+                                    {spreadsheetData ? (
                                         <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
-                                            <div className="flex items-center gap-2 px-4 py-3 bg-emerald-50 border-b">
-                                                <Table className="w-5 h-5 text-emerald-600" />
-                                                <span className="font-medium text-emerald-700">Spreadsheet Preview</span>
+                                            <div className="flex items-center justify-between px-4 py-3 bg-emerald-50 border-b">
+                                                <div className="flex items-center gap-2">
+                                                    <Table className="w-5 h-5 text-emerald-600" />
+                                                    <span className="font-medium text-emerald-700">
+                                                        {spreadsheetData.sheets ? `Excel: ${Object.keys(spreadsheetData.sheets)[0]}` : 'CSV Preview'}
+                                                    </span>
+                                                </div>
+                                                <div className="text-[10px] text-emerald-600 font-mono">
+                                                    {spreadsheetData.row_count && (typeof spreadsheetData.row_count === 'number' ? `${spreadsheetData.row_count} rows` : `${Object.values(spreadsheetData.row_count)[0]} rows`)}
+                                                </div>
                                             </div>
                                             <div className="overflow-x-auto">
                                                 <table className="w-full text-sm">
+                                                    <thead>
+                                                        <tr className="bg-gray-100 border-b">
+                                                            <th className="px-2 py-2 border-r bg-gray-50 text-gray-400 text-[10px] font-mono w-10 text-center">#</th>
+                                                            {(spreadsheetData.columns && (Array.isArray(spreadsheetData.columns) ? spreadsheetData.columns : Object.values(spreadsheetData.columns)[0] as string[])).map((col, idx) => (
+                                                                <th key={idx} className="px-4 py-2 border-r text-left text-xs font-semibold text-gray-600 whitespace-nowrap">
+                                                                    {col}
+                                                                </th>
+                                                            ))}
+                                                        </tr>
+                                                    </thead>
                                                     <tbody>
-                                                        {content.split('\n').filter(row => row.trim()).map((row, rowIdx) => {
-                                                            const cells = row.includes(',') ? row.split(',') : row.split('\t');
+                                                        {(spreadsheetData.data || (spreadsheetData.sheets ? Object.values(spreadsheetData.sheets)[0] : [])).slice(0, 100).map((row: any, rowIdx: number) => {
+                                                            const columns = spreadsheetData.columns && (Array.isArray(spreadsheetData.columns) ? spreadsheetData.columns : Object.values(spreadsheetData.columns)[0] as string[]);
                                                             return (
-                                                                <tr key={rowIdx} className={rowIdx === 0 ? 'bg-gray-100 font-semibold' : 'hover:bg-gray-50'}>
-                                                                    <td className="px-2 py-1 border-r bg-gray-50 text-gray-500 text-xs font-mono w-10 text-center">{rowIdx + 1}</td>
-                                                                    {cells.map((cell, cellIdx) => (
+                                                                <tr key={rowIdx} className="hover:bg-gray-50 border-b">
+                                                                    <td className="px-2 py-1 border-r bg-gray-50 text-gray-400 text-[10px] font-mono w-10 text-center">{rowIdx + 1}</td>
+                                                                    {columns.map((col: string, colIdx: number) => (
                                                                         <td
-                                                                            key={cellIdx}
-                                                                            className={cn(
-                                                                                "px-3 py-2 border-b border-r whitespace-nowrap",
-                                                                                rowIdx === 0 && "bg-gray-100"
-                                                                            )}
+                                                                            key={colIdx}
+                                                                            className="px-4 py-2 border-r whitespace-nowrap text-gray-700"
                                                                         >
-                                                                            {cell.trim().replace(/^"|"$/g, '')}
+                                                                            {row[col] === null || row[col] === undefined ? "" : String(row[col])}
                                                                         </td>
                                                                     ))}
                                                                 </tr>
@@ -638,6 +667,11 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
                                                         })}
                                                     </tbody>
                                                 </table>
+                                                {((spreadsheetData.data && spreadsheetData.data.length > 100) || (spreadsheetData.sheets && (Object.values(spreadsheetData.sheets)[0] as any[]).length > 100)) && (
+                                                    <div className="p-3 text-center text-xs text-gray-500 bg-gray-50 border-t italic">
+                                                        Showing first 100 rows only
+                                                    </div>
+                                                )}
                                             </div>
                                         </div>
                                     ) : (
@@ -648,9 +682,9 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
                                     )}
                                 </div>
                                 <div className="flex items-center gap-2 px-4 py-2 border-t bg-white text-xs text-gray-500">
-                                    <span>📊 {content.split('\n').filter(r => r.trim()).length} rows</span>
+                                    <span>📊 Spreadsheet View</span>
                                     <span>•</span>
-                                    <span>{(content.split('\n')[0] || '').split(/[,\t]/).length} columns</span>
+                                    <span>ReadOnly</span>
                                 </div>
                             </div>
                         )}

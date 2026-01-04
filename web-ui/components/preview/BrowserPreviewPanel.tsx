@@ -35,7 +35,8 @@ export function BrowserPreviewPanel({
     useEffect(() => {
         // Connect to browser events stream
         const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-        const eventSource = new EventSource(`${backendUrl}/api/browser/stream?session_id=${sessionId}`);
+        const workspaceId = `ws_${sessionId.substring(0, 12)}`;
+        const eventSource = new EventSource(`${backendUrl}/api/browser/stream/${workspaceId}`);
         eventSourceRef.current = eventSource;
 
         eventSource.onopen = () => {

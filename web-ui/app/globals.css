@@ -7,6 +7,7 @@
     opacity: 0;
     transform: translateY(10px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -18,6 +19,7 @@
     opacity: 0;
     transform: translateX(-20px);
   }
+
   to {
     opacity: 1;
     transform: translateX(0);
@@ -28,6 +30,7 @@
   0% {
     background-position: -1000px 0;
   }
+
   100% {
     background-position: 1000px 0;
   }
@@ -64,20 +67,20 @@
     --input: 0 0% 89.8%;
     --ring: 0 0% 3.9%;
     --radius: 0.5rem;
-    
+
     /* IBM Carbon Design System Color Palette */
     --color-bg: #F4F4F4;
     --color-panel: #FFFFFF;
     --color-border: #E0E0E0;
-    
+
     --color-text: #161616;
     --color-text-secondary: #525252;
     --color-text-muted: #8D8D8D;
-    
+
     --color-primary: #0F62FE;
     --color-primary-hover: #0050E6;
     --color-primary-bg: #EDF5FF;
-    
+
     --color-success: #24A148;
     --color-warning: #F1C21B;
     --color-danger: #DA1E28;
@@ -91,7 +94,7 @@
   .dark {
     --background: 0 0% 3.9%;
     --foreground: 0 0% 98%;
-    --card: 0 0% 3.9%;
+    --card: 0 0% 14.9%;
     --card-foreground: 0 0% 98%;
     --popover: 0 0% 3.9%;
     --popover-foreground: 0 0% 98%;
@@ -113,6 +116,15 @@
     --chart-3: 30 80% 55%;
     --chart-4: 280 65% 60%;
     --chart-5: 340 75% 55%;
+
+    /* IBM Carbon Design System Dark Mode */
+    --color-bg: #161616;
+    --color-panel: #262626;
+    --color-border: #393939;
+    --color-text: #F4F4F4;
+    --color-text-secondary: #C6C6C6;
+    --color-text-muted: #8D8D8D;
+    --color-primary-bg: #002D9C;
   }
 }
 
@@ -120,40 +132,10 @@
   * {
     @apply border-border;
   }
-  
+
   body {
     @apply bg-background text-foreground;
     font-feature-settings: "rlig" 1, "calt" 1;
-  }
-  
-  /* Fix dropdown and select contrast issues */
-  select,
-  [role="listbox"],
-  [role="menu"],
-  [role="combobox"],
-  [data-dropdown] {
-    color: var(--color-text, #161616) !important;
-    background-color: var(--color-panel, #FFFFFF) !important;
-  }
-  
-  /* Ensure dropdown items have proper contrast */
-  [role="option"],
-  [role="menuitem"],
-  [data-dropdown] button,
-  .dropdown-item {
-    color: var(--color-text, #161616) !important;
-  }
-  
-  /* Popover menus */
-  [data-radix-popper-content-wrapper] {
-    color: var(--color-text, #161616);
-  }
-  
-  /* Card and popover foreground colors */
-  .bg-card,
-  .bg-popover,
-  [class*="bg-background"] {
-    color: var(--color-text, #161616);
   }
 }
 
@@ -163,6 +145,7 @@
     opacity: 0;
     transform: translateY(-10px);
   }
+
   to {
     opacity: 1;
     transform: translateY(0);
@@ -173,6 +156,7 @@
   from {
     transform: translateX(100%);
   }
+
   to {
     transform: translateX(0);
   }
@@ -203,19 +187,3 @@
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-text-muted);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

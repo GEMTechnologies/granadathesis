@@ -12,6 +12,7 @@ from pathlib import Path
 class UniversityType(str, Enum):
     """Supported universities"""
     UOJ_PHD = "uoj_phd"  # University of Juba PhD
+    UOJ_GENERAL = "uoj_general" # University of Juba General (Bachelor)
     GENERIC = "generic"  # Generic/Base template
 
 
@@ -87,6 +88,40 @@ class UniversityManager:
             }
         )
         self.universities[UniversityType.UOJ_PHD.value] = uoj_config
+        
+        # University of Juba General (Bachelor) Template
+        uoj_general_config = UniversityConfig(
+            name="University of Juba (General)",
+            abbreviation="UoJ-BS",
+            type=UniversityType.UOJ_GENERAL,
+            description="General/Bachelor thesis proposal template for University of Juba",
+            cover_page_format={
+                "institution": "UNIVERSITY OF JUBA",
+                "format_type": "official",
+                "font": "Times New Roman",
+                "font_size": 12,
+                "alignment": "center",
+                "spacing": "double",
+            },
+            preliminary_sections=[
+                "cover_page",
+                "approval_page",
+                "declaration",
+                "dedication",
+                "acknowledgement",
+                "abstract",
+                "table_of_contents",
+            ],
+            main_chapters=5, # Bachelor's typically 5
+            has_appendices=True,
+            page_numbering_style="complex",
+            metadata={
+                "school": "SCHOOL OF ...",
+                "location": "South Sudan",
+                "established": 2011,
+            }
+        )
+        self.universities[UniversityType.UOJ_GENERAL.value] = uoj_general_config
 
         # Generic Template (Base for other universities)
         generic_config = UniversityConfig(

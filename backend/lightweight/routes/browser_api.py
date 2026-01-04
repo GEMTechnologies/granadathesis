@@ -178,17 +178,31 @@ async def stream_browser(workspace_id: str):
     async def generate_stream():
         """Stream browser screenshots as they happen."""
         browser = await get_browser(workspace_id)
+        queue = asyncio.Queue()
         
-        # Stream callback
+        # Stream callback - pushes to queue
         async def stream_callback(data):
-            yield f"data: {json.dumps(data)}\n\n"
+            await queue.put(data)
         
+        # Attach callback to browser
         browser.stream_callback = stream_callback
         
-        # Keep connection alive
-        while True:
-            await asyncio.sleep(1)
-            yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+        # Send initial connection message
+        yield f"data: {json.dumps({'type': 'connected'})}\n\n"
+        
+        try:
+            while True:
+                # Wait for event or timeout (heartbeat)
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+                    
+        except asyncio.CancelledError:
+            # Clean up callback on disconnect
+            print(f"👋 Browser stream client disconnected for {workspace_id}")
+            browser.stream_callback = None
     
     return StreamingResponse(
         generate_stream(),

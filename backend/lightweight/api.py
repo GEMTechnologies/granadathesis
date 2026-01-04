@@ -11,12 +11,16 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field
+import pandas as pd
+import numpy as np
 
-from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 import mimetypes
+import redis.asyncio as aioredis
+from core.config import settings
 
 # ============================================================================
 # FastAPI APP INITIALIZATION
@@ -64,6 +68,8 @@ from services.planner import planner_service
 from services.chat_history_service import chat_history_service
 from services.skills_manager import get_skills_manager
 from core.events import events
+from services.objective_generator import extract_short_theme, generate_smart_objectives
+from services.spreadsheet_service import get_spreadsheet_service
 
 # Import RAG router for fast document upload and semantic search
 try:
@@ -98,6 +104,12 @@ except Exception as e:
     print(f"⚠️ Workspace Creation API not available: {e}")
 
 # Import Agent router for autonomous problem solving
+# Initialize global redis client for SSE and job tracking
+redis_client = aioredis.from_url(
+    settings.REDIS_URL.replace("redis://redis:", "redis://localhost:") if settings.REDIS_URL.startswith("redis://redis:") and not os.path.exists("/.dockerenv") else settings.REDIS_URL,
+    decode_responses=True
+)
+
 try:
     from routes.agent_api import router as agent_router
     app.include_router(agent_router)
@@ -125,68 +137,7 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def extract_short_theme(full_topic: str) -> str:
-    """Extract 3-5 key words from a topic for use in objectives, headings, etc.
-    
-    Example:
-        Input: "Security sector reform and political transition in East Africa: A critical analysis of security sector institution in South Sudan, 2011-2014"
-        Output: "security sector reform political transition"
-    """
-    if not full_topic:
-        return "the research topic"
-    
-    # Remove common phrases and prefixes
-    text = full_topic.lower()
-    for phrase in ['a critical analysis of', 'an examination of', 'a study of', 
-                   'an investigation of', 'an assessment of', 'the impact of',
-                   'investigating', 'exploring', 'analysing', 'analyzing',
-                   'examining', 'assessing', 'evaluating']:
-        text = text.replace(phrase, ' ')
-    
-    # Remove date ranges
-    import re
-    text = re.sub(r'\d{4}\s*[-–]\s*\d{4}', '', text)
-    text = re.sub(r',\s*\d{4}', '', text)
-    
-    # Skip common words
-    skip_words = {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'which', 
-                  'their', 'of', 'in', 'on', 'a', 'an', 'to', 'by', 'as', 'is',
-                  'case', 'study', 'analysis', 'research', 'investigation'}
-    words = [w.strip('.,;:()') for w in text.split() if w.lower() not in skip_words and len(w) > 2]
-    
-    # Return first 4-5 key words
-    result = ' '.join(words[:5])
-    return result if result else "the research topic"
 
-
-def generate_smart_objectives(topic: str, num_objectives: int = 4) -> list:
-    """Generate meaningful default objectives based on the topic.
-    
-    Uses short theme instead of full topic title.
-    """
-    short_theme = extract_short_theme(topic)
-    
-    # Pool of objective templates
-    templates_4 = [
-        f"To examine the institutional framework governing {short_theme}",
-        f"To analyse the key challenges affecting {short_theme}",
-        f"To assess stakeholder perspectives on {short_theme}",
-        f"To recommend strategies for improving {short_theme}",
-    ]
-    
-    templates_6 = [
-        f"To examine the institutional framework governing {short_theme}",
-        f"To analyse the key factors influencing {short_theme}",
-        f"To evaluate the effectiveness of current {short_theme} initiatives",
-        f"To assess stakeholder perspectives on {short_theme}",
-        f"To identify barriers and enablers to {short_theme}",
-        f"To recommend evidence-based strategies for enhancing {short_theme}",
-    ]
-    
-    if num_objectives <= 4:
-        return templates_4[:num_objectives]
-    else:
-        return templates_6[:num_objectives]
 
 
 def extract_case_study(full_topic: str, provided_case_study: str = None) -> str:
@@ -490,15 +441,161 @@ def convert_future_to_past_tense(text: str) -> str:
     
     return result
 
+def convert_past_to_future_tense(text: str) -> str:
+    """
+    Convert thesis-style (past tense) text to proposal-style (future tense).
+    Used to generate proposal versions of methodology chapters.
+    
+    Examples:
+    - "was collected" → "will be collected"
+    - "were selected" → "will be selected"  
+    - "The study used" → "The study will use"
+    """
+    import re
+    
+    # Past-to-future conversions for academic writing
+    conversions = [
+        # Past be verbs to future
+        (r'\bwas collected\b', 'will be collected'),
+        (r'\bWas collected\b', 'Will be collected'),
+        (r'\bwere collected\b', 'will be collected'),
+        (r'\bWere collected\b', 'Will be collected'),
+        (r'\bwas gathered\b', 'will be gathered'),
+        (r'\bWas gathered\b', 'Will be gathered'),
+        (r'\bwere gathered\b', 'will be gathered'),
+        (r'\bWere gathered\b', 'Will be gathered'),
+        (r'\bwas selected\b', 'will be selected'),
+        (r'\bWas selected\b', 'Will be selected'),
+        (r'\bwere selected\b', 'will be selected'),
+        (r'\bWere selected\b', 'Will be selected'),
+        (r'\bwas used\b', 'will be used'),
+        (r'\bWas used\b', 'Will be used'),
+        (r'\bwere used\b', 'will be used'),
+        (r'\bWere used\b', 'Will be used'),
+        (r'\bwas employed\b', 'will be employed'),
+        (r'\bWas employed\b', 'Will be employed'),
+        (r'\bwere employed\b', 'will be employed'),
+        (r'\bWere employed\b', 'Will be employed'),
+        (r'\bwas adopted\b', 'will be adopted'),
+        (r'\bWas adopted\b', 'Will be adopted'),
+        (r'\bwere adopted\b', 'will be adopted'),
+        (r'\bWere adopted\b', 'Will be adopted'),
+        (r'\bwas applied\b', 'will be applied'),
+        (r'\bWas applied\b', 'Will be applied'),
+        (r'\bwere applied\b', 'will be applied'),
+        (r'\bWere applied\b', 'Will be applied'),
+        (r'\bwas conducted\b', 'will be conducted'),
+        (r'\bWas conducted\b', 'Will be conducted'),
+        (r'\bwere conducted\b', 'will be conducted'),
+        (r'\bWere conducted\b', 'Will be conducted'),
+        (r'\bwas administered\b', 'will be administered'),
+        (r'\bWas administered\b', 'Will be administered'),
+        (r'\bwere administered\b', 'will be administered'),
+        (r'\bWere administered\b', 'Will be administered'),
+        (r'\bwas distributed\b', 'will be distributed'),
+        (r'\bWas distributed\b', 'Will be distributed'),
+        (r'\bwere distributed\b', 'will be distributed'),
+        (r'\bWere distributed\b', 'Will be distributed'),
+        (r'\bwas analyzed\b', 'will be analyzed'),
+        (r'\bWas analyzed\b', 'Will be analyzed'),
+        (r'\bwere analyzed\b', 'will be analyzed'),
+        (r'\bWere analyzed\b', 'Will be analyzed'),
+        (r'\bwas analysed\b', 'will be analysed'),
+        (r'\bWas analysed\b', 'Will be analysed'),
+        (r'\bwere analysed\b', 'will be analysed'),
+        (r'\bWere analysed\b', 'Will be analysed'),
+        (r'\bwas obtained\b', 'will be obtained'),
+        (r'\bWas obtained\b', 'Will be obtained'),
+        (r'\bwere obtained\b', 'will be obtained'),
+        (r'\bWere obtained\b', 'Will be obtained'),
+        (r'\bwas ensured\b', 'will be ensured'),
+        (r'\bWas ensured\b', 'Will be ensured'),
+        (r'\bwere ensured\b', 'will be ensured'),
+        (r'\bWere ensured\b', 'Will be ensured'),
+        (r'\bwas maintained\b', 'will be maintained'),
+        (r'\bWas maintained\b', 'Will be maintained'),
+        (r'\bwere maintained\b', 'will be maintained'),
+        (r'\bWere maintained\b', 'Will be maintained'),
+        (r'\bwas protected\b', 'will be protected'),
+        (r'\bWas protected\b', 'Will be protected'),
+        (r'\bwere protected\b', 'will be protected'),
+        (r'\bWere protected\b', 'Will be protected'),
+        (r'\bwas sought\b', 'will be sought'),
+        (r'\bWas sought\b', 'Will be sought'),
+        (r'\bwere sought\b', 'will be sought'),
+        (r'\bWere sought\b', 'Will be sought'),
+        
+        # Simple past to future
+        (r'\bcollected\b', 'will collect'),
+        (r'\bCollected\b', 'Will collect'),
+        (r'\bselected\b', 'will select'),
+        (r'\bSelected\b', 'Will select'),
+        (r'\bused\b', 'will use'),
+        (r'\bUsed\b', 'Will use'),
+        (r'\bemployed\b', 'will employ'),
+        (r'\bEmployed\b', 'Will employ'),
+        (r'\badopted\b', 'will adopt'),
+        (r'\bAdopted\b', 'Will adopt'),
+        (r'\bapplied\b', 'will apply'),
+        (r'\bApplied\b', 'Will apply'),
+        (r'\bconducted\b', 'will conduct'),
+        (r'\bConducted\b', 'Will conduct'),
+        (r'\bperformed\b', 'will perform'),
+        (r'\bPerformed\b', 'Will perform'),
+        (r'\badministered\b', 'will administer'),
+        (r'\bAdministered\b', 'Will administer'),
+        (r'\bdistributed\b', 'will distribute'),
+        (r'\bDistributed\b', 'Will distribute'),
+        (r'\binterviewed\b', 'will interview'),
+        (r'\bInterviewed\b', 'Will interview'),
+        (r'\bobserved\b', 'will observe'),
+        (r'\bObserved\b', 'Will observe'),
+        (r'\brecorded\b', 'will record'),
+        (r'\bRecorded\b', 'Will record'),
+        (r'\bensured\b', 'will ensure'),
+        (r'\bEnsured\b', 'Will ensure'),
+        (r'\bmaintained\b', 'will maintain'),
+        (r'\bMaintained\b', 'Will maintain'),
+        (r'\bobtained\b', 'will obtain'),
+        (r'\bObtained\b', 'Will obtain'),
+        
+        # Phrases
+        (r'\bData was collected\b', 'Data will be collected'),
+        (r'\bdata was collected\b', 'data will be collected'),
+        (r'\bData were collected\b', 'Data will be collected'),
+        (r'\bdata were collected\b', 'data will be collected'),
+        (r'\bThe study used\b', 'The study will use'),
+        (r'\bthe study used\b', 'the study will use'),
+        (r'\bThe research used\b', 'The research will use'),
+        (r'\bthe research used\b', 'the research will use'),
+        (r'\bThe researcher \b', 'The researcher will '),
+        (r'\bthe researcher \b', 'the researcher will '),
+        
+        # Specific methodology phrases
+        (r'\bThis study aimed to\b', 'This study aims to'),
+        (r'\bthis study aimed to\b', 'this study aims to'),
+        (r'\bThis study sought to\b', 'This study seeks to'),
+        (r'\bthis study sought to\b', 'this study seeks to'),
+        (r'\bThe study aimed to\b', 'The study aims to'),
+        (r'\bthe study aimed to\b', 'the study aims to'),
+        (r'\bThe research aimed to\b', 'The research aims to'),
+        (r'\bthe research aimed to\b', 'the research aims to'),
+    ]
+    
+    result = text
+    for pattern, replacement in conversions:
+        result = re.sub(pattern, replacement, result)
+    
+    return result
+
 # ============================================================================
 # WORKSPACE FILE LISTING (Recursive)
 # ============================================================================
 
 def list_workspace_files(workspace_id: str, base_path: str = "") -> List[Dict]:
-    """Recursively list all files and folders in workspace from BOTH thesis_data and workspaces dirs."""
-    # Check both locations for workspace files
-    thesis_data_path = WORKSPACES_DIR / workspace_id  # thesis_data/default
-    workspaces_path = Path(f"/home/gemtech/Desktop/thesis/workspaces/{workspace_id}")  # workspaces/default
+    """Recursively list all files and folders in workspace from the official thesis_data dir."""
+    # Check only the official location for workspace files
+    thesis_data_path = WORKSPACES_DIR / workspace_id
     
     items = []
     
@@ -574,10 +671,7 @@ def list_workspace_files(workspace_id: str, base_path: str = "") -> List[Dict]:
     # Scan thesis_data folder (chapters, study tools)
     scan_directory(thesis_data_path)
     
-    # Scan workspaces folder (datasets, figures)
-    scan_directory(workspaces_path)
-    
-    print(f"✅ Found {len(items)} items in {workspace_id} (from thesis_data + workspaces)")
+    print(f"✅ Found {len(items)} items in {workspace_id} (from thesis_data)")
     return items
 
 # ============================================================================
@@ -735,8 +829,8 @@ async def health():
 # BROWSER STREAMING ENDPOINT - Live browser preview
 # ============================================================================
 
-@app.get("/api/browser/stream")
-async def browser_stream(session_id: str = "default"):
+@app.get("/api/browser/stream/{workspace_id}")
+async def browser_stream(workspace_id: str):
     """
     SSE endpoint for live browser automation viewing.
     
@@ -757,10 +851,10 @@ async def browser_stream(session_id: str = "default"):
         try:
             redis = aioredis.from_url(redis_url, decode_responses=True)
             pubsub = redis.pubsub()
-            await pubsub.subscribe(f"browser:{session_id}")
+            await pubsub.subscribe(f"browser:{workspace_id}")
             
             # Send initial connected message
-            yield {"event": "connected", "data": json.dumps({"status": "connected", "session_id": session_id})}
+            yield {"event": "connected", "data": json.dumps({"status": "connected", "workspace_id": workspace_id})}
             
             async for message in pubsub.listen():
                 if message["type"] == "message":
@@ -776,20 +870,17 @@ async def browser_stream(session_id: str = "default"):
 
 @app.post("/api/session/init")
 async def init_session(request: SessionInitRequest):
-    """Initialize a new session."""
+    """Initialize a new session with auto-created workspace."""
     try:
-        session_data = session_service.get_or_create_session()
-        
-        if request.workspace_id:
-            session_service.set_workspace(session_data["session_id"], request.workspace_id)
-            session_data["workspace_id"] = request.workspace_id
+        # Auto-create session with workspace
+        session_data = session_service.get_or_create_session(user_id=request.user_id)
         
         return {
             "session_id": session_data["session_id"],
             "user_id": request.user_id,
             "workspace_id": session_data.get("workspace_id"),
             "session_url": f"/session/{session_data['session_id']}",
-            "has_workspace": session_data.get("workspace_id") is not None
+            "has_workspace": True  # Always true now since we auto-create
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -805,6 +896,137 @@ async def get_session(session_id: str):
         
         return session_data
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/session/{session_id}/load")
+async def load_chat_session(session_id: str):
+    """
+    Load workspace and files for a specific chat session.
+    Used when clicking a chat in history to restore its workspace.
+    """
+    try:
+        session = session_service.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        workspace_id = session["workspace_id"]
+        
+        # Update last accessed timestamp
+        session_service.db.update_last_accessed(session_id)
+        
+        # Get workspace files
+        files = list_workspace_files(workspace_id)
+        
+        # Get chat history
+        from services.conversation_memory import conversation_memory
+        messages = await conversation_memory.get_messages(workspace_id, session_id, limit=100)
+        
+        return {
+            "session_id": session_id,
+            "workspace_id": workspace_id,
+            "files": files,
+            "messages": messages,
+            "metadata": session,
+            "created_at": session.get("created_at"),
+            "last_accessed": session.get("last_accessed")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/workspace/{workspace_id}/load")
+async def load_workspace_session(workspace_id: str):
+    """
+    Load latest session and files for a specific workspace.
+    Used for shareable URLs by workspace ID.
+    """
+    try:
+        # 1. Get session for this workspace
+        session = session_service.get_session_by_workspace(workspace_id)
+        
+        if not session:
+            # Fallback: if no formal session exists, create a dummy one or use default
+            session_id = f"sess_{workspace_id}"
+            session = {
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "user_id": "default",
+                "created_at": datetime.now().isoformat()
+            }
+        else:
+            session_id = session["session_id"]
+        
+        # 2. Get workspace files
+        files = list_workspace_files(workspace_id)
+        
+        # 3. Get chat history
+        from services.conversation_memory import conversation_memory
+        messages = await conversation_memory.get_messages(workspace_id, session_id, limit=100)
+        
+        # If no messages found for session_id, try workspace_id as session_id (common fallback)
+        if not messages and session_id != workspace_id:
+             messages = await conversation_memory.get_messages(workspace_id, workspace_id, limit=100)
+        
+        return {
+            "session_id": session_id,
+            "workspace_id": workspace_id,
+            "files": files,
+            "messages": messages,
+            "metadata": session
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sessions/list")
+async def list_user_sessions(user_id: str = "default", limit: int = 50):
+    """
+    List all chat sessions for a user.
+    Returns sessions ordered by last accessed (most recent first).
+    """
+    try:
+        from services.workspace_service import WORKSPACES_DIR
+        sessions = session_service.list_user_sessions(user_id, limit)
+        
+        # Enrich sessions with titles if available from conversation memory
+        enriched_sessions = []
+        
+        for session in sessions:
+            s_id = session.get("session_id")
+            w_id = session.get("workspace_id")
+            
+            # Use fallback title
+            title = session.get("metadata", {}).get("title", "New Conversation")
+            
+            # Fetch actual metadata from conversation memory if it exists
+            conv_dir = WORKSPACES_DIR / w_id / "conversations" / s_id
+            if conv_dir.exists():
+                try:
+                    with open(conv_dir / "metadata.json", 'r') as f:
+                        meta = json.load(f)
+                        title = meta.get("title", title)
+                except:
+                    pass
+            
+            enriched_sessions.append({
+                "conversation_id": s_id,
+                "workspace_id": w_id,
+                "title": title,
+                "updated_at": session.get("last_accessed") or session.get("created_at"),
+                "total_messages": 0
+            })
+            
+        return {
+            "conversations": enriched_sessions,
+            "total": len(enriched_sessions)
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
@@ -859,15 +1081,11 @@ async def get_workspace_structure(workspace_id: str):
 async def get_file(workspace_id: str, file_path: str):
     """Get file content."""
     try:
-        # Check both thesis_data and workspaces directories
-        thesis_data_path = WORKSPACES_DIR / workspace_id / file_path
-        workspaces_path = Path(f"/home/gemtech/Desktop/thesis/workspaces/{workspace_id}") / file_path
+        # Check central thesis_data directory
+        target_path = WORKSPACES_DIR / workspace_id / file_path
         
-        # Try thesis_data first, then workspaces
-        if thesis_data_path.exists() and thesis_data_path.is_file():
-            workspace_path = thesis_data_path
-        elif workspaces_path.exists() and workspaces_path.is_file():
-            workspace_path = workspaces_path
+        if target_path.exists() and target_path.is_file():
+            workspace_path = target_path
         else:
             raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         
@@ -893,23 +1111,66 @@ async def get_file(workspace_id: str, file_path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/workspace/{workspace_id}/spreadsheet/{file_path:path}")
+async def get_spreadsheet_data(workspace_id: str, file_path: str):
+    """Get structured data from Excel or CSV file."""
+    try:
+        # Use central thesis_data directory
+        target_path = WORKSPACES_DIR / workspace_id / file_path
+        
+        if not (target_path.exists() and target_path.is_file()):
+            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+        
+        service = get_spreadsheet_service()
+        
+        if target_path.suffix.lower() == '.csv':
+            result = service.read_csv(target_path)
+        elif target_path.suffix.lower() in ['.xlsx', '.xls']:
+            result = service.read_excel(target_path)
+        else:
+            raise HTTPException(status_code=400, detail="Only .csv, .xlsx, and .xls files are supported")
+            
+        if not result.get("success"):
+            # If it failed because it's not a spreadsheet but has the extension, 
+            # maybe pandas failed. return error.
+            raise HTTPException(status_code=500, detail=result.get("error", "Failed to read spreadsheet"))
+            
+        # Remove non-serializable DataFrames
+        result.pop("dataframe", None)
+        result.pop("dataframes", None)
+        
+        # Clean up numpy types for JSON serialization
+        def clean_data(obj):
+            if isinstance(obj, dict):
+                return {k: clean_data(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_data(i) for i in obj]
+            elif isinstance(obj, (np.int64, np.int32, np.intc, np.intp)):
+                return int(obj)
+            elif isinstance(obj, (np.float64, np.float32, np.float16)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return clean_data(obj.tolist())
+            elif pd.isna(obj):
+                return None
+            return obj
+            
+        return clean_data(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/workspace/{workspace_id}/serve/{file_path:path}")
 async def serve_file(workspace_id: str, file_path: str):
     """Serve binary files (images, PDFs, etc.) with correct Content-Type for inline viewing."""
     try:
-        # Check both thesis_data and workspaces directories
-        thesis_data_path = WORKSPACES_DIR / workspace_id / file_path
-        workspaces_path = Path(f"/home/gemtech/Desktop/thesis/workspaces/{workspace_id}") / file_path
+        # Use central thesis_data directory
+        workspace_path = WORKSPACES_DIR / workspace_id / file_path
         
-        # Try thesis_data first, then workspaces
-        if thesis_data_path.exists() and thesis_data_path.is_file():
-            workspace_path = thesis_data_path
-        elif workspaces_path.exists() and workspaces_path.is_file():
-            workspace_path = workspaces_path
-        else:
+        if not (workspace_path.exists() and workspace_path.is_file()):
             print(f"❌ File not found: {file_path}")
-            print(f"   Checked: {thesis_data_path}")
-            print(f"   Checked: {workspaces_path}")
+            print(f"   Checked: {workspace_path}")
             raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         
         # Determine media type
@@ -1112,6 +1373,84 @@ async def delete_source(workspace_id: str, source_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/workspace/{workspace_id}/upload-pdfs")
+async def upload_pdfs(workspace_id: str, files: List[UploadFile] = File(...)):
+    """Upload multiple PDFs and extract metadata. Supports bulk upload of 100+ PDFs."""
+    try:
+        from services.sources_service import sources_service
+        from services.pdf_metadata_extractor import pdf_metadata_extractor
+        import tempfile
+        import shutil
+        
+        results = []
+        errors = []
+        
+        print(f"📚 Uploading {len(files)} PDFs to workspace {workspace_id}")
+        
+        for i, file in enumerate(files):
+            try:
+                if not file.filename.lower().endswith('.pdf'):
+                    errors.append({"filename": file.filename, "error": "Not a PDF file"})
+                    continue
+                
+                # Create temp file with proper extension
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                    # Read and write file content
+                    content = await file.read()
+                    temp_file.write(content)
+                    temp_path = Path(temp_file.name)
+                
+                # Extract metadata
+                print(f"  [{i+1}/{len(files)}] Extracting: {file.filename}")
+                metadata = pdf_metadata_extractor.extract_metadata(temp_path)
+                
+                # Override with original filename if title extraction failed
+                if not metadata.get("title") or metadata["title"] == temp_path.stem:
+                    metadata["title"] = file.filename.replace('.pdf', '').replace('_', ' ').title()
+                
+                # Add to sources (this copies PDF to workspace)
+                source = await sources_service.add_pdf_source(
+                    workspace_id=workspace_id,
+                    pdf_path=temp_path,
+                    metadata=metadata,
+                    original_filename=file.filename
+                )
+                
+                # Clean up temp file
+                try:
+                    temp_path.unlink()
+                except:
+                    pass
+                
+                results.append({
+                    "filename": file.filename,
+                    "source_id": source["id"],
+                    "title": source["title"],
+                    "authors": source["authors"],
+                    "year": source["year"],
+                    "citation_key": source["citation_key"],
+                    "status": "success"
+                })
+                
+                print(f"    ✓ {source['title'][:50]}")
+                
+            except Exception as e:
+                print(f"    ✗ Error processing {file.filename}: {str(e)}")
+                errors.append({"filename": file.filename, "error": str(e)})
+        
+        return {
+            "workspace_id": workspace_id,
+            "total_uploaded": len(files),
+            "successful": len(results),
+            "failed": len(errors),
+            "results": results,
+            "errors": errors
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 # ============================================================================
 # WORKSPACE SETTINGS ENDPOINTS
@@ -1182,6 +1521,29 @@ async def get_search_filters(workspace_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ============================================================================
+@app.delete("/api/session/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    """Delete a chat session and its workspace."""
+    try:
+        success = await session_service.clear_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"status": "success", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/sessions/clear")
+async def clear_all_sessions_endpoint(user_id: str = "default"):
+    """Clear all chat history and workspaces for a user."""
+    try:
+        success = await session_service.clear_all_sessions(user_id)
+        return {"status": "success", "cleared": success}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # CONVERSATION MEMORY ENDPOINTS
@@ -2021,18 +2383,26 @@ async def batch_download_files(workspace_id: str, request: BatchDownloadRequest)
         # Create zip in memory
         zip_buffer = io.BytesIO()
         
+        # Track added files to prevent duplicates
+        added_files = set()
+        
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for file_path in request.paths:
                 target_path = workspace_path / file_path
                 if target_path.exists():
                     if target_path.is_file():
-                        zip_file.write(target_path, file_path)
+                        # File case
+                        if file_path not in added_files:
+                            zip_file.write(target_path, file_path)
+                            added_files.add(file_path)
                     else:
-                        # Add folder recursively
+                        # Directory case - Add folder recursively
                         for item in target_path.rglob('*'):
                             if item.is_file():
-                                arcname = item.relative_to(workspace_path)
-                                zip_file.write(item, str(arcname))
+                                arcname = str(item.relative_to(workspace_path))
+                                if arcname not in added_files:
+                                    zip_file.write(item, arcname)
+                                    added_files.add(arcname)
         
         zip_buffer.seek(0)
         
@@ -2578,2968 +2948,140 @@ def is_pdf_action_request(message: str) -> tuple:
     return (False, None, None)
 
 @app.post("/api/chat/message")
-async def chat_message(request: ChatMessageRequest):
-    """Handle chat messages with planner and tool execution."""
-    # Generate job_id IMMEDIATELY at the start - before any processing
-    # This ensures frontend can always connect to stream even if we error
+async def chat_message(request: ChatMessageRequest, background_tasks: BackgroundTasks):
+    """Handle chat messages with backgrounded agent workflow."""
     job_id = str(uuid.uuid4())
     
     # Ensure request has required fields with defaults
     if not hasattr(request, 'message') or not request.message:
         return {
             "response": "Please provide a message.",
-            "reasoning": "",
-            "plan": [],
-            "tool_results": {},
             "job_id": job_id
         }
     
     # Set defaults if not provided
-    if not hasattr(request, 'session_id') or not request.session_id:
-        request.session_id = "default"
-    if not hasattr(request, 'workspace_id') or not request.workspace_id:
-        request.workspace_id = "default"
+    if not hasattr(request, 'session_id') or not request.session_id or request.session_id == "new":
+        request.session_id = str(uuid.uuid4())
+        
+    # Resolve workspace_id from session if possible
+    # This prevents the "confusing IDs" issue where the backend uses 'default' 
+    # but the UI shows session-specific files.
+    session_data = session_service.get_session(request.session_id)
+    if session_data:
+        request.workspace_id = session_data["workspace_id"]
+    elif not hasattr(request, 'workspace_id') or not request.workspace_id or request.workspace_id == "default":
+        # Create a workspace tied to this unique session if neither exists
+        request.workspace_id = f"ws_{request.session_id[:12]}"
+    
     if not hasattr(request, 'user_id') or not request.user_id:
         request.user_id = "default"
     
+    # Store job-to-session mapping for SSE routing
+    await redis_client.setex(f"job:{job_id}:session", 3600, request.session_id)
+    
+    # Start the workflow in the background
+    background_tasks.add_task(
+        background_agent_workflow,
+        request=request,
+        job_id=job_id
+    )
+    
+    # Return IMMEDIATELY so frontend can connect to SSE stream
+    return {
+        "status": "processing",
+        "job_id": job_id,
+        "response": "Starting research and writing process...",
+        "message": "The AntiGravity research engine is warming up."
+    }
+
+async def background_agent_workflow(request: ChatMessageRequest, job_id: str):
+    """Execution logic for the agent workflow in the background."""
     try:
-        message_lower = request.message.lower().strip()
+        from services.central_brain import central_brain
         
-        # =====================================================================
-        # CENTRAL BRAIN - Context-Aware Thinking
-        # Analyzes conversation context to detect follow-ups before classification
-        # =====================================================================
-        from services.central_brain import central_brain, ActionType
-        
-        # Get conversation history from request
-        conv_history = getattr(request, 'conversation_history', []) or []
-        
-        # Let the brain think about this message in context (async for Redis support)
-        brain_decision = await central_brain.think(
+        # 1. Run full agent workflow (This emits stage_started/agent_activity events)
+        workflow_result = await central_brain.run_agent_workflow(
             message=request.message,
             session_id=request.session_id,
-            conversation_history=conv_history
+            workspace_id=request.workspace_id,
+            conversation_history=request.conversation_history,
+            job_id=job_id
         )
         
-        # If it's a follow-up, handle it specially
-        if brain_decision["decision"] == "followup":
-            followup = brain_decision["followup_info"]
-            print(f"🧠 Central Brain: Detected FOLLOW-UP - {followup['followup_type']}")
-            print(f"   Target: {followup.get('target_action')}")
-            print(f"   Extracted params: {followup.get('extracted_params')}")
-            
-            # Handle file update follow-up
-            if followup["followup_type"] == "modify_file" and followup.get("routing_override") == "file_update":
-                from pathlib import Path
-                import asyncio
-                
-                params = followup["extracted_params"]
-                original_filepath = params.get("original_filepath", "")
-                new_content = params.get("new_content", request.message.strip())
-                
-                async def run_file_update():
-                    """Update the previously created file with new content."""
-                    try:
-                        await events.connect()
-                        
-                        # Get original file path
-                        if original_filepath:
-                            file_path = Path(original_filepath)
-                        else:
-                            # Use absolute path for 'default' workspace
-                            if workspace_id == "default":
-                                workspace_dir = Path("/home/gemtech/Desktop/thesis")
-                            else:
-                                workspace_dir = Path(f"workspaces/{workspace_id}")
-                            
-                            filename = params.get("original_filename", "new_file.md")
-                            file_path = workspace_dir / filename
-                        
-                        # Update the file
-                        await events.publish(job_id, "stage_started", {
-                            "stage": "file_update", 
-                            "message": f"📝 Updating file with: {new_content[:50]}..."
-                        }, session_id=request.session_id)
-                        
-                        # Ensure directory exists
-                        file_path.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        # Write new content
-                        file_path.write_text(new_content)
-                        
-                        # Record this action
-                        await central_brain.record_action(request.session_id, ActionType.FILE_EDIT, {
-                            "filename": file_path.name,
-                            "filepath": str(file_path),
-                            "content": new_content
-                        })
-                        
-                        response_text = f"✅ File updated successfully!\n\n📄 **Filename:** {file_path.name}\n📁 **Path:** {file_path}\n📝 **New content:**\n```\n{new_content}\n```"
-                        
-                        await events.publish(job_id, "response_chunk", {
-                            "chunk": response_text,
-                            "accumulated": response_text
-                        }, session_id=request.session_id)
-                        
-                        await events.publish(job_id, "file_created", {
-                            "filename": file_path.name,
-                            "path": str(file_path)
-                        }, session_id=request.session_id)
-                        
-                        await events.publish(job_id, "stage_completed", {
-                            "stage": "file_update",
-                            "message": "File updated"
-                        }, session_id=request.session_id)
-                        
-                        await events.publish(job_id, "done", {"status": "success"}, session_id=request.session_id)
-                        
-                    except Exception as e:
-                        print(f"Error updating file: {e}")
-                        await events.publish(job_id, "error", {"message": str(e)}, session_id=request.session_id)
-                
-                asyncio.create_task(run_file_update())
-                return {"response": f"Updating file with: {new_content}...", "job_id": job_id, "plan": [], "reasoning": "Follow-up file update detected"}
+        # 2. Update session metadata
+        session_data = session_service.get_session(request.session_id)
+        if not session_data:
+            session_data = session_service.get_or_create_session(request.session_id, request.user_id)
+        session_metadata = session_data.get("metadata", {}) if session_data else {}
         
-        # =====================================================================
-        # FAST INTELLIGENT ROUTER - Speed is priority!
-        # Classifies and routes requests in <10ms wherever possible
-        # =====================================================================
+        if "gathered_data" in workflow_result:
+            session_metadata.update(workflow_result["gathered_data"])
+            session_service.update_session_metadata(request.session_id, session_metadata)
+
+        # 3. Formulate final response
+        from services.deepseek_direct import deepseek_direct
+        history_str = ""
+        if hasattr(request, 'conversation_history') and request.conversation_history:
+            for msg in request.conversation_history[-5:]:
+                history_str += f"{msg.get('role', 'user')}: {msg.get('content', '')}\n"
         
-        def fast_classify(msg: str) -> dict:
-            """Ultra-fast request classification using simple pattern matching."""
-            msg_lower = msg.lower().strip()
-            words = msg_lower.split()
-            word_count = len(words)
-            
-            # GREETINGS - instant response
-            if word_count < 5 and any(g in msg_lower for g in ["hi", "hello", "hey", "greetings", "sup", "yo"]):
-                # Ensure it's ONLY a greeting and not a command
-                command_trigger = any(t in msg_lower for t in ["search", "find", "google", "go to", "open", "browse", "visit", "generate", "create", "make", "file"])
-                has_url = any(u in msg_lower for u in [".com", ".org", ".net", ".edu", "http://", "https://"])
-                if not command_trigger and not has_url:
-                    return {"type": "greeting", "route": "instant"}
-            
-            # SIMPLE QUESTIONS - direct LLM streaming (fastest)
-            question_starters = ["what", "who", "when", "where", "why", "how", "is", "are", "can", "do", "does", "will", "would", "should", "could", "explain", "define", "describe"]
-            if any(msg_lower.startswith(q) for q in question_starters) and word_count < 30:
-                # Check if it needs tools - use regex for word boundaries
-                tool_keywords = ["search", "find", "google", "go to", "open", "browse", "generate", "create", "make", "write document", "write essay", "file"]
-                needs_tools = any(re.search(rf"\b{re.escape(t)}\b", msg_lower) for t in tool_keywords)
-                if not needs_tools:
-                    return {"type": "question", "route": "direct_llm"}
-            
-            # UNSUPPORTED REQUESTS - respond gracefully
-            unsupported_keywords = {
-                "video": "Video generation is not yet supported. I can help with text, images, and research.",
-                "audio": "Audio generation is not yet supported. I can help with text, images, and research.",
-                "music": "Music generation is not yet supported. I can help with text, images, and research.",
-                "voice": "Voice synthesis is not yet supported. I can help with text, images, and research.",
-                "song": "Song creation is not yet supported. I can help with text, images, and research.",
-            }
-            for keyword, message in unsupported_keywords.items():
-                if keyword in msg_lower and any(a in msg_lower for a in ["make", "create", "generate", "produce"]):
-                    return {"type": "unsupported", "route": "graceful", "message": message}
-            
-            # IMAGE SEARCH - PRIORITY over generation!
-            if ("image" in msg_lower or "picture" in msg_lower or "photo" in msg_lower):
-                if any(s in msg_lower for s in ["search", "find", "look for", "get me"]):
-                    return {"type": "image_search", "route": "tool"}
-                if any(p in msg_lower for p in ["image of", "picture of", "photo of", "images of", "pictures of"]):
-                    return {"type": "image_search", "route": "tool"}
-            
-            # IMAGE GENERATION
-            generation_keywords = ["diagram", "framework", "illustration", "chart", "flowchart", 
-                                   "infographic", "concept", "visualize", "schematic", "model diagram"]
-            explicit_generate = any(g in msg_lower for g in ["generate image", "create image", "draw me", "make me an image"])
-            needs_generation = any(k in msg_lower for k in generation_keywords)
-            
-            if explicit_generate or needs_generation:
-                return {"type": "image_generate", "route": "tool"}
-            
-            # PAPER/ACADEMIC SEARCH
-            if any(p in msg_lower for p in ["search paper", "find paper", "search research", "academic", "search literature"]):
-                return {"type": "paper_search", "route": "tool"}
-            
-            # WEB SEARCH
-            if any(p in msg_lower for p in ["search", "look up", "look for", "find out", "google", "go to", "browse", "visit", "open"]) and word_count < 20:
-                return {"type": "web_search", "route": "tool"}
-            
-            # ESSAY/DOCUMENT WRITING - needs worker
-            if any(p in msg_lower for p in ["write essay", "write document", "write report", "write paper", "essay about", "essay on"]):
-                return {"type": "essay", "route": "worker"}
-            
-            # SHORT CASUAL CHAT - direct LLM
-            if word_count < 20 and not any(t in msg_lower for t in ["file", "save", "create", "generate", "search", "document"]):
-                return {"type": "chat", "route": "direct_llm"}
-            
-            # DEFAULT - let LLM handle with possible tool use
-            return {"type": "general", "route": "orchestrator"}
+        workflow_context = f"Workflow Result: {json.dumps(workflow_result)}\nUser Message: {request.message}\nHistory: {history_str}"
+        system_prompt = "You are AntiGravity, a PhD-level research architect. Explain your accomplishments naturally."
         
-        # =====================================================
-        # INTELLIGENT INTENT SYSTEM - True AI Understanding
-        # =====================================================
-        from services.intelligent_intent import intelligent_intent, IntentType, RouteType
+        final_response = await deepseek_direct.generate_content(
+            prompt=f"Based on this outcome, respond to the user:\n{workflow_context}",
+            system_prompt=system_prompt,
+            temperature=0.7
+        )
+
+        # 4. Stream final response via SSE
+        await events.publish(job_id, "response_chunk", {
+            "chunk": final_response,
+            "accumulated": final_response
+        }, session_id=request.session_id)
         
-        # Use intelligent intent system (fast patterns + LLM for ambiguous cases)
-        intent_result = await intelligent_intent.understand(request.message)
-        print(f"🧠 Intelligent Intent: {intent_result.intent.value} -> {intent_result.route.value} (confidence: {intent_result.confidence:.2f})")
-        print(f"   Reasoning: {intent_result.reasoning}")
+        # 5. Signal completion
+        await events.publish(job_id, "stage_completed", {
+            "stage": "complete",
+            "message": "✅ All tasks finished"
+        }, session_id=request.session_id)
         
-        # Convert to route_info format for compatibility
-        route_info = {
-            "type": intent_result.intent.value,
-            "route": intent_result.route.value,
-            "params": intent_result.params,
-            "message": intent_result.message,
-            "confidence": intent_result.confidence
+        # 6. Persist to chat history
+        metadata = {
+            "job_id": job_id,
+            "workspace_id": request.workspace_id,
+            "intent": workflow_result.get("intent", "general")
         }
-        
-        # ROUTE 1: Unsupported requests - respond gracefully and fast
-        if route_info["route"] == "graceful":
-            await events.connect()
-            response_text = route_info.get("message", "This feature is not yet supported.")
-            await events.publish(job_id, "response_chunk", {
-                "chunk": response_text,
-                "accumulated": response_text
-            }, session_id=request.session_id)
-            return {
-                "response": response_text,
-                "reasoning": "",
-                "plan": [],
-                "job_id": job_id
-            }
-        
-        # ROUTE 2: Direct LLM streaming - NO tools, maximum speed
-        if route_info["route"] == "direct_llm":
-            from services.deepseek_direct import deepseek_direct
-            
-            # Build context from conversation history
-            history_context = ""
-            if request.conversation_history and len(request.conversation_history) > 0:
-                history_lines = []
-                for msg in request.conversation_history[-5:]:  # Last 5 messages for context
-                    role = msg.get("type", "user")
-                    content = msg.get("content", "")[:500]  # Truncate long messages
-                    if role == "user":
-                        history_lines.append(f"User: {content}")
-                    elif role == "assistant":
-                        history_lines.append(f"Assistant: {content}")
-                if history_lines:
-                    history_context = "\n\nRecent conversation:\n" + "\n".join(history_lines) + "\n\nUser's current message: "
-            
-            async def stream_direct_response():
-                """Stream LLM response directly - fastest path."""
-                import httpx
-                
-                try:
-                    yield {"event": "job_id", "data": json.dumps({"job_id": job_id})}
-                    yield {"event": "stage", "data": json.dumps({"stage": "responding", "icon": "💬", "message": "Generating response..."})}
-                    
-                    # Include context if available
-                    full_prompt = history_context + request.message if history_context else request.message
-                    
-                    # Build system prompt with user context
-                    user_context = brain_decision.get("user_context", "")
-                    base_system = "You are a helpful, knowledgeable AI assistant. Be concise and direct. Answer questions clearly. If the user refers to something from earlier in the conversation, understand the context."
-                    if user_context:
-                        system_prompt = f"{base_system}\n\nUser context: {user_context}"
-                    else:
-                        system_prompt = base_system
-                    
-                    accumulated = ""
-                    async for chunk in deepseek_direct.generate_stream(
-                        prompt=full_prompt,
-                        system_prompt=system_prompt
-                    ):
-                        accumulated += chunk
-                        yield {"event": "response_chunk", "data": json.dumps({"chunk": chunk, "accumulated": accumulated})}
-                    
-                    yield {"event": "done", "data": json.dumps({"status": "success"})}
-                    
-                except Exception as e:
-                    yield {"event": "error", "data": json.dumps({"message": str(e)})}
-            
-            return EventSourceResponse(stream_direct_response())
-
-        
-        # ROUTE 3: Direct IMAGE SEARCH - Uses Unsplash/Pexels/Pixabay APIs directly (no LLM!)
-        if route_info["route"] == "tool_direct" and route_info["type"] == "image_search":
-            from services.image_search import image_search_service  # Direct API calls, no LLM
-            import asyncio
-            
-            # Extract search query
-            query = request.message
-            for prefix in ["search for", "find", "look for", "get me", "show me", "image of", "picture of", "photo of", "images of", "pictures of"]:
-                query = query.lower().replace(prefix, "").strip()
-            
-            async def run_image_search():
-                """Run image search and publish events via Redis."""
-                try:
-                    await events.connect()
-                    
-                    # Send stage_started
-                    await events.publish(job_id, "stage_started", {"stage": "image_search", "message": f"🔍 Searching images: {query}..."}, session_id=request.session_id)
-                    
-                    # Call image search APIs directly
-                    results = await image_search_service.search(query, limit=6)
-                    
-                    if results and len(results) > 0:
-                        # Format response with images
-                        response_parts = [f"Found {len(results)} images for '{query}':\n\n"]
-                        
-                        for i, img in enumerate(results[:6]):
-                            title = img.get("title", f"Image {i+1}")
-                            url = img.get("url") or img.get("full") or img.get("thumbnail")
-                            source = img.get("source", "Unknown")
-                            if url:
-                                response_parts.append(f"![{title}]({url})\n*Source: {source}*\n\n")
-                        
-                        response_text = "".join(response_parts)
-                        
-                        # Send response_chunk
-                        await events.publish(job_id, "response_chunk", {"chunk": response_text, "accumulated": response_text}, session_id=request.session_id)
-                        
-                        # Send agent_activity for preview panel
-                        await events.publish(job_id, "agent_activity", {
-                            "agent": "image_search",
-                            "action": "completed",
-                            "query": query,
-                            "status": "completed",
-                            "results": results[:6]
-                        }, session_id=request.session_id)
-                        
-                        # Send stage_completed
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=request.session_id)
-                    else:
-                        await events.publish(job_id, "response_chunk", {"chunk": f"No images found for '{query}'. Try a different search term.", "accumulated": f"No images found for '{query}'. Try a different search term."}, session_id=request.session_id)
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "no_results"}, session_id=request.session_id)
-                        
-                except Exception as e:
-                    print(f"Image search error: {e}")
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error searching images: {str(e)}", "accumulated": f"Error searching images: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            # Run in background
-            asyncio.create_task(run_image_search())
-            
-            # Return JSON immediately
-            return {"response": f"Searching images for '{query}'...", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 4: Direct WEB SEARCH
-        if route_info["route"] == "tool_direct" and route_info["type"] == "web_search":
-            from services.web_search import WebSearchService
-            import asyncio
-            web_search = WebSearchService()
-            
-            # Smart query extraction - check if current message is a meta-request
-            query = route_info.get("params", {}).get("query")
-            
-            if not query or len(query) < 5:
-                msg_lower = request.message.lower()
-                # Check if this is a meta-request like "can you search" without a topic
-                meta_patterns = ["can you search", "cant u search", "search internet", "search online", 
-                                "do a search", "look it up", "search for it", "google it"]
-                is_meta_request = any(p in msg_lower for p in meta_patterns)
-                
-                if is_meta_request and request.conversation_history:
-                    # Look at recent messages for the actual topic
-                    for msg in reversed(request.conversation_history[-5:]):
-                        content = msg.get("content", "")
-                        # Skip short/meta messages
-                        if len(content) > 20 and not any(p in content.lower() for p in meta_patterns):
-                            # This is likely the topic - extract key terms
-                            query = content
-                            break
-                
-                # Fallback to current message (remove meta parts from START ONLY)
-                if not query:
-                    query = request.message
-                    # Use regex to only remove prefix verbs/meta
-                    import re
-                    query = re.sub(r'^(?:can\s+you\s+|cant\s+u\s+|can\s+u\s+|could\s+you\s+|please\s+|search\s+|internet\s+|online\s+|open\s+|go\s+to\s+|browse\s+|visit\s+)+', '', query, flags=re.IGNORECASE).strip()
-                    if not query:
-                        query = request.message
-            
-            async def run_web_search():
-                """Web search with Playwright in background thread."""
-                try:
-                    print(f"🔍 Starting web search for: {query}", flush=True)
-                    await events.connect()
-                    await events.publish(job_id, "stage_started", {"stage": "web_search", "message": f"🌐 Searching: {query}..."}, session_id=request.session_id)
-                    
-                    # Run Playwright in a separate thread
-                    import threading
-                    import redis
-                    import os
-                    
-                    def run_browser_search():
-                        """Run Playwright browser search in thread."""
-                        import asyncio
-                        from services.browser_automation import BrowserAutomation
-                        import json
-                        
-                        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-                        if redis_url.startswith("redis://redis:") and not os.path.exists("/.dockerenv"):
-                            redis_url = redis_url.replace("redis://redis:", "redis://localhost:")
-                        r = redis.from_url(redis_url)
-                        session = request.session_id or 'default'
-                        
-                        async def stream(data):
-                            r.publish(f"browser:{session}", json.dumps(data))
-                        
-                        async def do_search():
-                            print(f"🎭 Starting Playwright thread search...", flush=True)
-                            try:
-                                # Use headless=True by default for server compatibility
-                                # Screenshots will still be captured!
-                                browser = BrowserAutomation(workspace_id=session, headless=True)
-                                await browser.start(stream_callback=stream)
-                                
-                                search_url = f"https://duckduckgo.com/?q={query.replace(' ', '+')}"
-                                await stream({"type": "action", "action": f"Navigating to DuckDuckGo: {query}"})
-                                
-                                screenshot = await browser.navigate(search_url)
-                                await stream({"type": "screenshot", "image": screenshot, "url": search_url})
-                                
-                                # Wait for results and take another shot
-                                await asyncio.sleep(3)
-                                screenshot2 = await browser._take_screenshot("search_results")
-                                await stream({"type": "screenshot", "image": screenshot2, "url": browser.page.url})
-                                await stream({"type": "action", "action": "Search completed. Results visible in right panel."})
-                                
-                                print(f"✅ Playwright thread search complete", flush=True)
-                                await browser.close()
-                            except Exception as e:
-                                print(f"⚠️ Playwright thread search error: {e}", flush=True)
-                                await stream({"type": "action", "action": f"Browser Error: {str(e)}"})
-                                # Report back to chat via event bus if possible
-                                # (Note: events.publish is async, we are in a non-async loop running in a thread)
-                                # So we just log and stream to browser panel.
-                        
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        try:
-                            loop.run_until_complete(do_search())
-                        except Exception as e:
-                            print(f"⚠️ Event loop error: {e}", flush=True)
-                        finally:
-                            loop.close()
-                    
-                    thread = threading.Thread(target=run_browser_search, daemon=True)
-                    thread.start()
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"🎭 **Opening browser:** {query}\n\n📺 Watch **browser panel** →",
-                        "accumulated": f"🎭 **Opening browser:** {query}\n\n📺 Watch **browser panel** →"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=request.session_id)
-                    
-                except Exception as e:
-                    print(f"⚠️ Search error: {e}", flush=True)
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error: {str(e)}", "accumulated": f"Error: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            asyncio.create_task(run_web_search())
-            return {"response": f"🔍 Searching: {query}...", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 5: Direct PAPER SEARCH
-        if route_info["route"] == "tool_direct" and route_info["type"] == "paper_search":
-            from services.academic_search import academic_search_service
-            import asyncio
-            
-            query = route_info.get("params", {}).get("query") or request.message
-            
-            async def run_paper_search():
-                try:
-                    await events.connect()
-                    await events.publish(job_id, "stage_started", {"stage": "paper_search", "message": f"📚 Searching papers: {query}..."}, session_id=request.session_id)
-                    
-                    results = await academic_search_service.search(query, max_results=10)
-                    
-                    if results and len(results) > 0:
-                        response_parts = [f"**Found {len(results)} academic papers for '{query}':**\n\n"]
-                        for i, paper in enumerate(results[:10]):
-                            title = paper.get("title", f"Paper {i+1}")
-                            authors = ", ".join(paper.get("authors", [])[:3])
-                            year = paper.get("year", "")
-                            doi = paper.get("doi", "")
-                            url = f"https://doi.org/{doi}" if doi else paper.get("url", "")
-                            response_parts.append(f"{i+1}. **{title}** ({year})\n   *{authors}*\n   [Link]({url})\n\n")
-                        
-                        response_text = "".join(response_parts)
-                        await events.publish(job_id, "response_chunk", {"chunk": response_text, "accumulated": response_text}, session_id=request.session_id)
-                        await events.publish(job_id, "agent_activity", {"agent": "researcher", "action": "completed", "query": query, "status": "completed", "results": results[:10]}, session_id=request.session_id)
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=request.session_id)
-                    else:
-                        await events.publish(job_id, "response_chunk", {"chunk": f"No papers found for '{query}'.", "accumulated": f"No papers found for '{query}'."}, session_id=request.session_id)
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "no_results"}, session_id=request.session_id)
-                except Exception as e:
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error: {str(e)}", "accumulated": f"Error: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            asyncio.create_task(run_paper_search())
-            return {"response": f"Searching papers for '{query}'...", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 6: Direct IMAGE GENERATE (for diagrams, illustrations)
-        if route_info["route"] == "tool_direct" and route_info["type"] == "image_generate":
-            from services.image_generation import image_generation_service
-            import asyncio
-            
-            prompt = route_info.get("params", {}).get("prompt") or request.message
-            
-            async def run_image_generate():
-                try:
-                    await events.connect()
-                    await events.publish(job_id, "stage_started", {"stage": "image_generate", "message": f"🎨 Generating image: {prompt[:50]}..."}, session_id=request.session_id)
-                    
-                    result = await image_generation_service.generate(prompt=prompt, size="1024x1024")
-                    
-                    if result.get("success"):
-                        image_url = result.get("image_url") or result.get("url")
-                        response_text = f"**Generated image:**\n\n![{prompt[:50]}]({image_url})\n\n*Prompt: {prompt}*"
-                        
-                        await events.publish(job_id, "response_chunk", {"chunk": response_text, "accumulated": response_text}, session_id=request.session_id)
-                        await events.publish(job_id, "agent_activity", {"agent": "image_generator", "action": "completed", "query": prompt, "status": "completed", "results": [{"url": image_url}]}, session_id=request.session_id)
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=request.session_id)
-                    else:
-                        await events.publish(job_id, "response_chunk", {"chunk": f"Image generation failed: {result.get('error', 'Unknown error')}", "accumulated": f"Image generation failed: {result.get('error', 'Unknown error')}"}, session_id=request.session_id)
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-                except Exception as e:
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error: {str(e)}", "accumulated": f"Error: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            asyncio.create_task(run_image_generate())
-            return {"response": f"Generating image: {prompt[:50]}...", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 6.5: Direct FILE WRITE (create files in workspace)
-        if route_info["route"] == "tool_direct" and route_info["type"] == "file_write":
-            import asyncio
-            from pathlib import Path
-            
-            params = route_info.get("params", {})
-            filename = params.get("filename")
-            content = params.get("content") or ""
-            
-            # Default filename if not provided
-            if not filename:
-                # Try to infer extension from request
-                if "md" in request.message.lower() or "markdown" in request.message.lower():
-                    filename = "new_file.md"
-                elif "txt" in request.message.lower() or "text" in request.message.lower():
-                    filename = "new_file.txt"
-                elif "json" in request.message.lower():
-                    filename = "new_file.json"
-                else:
-                    filename = "new_file.md"
-            
-            async def run_file_create():
-                try:
-                    await events.connect()
-                    await events.publish(job_id, "stage_started", {"stage": "file_create", "message": f"📄 Creating file: {filename}..."}, session_id=request.session_id)
-                    
-                    # Get workspace directory
-                    workspace_id = request.workspace_id or "default"
-                    if workspace_id == "default":
-                        workspace_dir = Path("/home/gemtech/Desktop/thesis")
-                    else:
-                        workspace_dir = Path(f"workspaces/{workspace_id}")
-                    workspace_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Create the file
-                    file_path = workspace_dir / filename
-                    file_path.write_text(content)
-                    
-                    response_text = f"✅ **File created successfully!**\n\n📄 **Filename:** `{filename}`\n📁 **Path:** `{file_path}`\n📝 **Content:**\n```\n{content}\n```"
-                    
-                    # Record action in central brain for follow-up detection
-                    from services.central_brain import central_brain, ActionType
-                    await central_brain.record_action(request.session_id, ActionType.FILE_CREATE, {
-                        "filename": filename,
-                        "filepath": str(file_path),
-                        "content": content,
-                        "workspace_id": workspace_id
-                    })
-                    
-                    await events.publish(job_id, "response_chunk", {"chunk": response_text, "accumulated": response_text}, session_id=request.session_id)
-                    await events.publish(job_id, "file_created", {
-                        "path": filename,
-                        "full_path": str(file_path),
-                        "filename": filename,
-                        "workspace_id": workspace_id,
-                        "type": "text"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=request.session_id)
-                except Exception as e:
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error creating file: {str(e)}", "accumulated": f"Error creating file: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            asyncio.create_task(run_file_create())
-            return {"response": f"Creating file: {filename}...", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 7: CHAPTER GENERATION - Parallel multi-agent thesis chapter generation
-        if route_info["route"] == "pipeline" and route_info["type"] in ["chapter_generate", "chapter_two_generate", "chapter_three_generate"]:
-            from services.parallel_chapter_generator import parallel_chapter_generator, BACKGROUND_STYLES
-            import asyncio
-            
-            topic = route_info.get("params", {}).get("topic") or request.message
-            case_study = route_info.get("params", {}).get("case_study", "")
-            background_style = route_info.get("params", {}).get("background_style", "inverted_pyramid")
-            # IMPORTANT: Read generation_type from params (set by intelligent_intent.py)
-            # This determines if we generate Chapter 1, 2, or 3
-            chapter_type = route_info.get("params", {}).get("generation_type") or route_info.get("type", "chapter_generate")
-            
-            # Get objectives if provided (for Chapter Two and Three)
-            objectives = route_info.get("params", {}).get("objectives")
-            research_questions = route_info.get("params", {}).get("research_questions")
-            
-            # Validate background style
-            if background_style not in BACKGROUND_STYLES:
-                background_style = "inverted_pyramid"
-            
-            async def run_chapter_generation():
-                try:
-                    await events.connect()
-                    
-                    # FULL PROPOSAL - Generate all 3 chapters sequentially
-                    print(f"🔍 DEBUG: chapter_type = '{chapter_type}'")
-                    if chapter_type == "full_proposal_generate":
-                        print("🎯 DEBUG: Entered full_proposal_generate route!")
-                        # Initialize session_id for events
-                        session_id = request.session_id # Use request's session_id
-                        print(f"🔍 DEBUG: session_id = {session_id}")
-                        
-                        await events.publish(
-                            job_id,
-                            "response_chunk",
-                            {"chunk": f"# 📚 Generating Full Research Proposal (Chapters 1-3)\n\n**Topic:** {topic}\n**Case Study:** {case_study}\n\nThis will generate:\n- ✅ Chapter 1: Introduction\n- ✅ Chapter 2: Literature Review\n- ✅ Chapter 3: Research Methodology\n\nObjectives from Chapter 1 will be used throughout.\n\n---\n\n", "accumulated": ""},
-                            session_id=session_id
-                        )
-                        
-                        
-                        # Step 1: Generate Chapter 1
-                        print("🔍 DEBUG: About to generate Chapter 1...")
-                        await events.publish(job_id, "log", {"message": "📖 Step 1/3: Generating Chapter 1..."}, session_id=session_id)
-                        chapter1_result = await parallel_chapter_generator.generate(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=session_id
-                        )
-                        print(f"✅ DEBUG: Chapter 1 complete! Length: {len(chapter1_result)} chars")
-                        
-                        # Step 2: Generate Chapter 2 (using objectives from Chapter 1)
-                        print("🔍 DEBUG: About to generate Chapter 2...")
-                        await events.publish(job_id, "log", {"message": "📚 Step 2/3: Generating Chapter 2 (using Chapter 1 objectives)..."}, session_id=session_id)
-                        chapter2_result = await parallel_chapter_generator.generate_chapter_two(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=session_id
-                        )
-                        print(f"✅ DEBUG: Chapter 2 complete! Length: {len(chapter2_result)} chars")
-                        
-                        # Step 3: Generate Chapter 3 (using objectives from Chapter 1)
-                        print("🔍 DEBUG: About to generate Chapter 3...")
-                        await events.publish(job_id, "log", {"message": "🔬 Step 3/3: Generating Chapter 3 (using Chapter 1 objectives)..."}, session_id=session_id)
-                        chapter3_result = await parallel_chapter_generator.generate_chapter_three(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=session_id
-                        )
-                        
-                        # Combine all chapters
-                        full_proposal = f"{chapter1_result}\n\n---\n\n{chapter2_result}\n\n---\n\n{chapter3_result}"
-                        
-                        # Extract and consolidate all references
-                        await events.publish(job_id, "log", {"message": "📚 Consolidating references from all chapters..."}, session_id=session_id)
-                        
-                        import re
-                        # Extract all citations in format (Author, Year) or (Author et al., Year)
-                        all_citations = set()
-                        
-                        # Pattern to match APA citations
-                        citation_pattern = r'\(([A-Z][a-zA-Z\s&,\.]+,\s*\d{4}[a-z]?)\)'
-                        
-                        for chapter in [chapter1_result, chapter2_result, chapter3_result]:
-                            citations = re.findall(citation_pattern, chapter)
-                            all_citations.update(citations)
-                        
-                        # Sort citations alphabetically
-                        sorted_citations = sorted(list(all_citations))
-                        
-                        # Create References section
-                        references_section = "\n\n---\n\n# References\n\n"
-                        references_section += "*Note: This is a consolidated list of all citations from Chapters 1-3. Full bibliographic details should be added based on the actual sources used.*\n\n"
-                        
-                        for citation in sorted_citations:
-                            # Extract author and year
-                            parts = citation.rsplit(',', 1)
-                            if len(parts) == 2:
-                                author = parts[0].strip()
-                                year = parts[1].strip()
-                                references_section += f"- {author} ({year}). *[Full reference details to be added]*\n"
-                        
-                        # Add references to full proposal
-                        full_proposal_with_refs = full_proposal + references_section
-                        
-                        # Generate appendices (study tools)
-                        await events.publish(job_id, "log", {"message": "📎 Generating study tools appendices..."}, session_id=session_id)
-                        
-                        generated_files = []
-                        try:
-                            from services.appendix_generator import AppendixGenerator
-                            from pathlib import Path
-                            import glob
-                            
-                            # Get objectives from database
-                            objectives = []
-                            research_questions = []
-                            try:
-                                from services.thesis_session_db import ThesisSessionDB
-                                db = ThesisSessionDB(session_id)
-                                obj_data = db.get_objectives() or {}
-                                # get_objectives returns {"general": str, "specific": list}
-                                objectives = obj_data.get("specific", [])
-                                if obj_data.get("general"):
-                                    objectives = [obj_data["general"]] + objectives
-                                print(f"📋 Found {len(objectives)} objectives for study tools generation")
-                                
-                                # Get research questions
-                                try:
-                                    rq_data = db.get_questions() or []
-                                    research_questions = rq_data if isinstance(rq_data, list) else []
-                                    print(f"📋 Found {len(research_questions)} research questions")
-                                except:
-                                    pass
-                                    
-                            except Exception as obj_err:
-                                print(f"⚠️ Could not get objectives: {obj_err}")
-                            
-                            # Read Chapter 3 methodology content
-                            methodology_content = ""
-                            try:
-                                workspace_dir = Path(f"/home/gemtech/Desktop/thesis/thesis_data/default")
-                                chapter3_files = list(workspace_dir.glob("Chapter_3*.md")) + list(workspace_dir.glob("chapter_3*.md"))
-                                if chapter3_files:
-                                    with open(chapter3_files[0], 'r', encoding='utf-8') as f:
-                                        methodology_content = f.read()
-                                    print(f"📋 Read Chapter 3: {len(methodology_content)} chars")
-                                else:
-                                    # Use the just-generated chapter3_result
-                                    methodology_content = chapter3_result
-                                    print(f"📋 Using generated Chapter 3 content: {len(methodology_content)} chars")
-                            except Exception as ch3_err:
-                                print(f"⚠️ Could not read Chapter 3: {ch3_err}")
-                                methodology_content = chapter3_result if chapter3_result else ""
-                            
-                            # Use actual workspace directory
-                            from config import get_workspace_dir
-                            workspace_path = get_workspace_dir('default')
-                            workspace_path.mkdir(parents=True, exist_ok=True)
-                            
-                            # Create enhanced appendix generator with methodology
-                            appendix_gen = AppendixGenerator(
-                                workspace_dir=str(workspace_path),
-                                topic=topic,
-                                case_study=case_study,
-                                objectives=objectives,
-                                methodology_content=methodology_content,
-                                research_questions=research_questions
-                            )
-                            
-                            await events.publish(job_id, "log", {
-                                "message": f"📋 Detected: {appendix_gen.research_design} design with {', '.join(appendix_gen.data_collection_methods)}"
-                            }, session_id=session_id)
-                            
-                            # Generate all appropriate appendices
-                            generated_files = await appendix_gen.generate_all_appendices()
-                            
-                            await events.publish(job_id, "log", {
-                                "message": f"✅ Generated {len(generated_files)} study tool(s): {', '.join([Path(f).stem for f in generated_files])}"
-                            }, session_id=session_id)
-                            
-                        except Exception as appendix_error:
-                            print(f"⚠️ Appendix generation failed: {appendix_error}")
-                            import traceback
-                            traceback.print_exc()
-                            await events.publish(job_id, "log", {"message": f"⚠️ Appendix generation skipped: {appendix_error}"}, session_id=session_id)
-                        
-                        # Combine appendices into main proposal
-                        if generated_files:
-                            await events.publish(job_id, "log", {"message": "📋 Combining appendices into proposal..."}, session_id=session_id)
-                            
-                            appendix_section = "\n\n---\n\n# APPENDICES\n\n"
-                            
-                            for file_path in generated_files:
-                                try:
-                                    with open(file_path, 'r', encoding='utf-8') as f:
-                                        appendix_content = f.read()
-                                    
-                                    # Add page break before each appendix
-                                    appendix_section += "\n\n---\n\n"
-                                    appendix_section += appendix_content
-                                    
-                                except Exception as read_error:
-                                    print(f"Error reading appendix {file_path}: {read_error}")
-                            
-                            full_proposal_with_refs += appendix_section
-                        
-                        # Save individual chapter files to workspace
-                        await events.publish(job_id, "log", {"message": "💾 Saving files to workspace..."}, session_id=session_id)
-                        
-                        try:
-                            from pathlib import Path
-                            from config import get_workspace_dir
-                            workspace_path = get_workspace_dir('default')
-                            workspace_path.mkdir(parents=True, exist_ok=True)
-                            
-                            # Save Chapter 1
-                            chapter1_file = workspace_path / "Chapter_1_Introduction.md"
-                            with open(chapter1_file, 'w', encoding='utf-8') as f:
-                                f.write(f"# CHAPTER 1: INTRODUCTION\n\n{chapter1_result}")
-                            
-                            # Save Chapter 2
-                            chapter2_file = workspace_path / "Chapter_2_Literature_Review.md"
-                            with open(chapter2_file, 'w', encoding='utf-8') as f:
-                                f.write(f"# CHAPTER 2: LITERATURE REVIEW\n\n{chapter2_result}")
-                            
-                            # Save Chapter 3
-                            chapter3_file = workspace_path / "Chapter_3_Methodology.md"
-                            with open(chapter3_file, 'w', encoding='utf-8') as f:
-                                f.write(f"# CHAPTER 3: RESEARCH METHODOLOGY\n\n{chapter3_result}")
-                            
-                            # Save References
-                            references_file = workspace_path / "References.md"
-                            with open(references_file, 'w', encoding='utf-8') as f:
-                                f.write(references_section)
-                            
-                            # Save complete proposal
-                            proposal_file = workspace_path / "Complete_Proposal.md"
-                            with open(proposal_file, 'w', encoding='utf-8') as f:
-                                f.write(f"# RESEARCH PROPOSAL\n\n**Topic:** {topic}\n\n**Case Study:** {case_study}\n\n**Date:** {datetime.now().strftime('%B %Y')}\n\n---\n\n")
-                                f.write(full_proposal_with_refs)
-                            
-                            await events.publish(job_id, "log", {"message": f"✅ Saved 5 files to workspace/default/"}, session_id=session_id)
-                            
-                        except Exception as save_error:
-                            print(f"⚠️ File saving failed: {save_error}")
-                            import traceback
-                            traceback.print_exc()
-                        
-                        await events.publish(
-                            job_id,
-                            "response_chunk",
-                            {"chunk": f"\n\n✅ **Full Research Proposal Complete!**\n\nAll 3 chapters generated successfully with:\n- ✅ Consistent objectives throughout\n- ✅ {len(sorted_citations)} unique references consolidated\n- ✅ Unified References section\n- ✅ {len(generated_files)} study tool appendices\n- ✅ All files saved to workspace\n\n**Files Created:**\n- Complete_Proposal.md (all-in-one)\n- Chapter_1_Introduction.md\n- Chapter_2_Literature_Review.md\n- Chapter_3_Methodology.md\n- References.md\n- appendices/ folder with {len(generated_files)} tool(s)\n", "accumulated": full_proposal_with_refs},
-                            session_id=session_id
-                        )
-                        
-                        await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=session_id)
-                        
-                    # Individual chapter generation
-                    elif chapter_type == "chapter_three_generate":
-                        # Generate Chapter Three - Research Methodology
-                        await parallel_chapter_generator.generate_chapter_three(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=request.session_id,
-                            objectives=objectives,
-                            research_questions=research_questions
-                        )
-                    elif chapter_type == "chapter_two_generate":
-                        # Generate Chapter Two - Literature Review
-                        await parallel_chapter_generator.generate_chapter_two(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=request.session_id,
-                            objectives=objectives,
-                            research_questions=research_questions
-                        )
-                    else:
-                        # Generate Chapter One
-                        await parallel_chapter_generator.generate(
-                            topic=topic,
-                            case_study=case_study,
-                            job_id=job_id,
-                            session_id=request.session_id,
-                            background_style=background_style
-                        )
-                except Exception as e:
-                    print(f"Chapter generation error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {"chunk": f"Error generating chapter: {str(e)}", "accumulated": f"Error: {str(e)}"}, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "error"}, session_id=request.session_id)
-            
-            asyncio.create_task(run_chapter_generation())
-            
-            if chapter_type == "chapter_two_generate":
-                return {"response": f"📚 Starting Chapter Two (Literature Review) generation for: {topic}...\\n\\n10+ research agents + 20+ writer agents working simultaneously!\\nObjective-based themes generated automatically!", "job_id": job_id, "plan": [], "reasoning": ""}
-            else:
-                return {"response": f"📖 Starting parallel chapter generation for: {topic}...\\n\\n6 research agents + 5 writer agents working simultaneously!", "job_id": job_id, "plan": [], "reasoning": ""}
-        
-        # ROUTE 7.5: DATASET GENERATION - AI synthetic data collection
-        if route_info["route"] == "pipeline" and route_info.get("params", {}).get("generation_type") == "dataset_generate":
-            from services.data_collection_worker import generate_research_dataset
-            import asyncio
-            from pathlib import Path
-            import glob
-            
-            sample_size = route_info.get("params", {}).get("sample_size")
-            
-            async def run_dataset_generation():
-                try:
-                    await events.connect()
-                    session_id = request.session_id
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"# 📊 Generating Synthetic Research Dataset\n\n**Simulating survey data collection...**\n\n",
-                        "accumulated": ""
-                    }, session_id=session_id)
-                    
-                    # Get topic from session database
-                    topic = ""
-                    case_study = ""
-                    objectives = []
-                    
-                    try:
-                        from services.thesis_session_db import ThesisSessionDB
-                        db = ThesisSessionDB(session_id)
-                        topic = db.get_topic() or "Research Study"
-                        case_study = db.get_case_study() or ""
-                        obj_data = db.get_objectives() or {}
-                        objectives = obj_data.get("specific", [])
-                        if obj_data.get("general"):
-                            objectives = [obj_data["general"]] + objectives
-                    except Exception as e:
-                        print(f"⚠️ Could not get session data: {e}")
-                        topic = "Research Study"
-                    
-                    # Provide default objectives if none found
-                    if not objectives:
-                        objectives = generate_smart_objectives(topic, 4)
-                        print(f"📋 Using default objectives for dataset generation")
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📋 Topic: {topic[:50]}... | {len(objectives)} objectives"
-                    }, session_id=session_id)
-                    
-                    # Find questionnaire file
-                    questionnaire_path = None
-                    methodology_path = None
-                    
-                    from config import get_appendices_dir
-                    workspace_dir = get_appendices_dir('default')
-                    thesis_dir = Path("/home/gemtech/Desktop/thesis/thesis_data/default")
-                    
-                    # Look for questionnaire
-                    for search_dir in [workspace_dir, thesis_dir]:
-                        questionnaire_files = list(search_dir.glob("*Questionnaire*.md"))
-                        if questionnaire_files:
-                            questionnaire_path = str(questionnaire_files[0])
-                            break
-                    
-                    # Look for methodology
-                    chapter3_files = list(thesis_dir.glob("Chapter_3*.md"))
-                    if chapter3_files:
-                        methodology_path = str(chapter3_files[0])
-                    
-                    if questionnaire_path:
-                        await events.publish(job_id, "log", {
-                            "message": f"📋 Found questionnaire: {Path(questionnaire_path).name}"
-                        }, session_id=session_id)
-                    
-                    # Output directory - save with other thesis files
-                    output_dir = "/home/gemtech/Desktop/thesis/workspaces/default/datasets"
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    # Generate dataset
-                    await events.publish(job_id, "log", {
-                        "message": f"🚀 Deploying AI respondent agents..."
-                    }, session_id=session_id)
-                    
-                    result = await generate_research_dataset(
-                        topic=topic,
-                        case_study=case_study,
-                        questionnaire_path=questionnaire_path,
-                        methodology_path=methodology_path,
-                        sample_size=sample_size,
-                        objectives=objectives,
-                        job_id=job_id,
-                        session_id=session_id,
-                        output_dir=output_dir
-                    )
-                    
-                    csv_path = result["csv_path"]
-                    spss_path = result["spss_syntax_path"]
-                    stats = result["stats"]
-                    xlsx_path = stats.get("xlsx_path")
-                    
-                    # Add XLSX to files list if exists
-                    if xlsx_path:
-                        result['files'].append(xlsx_path)
-                    
-                    # Summary message
-                    summary = f"""
-## ✅ Dataset Generated Successfully!
-
-### Files Created:
-- 📄 **CSV Dataset**: `{Path(csv_path).name}`
-- 📊 **Excel Dataset**: `{Path(xlsx_path).name if xlsx_path else 'N/A'}`
-- 📋 **SPSS Syntax**: `{Path(spss_path).name}`
-
-### Statistics:
-- **Sample Size**: {result['sample_size']} respondents
-- **Total Variables**: {result['total_variables']}
-
-### Demographic Distribution:
-"""
-                    for var, freq in list(stats.get("demographics", {}).items())[:3]:
-                        summary += f"\n**{var}**:\n"
-                        for val, count in list(freq.items())[:5]:
-                            pct = (count / result['sample_size']) * 100
-                            summary += f"  - {val}: {count} ({pct:.1f}%)\n"
-                    
-                    # Add all generated files
-                    summary += "\n### All Generated Files:\n"
-                    for file_path in result.get('files', []):
-                        summary += f"- 📄 `{Path(file_path).name}`\n"
-                    
-                    summary += f"""
-### Next Steps:
-1. Download the CSV files
-2. Import questionnaire data into SPSS using the provided syntax
-3. Analyze interview/FGD transcripts using thematic analysis
-4. Review observation data for patterns
-
-**Note**: This is synthetic data for demonstration purposes.
-"""
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": summary,
-                        "accumulated": summary
-                    }, session_id=session_id)
-                    
-                    # Publish all files
-                    for file_path in result.get('files', []):
-                        await events.publish(job_id, "file_created", {
-                            "path": file_path,
-                            "name": Path(file_path).name
-                        }, session_id=session_id)
-                    
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "success"
-                    }, session_id=session_id)
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"❌ Error generating dataset: {str(e)}",
-                        "accumulated": f"Error: {str(e)}"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "error"
-                    }, session_id=request.session_id)
-            
-            asyncio.create_task(run_dataset_generation())
-            sample_info = f" with {sample_size} respondents" if sample_size else ""
-            return {
-                "response": f"📊 Starting synthetic dataset generation{sample_info}...\\n\\nAI agents simulating survey responses!",
-                "job_id": job_id,
-                "plan": [],
-                "reasoning": ""
-            }
-        
-        # ROUTE 7.6: CHAPTER 4 GENERATION - Data Presentation and Analysis
-        if route_info["route"] == "pipeline" and route_info.get("params", {}).get("generation_type") == "chapter_four_generate":
-            from services.chapter4_generator import generate_chapter4
-            import asyncio
-            from pathlib import Path
-            
-            async def run_chapter4_generation():
-                try:
-                    await events.connect()
-                    session_id = request.session_id
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"# 📊 Generating Chapter 4: Data Presentation and Analysis\n\n**Building tables, figures, and interpretation...**\n\n",
-                        "accumulated": ""
-                    }, session_id=session_id)
-                    
-                    # Get session data
-                    topic = ""
-                    case_study = ""
-                    objectives = []
-                    
-                    try:
-                        from services.thesis_session_db import ThesisSessionDB
-                        db = ThesisSessionDB(session_id)
-                        topic = db.get_topic() or "Research Study"
-                        case_study = db.get_case_study() or ""
-                        obj_data = db.get_objectives() or {}
-                        objectives = obj_data.get("specific", [])
-                        if obj_data.get("general"):
-                            objectives = [obj_data["general"]] + objectives
-                    except Exception as e:
-                        print(f"⚠️ Could not get session data: {e}")
-                        topic = "Research Study"
-                    
-                    # Generate default objectives if none found
-                    if not objectives:
-                        objectives = generate_smart_objectives(topic, 4)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📋 Topic: {topic[:50]}... | {len(objectives)} objectives"
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📊 Loading datasets and generating analysis..."
-                    }, session_id=session_id)
-                    
-                    # Generate Chapter 4
-                    result = await generate_chapter4(
-                        topic=topic,
-                        case_study=case_study,
-                        objectives=objectives,
-                        job_id=job_id,
-                        session_id=session_id
-                    )
-                    
-                    filepath = result["filepath"]
-                    tables = result["tables"]
-                    figures = result["figures"]
-                    
-                    # Summary message
-                    summary = f"""
-## ✅ Chapter 4 Generated Successfully!
-
-### File Created:
-- 📄 **Chapter 4**: `{Path(filepath).name}`
-
-### Content Summary:
-- **Tables Generated**: {tables}
-- **Figures Generated**: {figures}
-- **Objectives Covered**: {result['objectives_covered']}
-
-### Sections Included:
-- 4.0 Introduction
-- 4.1 Study Tools Rate of Return  
-- 4.2 Demographics (all subsections)
-- 4.3-4.{len(objectives)+2} Objective Analyses
-  - Descriptive Statistics
-  - Inferential Statistics
-  - Qualitative Findings (quotes)
-  - Triangulation
-- Summary of Findings
-
-**Note**: Review and customize the auto-generated content as needed.
-"""
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": summary,
-                        "accumulated": summary
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "file_created", {
-                        "path": filepath,
-                        "name": Path(filepath).name
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "success"
-                    }, session_id=session_id)
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"❌ Error generating Chapter 4: {str(e)}",
-                        "accumulated": f"Error: {str(e)}"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "error"
-                    }, session_id=request.session_id)
-            
-            asyncio.create_task(run_chapter4_generation())
-            return {
-                "response": f"📊 Starting Chapter 4 generation...\\n\\nCreating data presentation with tables, figures, and interpretation!",
-                "job_id": job_id,
-                "plan": [],
-                "reasoning": ""
-            }
-        
-        # ROUTE 7.7: CHAPTER 5 GENERATION - Results and Discussion
-        if route_info["route"] == "pipeline" and route_info.get("params", {}).get("generation_type") == "chapter_five_generate":
-            from services.chapter5_generator_v2 import generate_chapter5
-            import asyncio
-            from pathlib import Path
-            
-            async def run_chapter5_generation():
-                try:
-                    await events.connect()
-                    session_id = request.session_id
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"# 📖 Generating Chapter 5: Results and Discussion\n\n**Synthesizing Chapter 2 (Literature) with Chapter 4 (Data)...**\n\n",
-                        "accumulated": ""
-                    }, session_id=session_id)
-                    
-                    # Get session data
-                    topic = ""
-                    case_study = ""
-                    objectives = []
-                    
-                    try:
-                        from services.thesis_session_db import ThesisSessionDB
-                        db = ThesisSessionDB(session_id)
-                        topic = db.get_topic() or "Research Study"
-                        case_study = db.get_case_study() or ""
-                        obj_data = db.get_objectives() or {}
-                        objectives = obj_data.get("specific", [])
-                        if obj_data.get("general"):
-                            objectives = [obj_data["general"]] + objectives
-                    except Exception as e:
-                        print(f"⚠️ Could not get session data: {e}")
-                        topic = "Research Study"
-                    
-                    # Generate default objectives if none found
-                    if not objectives:
-                        objectives = generate_smart_objectives(topic, 4)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📋 Topic: {topic[:50]}... | {len(objectives)} objectives"
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📖 Synthesizing Chapter 2 and Chapter 4..."
-                    }, session_id=session_id)
-                    
-                    # Find Chapter 2 and Chapter 4 files - check both session and default directories
-                    workspace_dir = Path(f"/home/gemtech/Desktop/thesis/thesis_data/{session_id}")
-                    default_dir = Path("/home/gemtech/Desktop/thesis/thesis_data/default")
-                    
-                    # Search for Chapter 2 in session dir first, then default
-                    chapter2_files = list(workspace_dir.glob("Chapter_2*.md")) + list(workspace_dir.glob("chapter_2*.md"))
-                    if not chapter2_files:
-                        chapter2_files = list(default_dir.glob("Chapter_2*.md")) + list(default_dir.glob("chapter_2*.md"))
-                    
-                    # Search for Chapter 4 in session dir first, then default
-                    chapter4_files = list(workspace_dir.glob("Chapter_4*.md")) + list(workspace_dir.glob("chapter_4*.md"))
-                    if not chapter4_files:
-                        chapter4_files = list(default_dir.glob("Chapter_4*.md")) + list(default_dir.glob("chapter_4*.md"))
-                    
-                    chapter2_path = str(chapter2_files[0]) if chapter2_files else None
-                    chapter4_path = str(chapter4_files[0]) if chapter4_files else None
-                    
-                    # Use default output dir if session dir doesn't exist
-                    output_dir = str(workspace_dir) if workspace_dir.exists() else str(default_dir)
-                    
-                    # Generate Chapter 5
-                    result = await generate_chapter5(
-                        topic=topic,
-                        case_study=case_study,
-                        objectives=objectives,
-                        chapter_two_filepath=chapter2_path,
-                        chapter_four_filepath=chapter4_path,
-                        output_dir=output_dir,
-                        job_id=job_id,
-                        session_id=session_id
-                    )
-                    
-                    filepath = result["filepath"]
-                    
-                    # Summary message
-                    summary = f"""
-## ✅ Chapter 5 Generated Successfully!
-
-### File Created:
-- 📖 **Chapter 5**: `{Path(filepath).name}`
-
-### Features:
-- ✅ Problem & objectives reintroduced
-- ✅ {result['objectives_discussed']} objectives discussed
-- ✅ {result['citations_integrated']} literature themes integrated
-- ✅ 3-5 citations per paragraph for comparisons
-- ✅ Confirmation/variation from existing knowledge identified
-- ✅ Contribution to knowledge demonstrated
-
-### Next Steps:
-You can now:
-1. Download and review Chapter 5
-2. Generate Chapter 6 (Conclusions & Recommendations)
-3. Export entire thesis to DOCX
-4. Request revisions or improvements
-
-"""
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": summary,
-                        "accumulated": summary
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "success"
-                    }, session_id=session_id)
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"❌ Error generating Chapter 5: {str(e)}",
-                        "accumulated": f"Error: {str(e)}"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "error"
-                    }, session_id=request.session_id)
-            
-            asyncio.create_task(run_chapter5_generation())
-            return {
-                "response": f"📖 Starting Chapter 5 generation...\\n\\nSynthesizing literature review with data findings!",
-                "job_id": job_id,
-                "plan": [],
-                "reasoning": ""
-            }
-        
-        # ROUTE 7.8: CHAPTER 6 GENERATION - Summary, Conclusion and Recommendations
-        if route_info["route"] == "pipeline" and route_info.get("params", {}).get("generation_type") == "chapter_six_generate":
-            from services.chapter6_generator_v2 import generate_chapter6
-            import asyncio
-            from pathlib import Path
-            
-            async def run_chapter6_generation():
-                try:
-                    await events.connect()
-                    session_id = request.session_id
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"# 📖 Generating Chapter 6: Summary, Conclusions and Recommendations\n\n**Using LLM to synthesise findings from all chapters...**\n\n",
-                        "accumulated": ""
-                    }, session_id=session_id)
-                    
-                    # Get session data
-                    topic = ""
-                    case_study = ""
-                    objectives = []
-                    
-                    try:
-                        from services.thesis_session_db import ThesisSessionDB
-                        db = ThesisSessionDB(session_id)
-                        topic = db.get_topic() or "Research Study"
-                        case_study = db.get_case_study() or ""
-                        obj_data = db.get_objectives() or {}
-                        objectives = obj_data.get("specific", [])
-                        if obj_data.get("general"):
-                            objectives = [obj_data["general"]] + objectives
-                    except Exception as e:
-                        print(f"⚠️ Could not get session data: {e}")
-                        topic = "Research Study"
-                    
-                    # Generate default objectives if none found
-                    if not objectives:
-                        objectives = generate_smart_objectives(topic, 4)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📋 Topic: {topic[:50]}... | {len(objectives)} objectives"
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📖 Synthesising Chapter 1 through Chapter 5..."
-                    }, session_id=session_id)
-                    
-                    # Find all chapter files
-                    workspace_dir = Path(f"/home/gemtech/Desktop/thesis/thesis_data/{session_id}")
-                    chapter1_files = list(workspace_dir.glob("Chapter_1*.md")) + list(workspace_dir.glob("chapter_1*.md"))
-                    chapter2_files = list(workspace_dir.glob("Chapter_2*.md")) + list(workspace_dir.glob("chapter_2*.md"))
-                    chapter3_files = list(workspace_dir.glob("Chapter_3*.md")) + list(workspace_dir.glob("chapter_3*.md"))
-                    chapter4_files = list(workspace_dir.glob("Chapter_4*.md")) + list(workspace_dir.glob("chapter_4*.md"))
-                    chapter5_files = list(workspace_dir.glob("Chapter_5*.md")) + list(workspace_dir.glob("chapter_5*.md"))
-                    
-                    chapter1_content = ""
-                    chapter2_content = ""
-                    chapter3_content = ""
-                    chapter4_content = ""
-                    chapter5_content = ""
-                    
-                    if chapter1_files:
-                        with open(chapter1_files[0], 'r', encoding='utf-8') as f:
-                            chapter1_content = f.read()
-                    if chapter2_files:
-                        with open(chapter2_files[0], 'r', encoding='utf-8') as f:
-                            chapter2_content = f.read()
-                    if chapter3_files:
-                        with open(chapter3_files[0], 'r', encoding='utf-8') as f:
-                            chapter3_content = f.read()
-                    if chapter4_files:
-                        with open(chapter4_files[0], 'r', encoding='utf-8') as f:
-                            chapter4_content = f.read()
-                    if chapter5_files:
-                        with open(chapter5_files[0], 'r', encoding='utf-8') as f:
-                            chapter5_content = f.read()
-                    
-                    # Generate Chapter 6 using LLM-based generator
-                    chapter6_content = await generate_chapter6(
-                        topic=topic,
-                        case_study=case_study,
-                        objectives=objectives,
-                        chapter4_content=chapter4_content,
-                        chapter5_content=chapter5_content,
-                        job_id=job_id,
-                        session_id=session_id
-                    )
-                    
-                    # Save Chapter 6
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    safe_topic = topic[:50].replace(' ', '_')
-                    filename = f"Chapter_6_PhD_Conclusion_{safe_topic}.md"
-                    filepath = workspace_dir / filename
-                    
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(chapter6_content)
-                    
-                    # Summary message
-                    summary = f"""
-## ✅ Chapter 6 Generated Successfully!
-
-### File Created:
-- 📖 **Chapter 6**: `{filename}`
-
-### Sections Included:
-- ✅ 6.0 Introduction
-- ✅ 6.1 Summary of the Study
-- ✅ 6.2 Summary of Key Findings (per objective)
-- ✅ 6.3 Conclusions (per objective)
-- ✅ 6.4 Recommendations
-- ✅ 6.5 Contribution to Knowledge
-- ✅ 6.6 Limitations of the Study
-- ✅ 6.7 Suggestions for Further Research
-
-### Features:
-- ✅ LLM-generated unique content (not templates)
-- ✅ Synthesised findings from all chapters
-- ✅ Evidence-based recommendations
-- ✅ Limitations acknowledged
-- ✅ Clear research directions identified
-- ✅ PhD-level academic rigour
-- ✅ UK English throughout
-
-### Thesis Completion:
-You now have all chapters (1-6) ready! You can:
-1. Download and review Chapter 6
-2. Export entire thesis (Chapters 1-6) to DOCX
-3. Request final revisions or additional chapters
-4. Generate thesis summary or abstract
-
-"""
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": summary,
-                        "accumulated": summary
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "success"
-                    }, session_id=session_id)
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"❌ Error generating Chapter 6: {str(e)}",
-                        "accumulated": f"Error: {str(e)}"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "error"
-                    }, session_id=request.session_id)
-            
-            asyncio.create_task(run_chapter6_generation())
-            return {
-                "response": f"📖 Starting Chapter 6 generation...\\n\\nSynthesising all chapters into conclusions and recommendations!",
-                "job_id": job_id,
-                "plan": [],
-                "reasoning": ""
-            }
-        
-        # ROUTE 7.9: THESIS COMBINE - Combine all chapters into single file
-        if route_info["route"] == "pipeline" and route_info.get("params", {}).get("generation_type") == "thesis_combine_generate":
-            from services.thesis_combiner import combine_existing_chapters
-            import asyncio
-            from pathlib import Path
-            
-            async def run_thesis_combine():
-                try:
-                    await events.connect()
-                    session_id = request.session_id
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"# 📚 Combining All Chapters into Unified Thesis\n\n**Merging Chapters 1-6, generating references and statistics...**\n\n",
-                        "accumulated": ""
-                    }, session_id=session_id)
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📚 Discovering and loading all chapters from workspace..."
-                    }, session_id=session_id)
-                    
-                    # Publish agent activity for UI
-                    await publish_agent_activity(
-                        job_id=job_id,
-                        agent="planner",
-                        action="Discovering chapters",
-                        description="Finding and loading all thesis chapters from workspace...",
-                        progress=10,
-                        session_id=session_id
-                    )
-                    
-                    # Get session data
-                    topic = ""
-                    case_study = ""
-                    objectives = []
-                    
-                    try:
-                        from services.thesis_session_db import ThesisSessionDB
-                        db = ThesisSessionDB(session_id)
-                        topic = db.get_topic() or "Research Study"
-                        case_study = db.get_case_study() or ""
-                        obj_data = db.get_objectives() or {}
-                        objectives = obj_data.get("specific", [])
-                        if obj_data.get("general"):
-                            objectives = [obj_data["general"]] + objectives
-                    except Exception as e:
-                        print(f"⚠️ Could not get session data: {e}")
-                        topic = "Research Study"
-                    
-                    # Generate default objectives if none found
-                    if not objectives:
-                        objectives = generate_smart_objectives(topic, 4)
-                    
-                    # Publish agent activity for UI
-                    await publish_agent_activity(
-                        job_id=job_id,
-                        agent="citation",
-                        action="Combining chapters",
-                        description=f"Merging {len(objectives)} chapters with unified references...",
-                        progress=50,
-                        session_id=session_id
-                    )
-                    
-                    await events.publish(job_id, "log", {
-                        "message": f"📋 Topic: {topic[:50]}... | {len(objectives)} objectives"
-                    }, session_id=session_id)
-                    
-                    # Use thesis combiner to combine existing chapters
-                    thesis_path, total_words = await combine_existing_chapters(
-                        workspace_id=session_id,
-                        topic=topic,
-                        case_study=case_study,
-                        objectives=objectives
-                    )
-                    
-                    chapters_found = 6  # Assuming 6 chapters in a complete thesis
-                    
-                    # Summary message
-                    summary = f"""
-## ✅ Complete Thesis Generated Successfully!
-
-### File Created:
-- 📚 **Unified Thesis**: `{Path(thesis_path).name if thesis_path else 'thesis.md'}`
-
-### Statistics:
-- **Chapters Combined**: {chapters_found}
-- **Total Words**: {total_words:,}
-- **Estimated Pages**: ~{int(total_words / 250) if total_words > 0 else 0}
-
-### Contents:
-✅ Title Page with Abstract
-✅ Table of Contents
-✅ Chapter 1: Introduction
-✅ Chapter 2: Literature Review
-✅ Chapter 3: Research Methodology
-✅ Chapter 4: Data Presentation & Analysis
-✅ Chapter 5: Results & Discussion
-✅ Chapter 6: Summary, Conclusion & Recommendations
-✅ Consolidated References Section
-✅ Thesis Statistics
-
-### Next Steps:
-1. **Download**: Get your complete thesis.md file
-2. **Export to DOCX**: Convert to Word format with formatting
-3. **Review**: Check chapter flow and references
-4. **Submit**: Your PhD thesis is ready!
-"""
-                    
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": summary,
-                        "accumulated": summary
-                    }, session_id=session_id)
-                    
-                    if thesis_path:
-                        await events.publish(job_id, "file_created", {
-                            "path": thesis_path,
-                            "name": Path(thesis_path).name
-                        }, session_id=session_id)
-                    
-                    # Publish agent completion
-                    await publish_agent_activity(
-                        job_id=job_id,
-                        agent="citation",
-                        action="Thesis combination complete",
-                        description=f"Successfully merged {chapters_found} chapters into unified thesis ({total_words:,} words)",
-                        progress=100,
-                        session_id=session_id
-                    )
-                    
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "success"
-                    }, session_id=session_id)
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": f"❌ Error combining thesis: {str(e)}",
-                        "accumulated": f"Error: {str(e)}"
-                    }, session_id=request.session_id)
-                    await events.publish(job_id, "stage_completed", {
-                        "stage": "complete",
-                        "status": "error"
-                    }, session_id=request.session_id)
-            
-            asyncio.create_task(run_thesis_combine())
-            return {
-                "response": f"📚 Combining all thesis chapters into single unified file...\\n\\nMerging Chapters 1-6 with references and statistics!",
-                "job_id": job_id,
-                "plan": [],
-                "reasoning": ""
-            }
-        
-        # ROUTE 8: Instant responses - DISABLED
-        # Let ALL messages (including greetings) go to LLM for natural responses
-        # if route_info["route"] == "instant":
-        #     # Skip - let LLM handle greetings naturally
-        #     pass
-        
-        # Simple greetings - DISABLED - let messages fall through to LLM
-        if False and is_simple_greeting(request.message):  # Disabled
-            try:
-                await events.connect()
-                await events.log(job_id, "💬 Responding to simple query...", "info", session_id=request.session_id)
-                
-                # Don't use hardcoded greetings - let LLM respond naturally
-                response_text = ""
-                
-                # Stream response word by word for real-time effect
-                words = response_text.split(' ')
-                accumulated = ""
-                for i, word in enumerate(words):
-                    accumulated += word + (" " if i < len(words) - 1 else "")
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": word + " ",
-                        "accumulated": accumulated
-                    }, session_id=request.session_id)
-                    await asyncio.sleep(0.03)  # Small delay for streaming effect
-                
-                await events.publish(job_id, "stage_completed", {
-                    "stage": "response",
-                    "metadata": {"type": "simple"}
-                }, session_id=request.session_id)
-            except Exception as e:
-                print(f"⚠️ Error in simple response streaming: {e}", flush=True)
-            
-            return {
-                "response": "",  # Empty - let LLM handle greeting
-                "reasoning": "",
-                "plan": [],
-                "tool_results": {},
-                "job_id": job_id
-            }
-        
-        # Direct image generation - bypass planner (only for explicit generation requests)
-        if is_image_generation_request(request.message):
-            try:
-                from services.image_generation import image_generation_service
-                
-                # Extract prompt (remove generation keywords)
-                prompt = request.message
-                for keyword in ["generate image", "create image", "make image", "generate a picture", "create a picture"]:
-                    prompt = prompt.replace(keyword, "").replace(keyword.replace(" ", ""), "").strip()
-                if not prompt:
-                    prompt = request.message  # Use full message if no prompt extracted
-                
-                # Generate image directly
-                result = await image_generation_service.generate(
-                    prompt=prompt,
-                    size="1024x1024"
-                )
-                
-                if result.get("success"):
-                    image_url = result.get("image_url") or result.get("url")
-                    image_data = result.get("image_data")  # Base64 if available
-                    
-                    response_text = f"✅ Image generated successfully!\n\nPrompt: {prompt}"
-                    
-                    return {
-                        "response": "Image generated successfully!",
-                        "reasoning": "",  # Empty - don't show reasoning panel
-                        "plan": [],
-                        "image_generation": {
-                            "success": True,
-                            "image_url": image_url,
-                            "image_data": image_data,
-                            "prompt": prompt
-                        }
-                    }
-                else:
-                    error_msg = result.get("error", "Image generation failed")
-                    return {
-                        "response": f"❌ Failed to generate image: {error_msg}",
-                        "reasoning": "",  # Empty - don't show reasoning panel
-                        "plan": [],
-                        "image_generation": {"success": False, "error": error_msg}
-                    }
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return {
-                    "response": f"❌ Error generating image: {str(e)}",
-                    "reasoning": f"Image generation error: {str(e)}",
-                    "plan": []
-                }
-        
-        # =====================================================================
-        # INTELLIGENT RESEARCH SYNTHESIS - Search + Analyze + Write
-        # =====================================================================
-        is_synthesis, synthesis_topic, synthesis_style = is_research_synthesis_request(request.message)
-        if is_synthesis and synthesis_topic:
-            print(f"🧠 Detected research synthesis request: '{synthesis_topic}' (style: {synthesis_style})")
-            
-            async def run_intelligent_synthesis():
-                """
-                Intelligent research synthesis pipeline with streaming.
-                
-                This pipeline THINKS about what to do, not just follows steps:
-                1. Understands the research topic and scope
-                2. Searches for relevant papers dynamically
-                3. Analyzes gaps and themes in the literature
-                4. Generates a coherent synthesis with proper citations
-                """
-                from services.sources_service import sources_service
-                from services.literature_synthesis import literature_synthesis_service
-                from services.planner import planner_service
-                
-                try:
-                    # Connect to event system
-                    await events.connect()
-                    
-                    # ── PHASE 1: Understanding ──────────────────────────────────
-                    yield {"event": "stage", "data": json.dumps({
-                        "stage": "understanding", 
-                        "icon": "🧠",
-                        "message": f"Understanding research scope: {synthesis_topic}"
-                    })}
-                    
-                    await events.log(job_id, f"🧠 Analyzing research scope: {synthesis_topic}", "info", session_id=request.session_id)
-                    await asyncio.sleep(0.3)
-                    
-                    # ── PHASE 2: Search ─────────────────────────────────────────
-                    yield {"event": "stage", "data": json.dumps({
-                        "stage": "searching",
-                        "icon": "🔍", 
-                        "message": f"Searching academic databases for papers on '{synthesis_topic}'..."
-                    })}
-                    
-                    await events.log(job_id, f"🔍 Searching papers on: {synthesis_topic}", "info", session_id=request.session_id)
-                    
-                    search_result = await sources_service.search_and_save(
-                        workspace_id=request.workspace_id,
-                        query=synthesis_topic,
-                        max_results=10,
-                        auto_save=True
-                    )
-                    
-                    papers_found = search_result.get('total_results', 0)
-                    papers_saved = search_result.get('saved_count', 0)
-                    
-                    yield {"event": "search_complete", "data": json.dumps({
-                        "papers_found": papers_found,
-                        "papers_saved": papers_saved,
-                        "papers": search_result.get('results', [])[:5]  # Preview first 5
-                    })}
-                    
-                    await events.log(job_id, f"📚 Found {papers_found} papers, saved {papers_saved}", "info", session_id=request.session_id)
-                    
-                    if papers_saved == 0:
-                        yield {"event": "response_chunk", "data": json.dumps({
-                            "chunk": f"\n\n⚠️ No papers found for '{synthesis_topic}'. Try a broader or different search term.\n",
-                            "accumulated": f"\n\n⚠️ No papers found for '{synthesis_topic}'. Try a broader or different search term.\n"
-                        })}
-                        yield {"event": "done", "data": json.dumps({"status": "no_sources"})}
-                        return
-                    
-                    # ── PHASE 3: Analysis & Planning ────────────────────────────
-                    yield {"event": "stage", "data": json.dumps({
-                        "stage": "planning",
-                        "icon": "📋",
-                        "message": "Analyzing literature themes and planning synthesis structure..."
-                    })}
-                    
-                    await events.log(job_id, "📋 Planning synthesis structure...", "info", session_id=request.session_id)
-                    
-                    # Quick outline using planner
-                    try:
-                        outline = await planner_service.generate_outline(
-                            topic=synthesis_topic,
-                            word_count=1500,
-                            include_images=False,
-                            job_id=job_id
-                        )
-                        
-                        if outline and outline.get('sections'):
-                            yield {"event": "outline", "data": json.dumps({
-                                "title": outline.get('title', synthesis_topic),
-                                "sections": [s.get('title', s) if isinstance(s, dict) else s for s in outline.get('sections', [])]
-                            })}
-                    except Exception as e:
-                        print(f"⚠️ Outline generation skipped: {e}")
-                    
-                    # ── PHASE 4: Writing Synthesis ──────────────────────────────
-                    yield {"event": "stage", "data": json.dumps({
-                        "stage": "writing",
-                        "icon": "✍️",
-                        "message": "Generating comprehensive literature synthesis with citations..."
-                    })}
-                    
-                    await events.log(job_id, "✍️ Writing synthesis with citations...", "info", session_id=request.session_id)
-                    
-                    # Stream the synthesis content
-                    accumulated = ""
-                    async for chunk in literature_synthesis_service.synthesize_literature(
-                        workspace_id=request.workspace_id,
-                        topic=synthesis_topic,
-                        output_format="markdown"
-                    ):
-                        accumulated += chunk
-                        yield {"event": "response_chunk", "data": json.dumps({"chunk": chunk, "accumulated": accumulated})}
-                    
-                    # ── PHASE 5: Complete ───────────────────────────────────────
-                    yield {"event": "stage", "data": json.dumps({
-                        "stage": "complete",
-                        "icon": "✅",
-                        "message": "Synthesis complete!"
-                    })}
-                    
-                    await events.log(job_id, "✅ Research synthesis complete!", "info", session_id=request.session_id)
-                    
-                    # Save to workspace
-                    try:
-                        from services.workspace_service import WORKSPACES_DIR
-                        output_path = WORKSPACES_DIR / request.workspace_id / f"synthesis_{synthesis_topic.replace(' ', '_')[:30]}.md"
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_text(full_content, encoding='utf-8')
-                        
-                        yield {"event": "file_created", "data": json.dumps({
-                            "path": str(output_path),
-                            "name": output_path.name
-                        })}
-                        await events.log(job_id, f"📄 Saved to: {output_path.name}", "info", session_id=request.session_id)
-                    except Exception as e:
-                        print(f"⚠️ Could not save synthesis: {e}")
-                    
-                    yield {"event": "done", "data": json.dumps({
-                        "status": "success",
-                        "papers_used": papers_saved,
-                        "word_count": len(full_content.split())
-                    })}
-                    
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    yield {"event": "error", "data": json.dumps({"message": str(e)})}
-            
-            return EventSourceResponse(run_intelligent_synthesis())
-        
-        # Paper/Literature search - route directly to sources service
-        if is_paper_search_request(request.message):
-            try:
-                await events.connect()
-                await events.log(job_id, "📚 Searching academic papers...", "info", session_id=request.session_id)
-                
-                from services.sources_service import sources_service
-                import re
-                
-                # Extract search query from message
-                query = request.message
-                for phrase in ["search for papers on", "search papers on", "find papers on",
-                               "search for papers about", "search papers about", "find papers about",
-                               "search for articles on", "find articles on", "search literature on",
-                               "find research on", "look for papers on", "search academic",
-                               "search for sources on", "find sources on"]:
-                    query = re.sub(phrase, "", query, flags=re.IGNORECASE)
-                query = query.strip()
-                
-                if not query or len(query) < 3:
-                    query = request.message  # Use full message if extraction failed
-                
-                # Search and auto-save
-                result = await sources_service.search_and_save(
-                    workspace_id=request.workspace_id,
-                    query=query,
-                    max_results=5,
-                    auto_save=True
-                )
-                
-                # Format response
-                response_parts = [f"📚 **Found {result['total_results']} papers for:** {query}\n"]
-                
-                for i, paper in enumerate(result['results'][:5], 1):
-                    authors = paper.get('authors', [])
-                    if authors:
-                        author_str = authors[0] if isinstance(authors[0], str) else authors[0].get('name', 'Unknown')
-                        if len(authors) > 1:
-                            author_str += " et al."
-                    else:
-                        author_str = "Unknown"
-                    
-                    response_parts.append(f"**{i}. {paper.get('title', 'Untitled')}**")
-                    response_parts.append(f"   - *{author_str}* ({paper.get('year', 'N/A')})")
-                    if paper.get('venue'):
-                        response_parts.append(f"   - Venue: {paper.get('venue')}")
-                    if paper.get('citation_count', 0) > 0:
-                        response_parts.append(f"   - Citations: {paper.get('citation_count')}")
-                    response_parts.append("")
-                
-                if result['saved_count'] > 0:
-                    response_parts.append(f"✅ **Saved {result['saved_count']} papers** to `sources/` folder")
-                    response_parts.append("Access via GraphQL at `/graphql` or REST at `/api/workspace/{id}/sources`")
-                
-                response_text = "\n".join(response_parts)
-                
-                # Stream response
-                await events.publish(job_id, "response_chunk", {
-                    "chunk": response_text,
-                    "accumulated": response_text
-                }, session_id=request.session_id)
-                
-                await events.publish(job_id, "stage_completed", {
-                    "stage": "search",
-                    "metadata": {"type": "paper_search", "saved": result['saved_count']}
-                }, session_id=request.session_id)
-                
-                return {
-                    "response": response_text,
-                    "reasoning": "",
-                    "plan": [],
-                    "search_results": result,
-                    "job_id": job_id
-                }
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return {
-                    "response": f"❌ Paper search error: {str(e)}",
-                    "reasoning": "",
-                    "plan": [],
-                    "job_id": job_id
-                }
-        
-        # PDF action (summarize, read, analyze) - direct PDF processing
-        is_pdf_action, pdf_action_type, pdf_name = is_pdf_action_request(request.message)
-        if is_pdf_action:
-            try:
-                await events.connect()
-                await events.log(job_id, f"📄 Processing PDF ({pdf_action_type})...", "info", session_id=request.session_id)
-                
-                from services.pdf_service import get_pdf_service
-                from services.deepseek_direct import deepseek_direct
-                import glob
-                
-                pdf_service = get_pdf_service()
-                workspace_path = WORKSPACES_DIR / request.workspace_id
-                
-                # Find the PDF file
-                pdf_path = None
-                if pdf_name:
-                    # Search for the specific PDF
-                    for pfile in workspace_path.rglob("*.pdf"):
-                        if pdf_name.lower() in pfile.name.lower():
-                            pdf_path = pfile
-                            break
-                
-                if not pdf_path:
-                    # Try to find any PDF in workspace (most recent)
-                    pdf_files = list(workspace_path.rglob("*.pdf"))
-                    if pdf_files:
-                        # Sort by modification time, newest first
-                        pdf_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-                        pdf_path = pdf_files[0]
-                
-                if not pdf_path or not pdf_path.exists():
-                    return {
-                        "response": "❌ No PDF file found in workspace. Please upload a PDF first.",
-                        "reasoning": "",
-                        "plan": [],
-                        "job_id": job_id
-                    }
-                
-                await events.log(job_id, f"📄 Reading: {pdf_path.name}", "info", session_id=request.session_id)
-                
-                # Extract text from PDF
-                text = pdf_service.extract_text_simple(pdf_path)
-                
-                if not text or len(text) < 50:
-                    return {
-                        "response": f"❌ Could not extract text from {pdf_path.name}. The PDF may be image-based or encrypted.",
-                        "reasoning": "",
-                        "plan": [],
-                        "job_id": job_id
-                    }
-                
-                # Truncate if too long
-                max_chars = 15000
-                if len(text) > max_chars:
-                    text = text[:max_chars] + f"\n\n[... Truncated. Full document is {len(text)} characters ...]"
-                
-                # Create prompt based on action type
-                if pdf_action_type == "summarize":
-                    prompt = f"""Please provide a comprehensive summary of the following document. Include:
-1. Main topic and purpose
-2. Key findings or arguments
-3. Important conclusions
-
-Document content:
----
-{text}
----
-
-Please provide a clear, well-structured summary."""
-
-                elif pdf_action_type == "extract":
-                    prompt = f"""Extract the key points from the following document. Format as a bulleted list of the most important information:
-
-Document content:
----
-{text}
----
-
-Key Points:"""
-
-                elif pdf_action_type == "analyze":
-                    prompt = f"""Provide an analysis of the following document, including:
-1. Main themes and topics
-2. Methodology (if applicable)
-3. Strengths and limitations
-4. Key insights
-
-Document content:
----
-{text}
----
-
-Analysis:"""
-
-                else:  # read
-                    prompt = f"""Based on the following document, provide a helpful overview:
-
-Document content:
----
-{text}
----
-
-Overview:"""
-                
-                # Generate response using LLM
-                response_text = f"📄 **{pdf_action_type.capitalize()}:** {pdf_path.name}\n\n"
-                
-                async for chunk in deepseek_direct.generate_stream(
-                    prompt=prompt,
-                    system_prompt="You are an expert document analyst. Provide clear, well-structured responses. Use markdown formatting."
-                ):
-                    response_text += chunk
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": chunk,
-                        "accumulated": response_text
-                    }, session_id=request.session_id)
-                
-                await events.publish(job_id, "stage_completed", {
-                    "stage": "response",
-                    "metadata": {"type": "pdf_action", "action": pdf_action_type, "file": pdf_path.name}
-                }, session_id=request.session_id)
-                
-                return {
-                    "response": response_text,
-                    "reasoning": "",
-                    "plan": [],
-                    "job_id": job_id
-                }
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return {
-                    "response": f"❌ PDF processing error: {str(e)}",
-                    "reasoning": "",
-                    "plan": [],
-                    "job_id": job_id
-                }
-        
-        # Simple questions - direct AI response, no planning
-        if is_simple_question(request.message):
-            try:
-                await events.connect()
-                await events.log(job_id, "💬 Responding to simple question...", "info", session_id=request.session_id)
-                
-                # Use DeepSeek for direct response
-                from services.deepseek_direct import deepseek_direct
-                
-                response_text = ""
-                async for chunk in deepseek_direct.generate_stream(
-                    prompt=request.message,
-                    system_prompt="You are a helpful AI assistant. Provide clear, concise, and accurate responses. For math equations, use LaTeX notation with $ for inline and $$ for block equations."
-                ):
-                    response_text += chunk
-                    # Stream response chunks
-                    await events.publish(job_id, "response_chunk", {
-                        "chunk": chunk,
-                        "accumulated": response_text
-                    }, session_id=request.session_id)
-                
-                await events.publish(job_id, "stage_completed", {
-                    "stage": "response",
-                    "metadata": {"type": "simple_question"}
-                }, session_id=request.session_id)
-                
-                return {
-                    "response": response_text,
-                    "reasoning": "",  # Empty - no planning visible
-                    "plan": [],
-                    "tool_results": {},
-                    "job_id": job_id
-                }
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"⚠️ Simple question direct response failed: {e}, falling through to planner")
-                # Fall through to task classifier if direct response fails
-        
-        # Use intelligent task classifier
-        from services.task_classifier import task_classifier
-        task_info = task_classifier.classify(request.message)
-        
-        # For complex tasks, use the INTELLIGENT ORCHESTRATOR (live streaming)
-        if task_info["strategy"] == "worker":
-            print(f"🧠 Complex task detected, using Intelligent Orchestrator")
-            
-            async def run_orchestrator():
-                """Stream intelligent agent actions to frontend."""
-                from services.intelligent_orchestrator import intelligent_orchestrator
-                
-                try:
-                    yield {"event": "job_id", "data": json.dumps({"job_id": job_id})}
-                    async for event in intelligent_orchestrator.run(
-                        task=request.message,
-                        workspace_id=request.workspace_id,
-                        session_id=request.session_id,
-                        job_id=job_id
-                    ):
-                        yield event
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    yield {"event": "error", "data": json.dumps({"message": str(e)})}
-            
-            return EventSourceResponse(run_orchestrator())
-        
-        # Handle mentioned agents - queue jobs to appropriate workers
-        if request.mentioned_agents and len(request.mentioned_agents) > 0:
-            try:
-                await events.connect()
-                
-                # Map agent names to worker queues
-                agent_to_queue = {
-                    "objective": "objectives",
-                    "objectives": "objectives",
-                    "planner": "objectives",  # Planner can use objectives worker
-                    "writer": "content",
-                    "content": "content",
-                    "editor": "content",  # Editor uses content worker
-                    "research": "search",
-                    "search": "search",
-                    "citation": "search",  # Citation uses search worker
-                }
-                
-                # Queue jobs to workers based on mentioned agents
-                from core.queue import JobQueue
-                queued_jobs = []
-                
-                for agent_name in request.mentioned_agents:
-                    agent_lower = agent_name.lower().replace("_", "").replace("-", "")
-                    queue_name = agent_to_queue.get(agent_lower)
-                    
-                    if queue_name:
-                        try:
-                            # Prepare job data based on agent type
-                            job_data = {
-                                "job_id": job_id,
-                                "message": request.message,
-                                "workspace_id": request.workspace_id,
-                                "session_id": request.session_id,
-                                "user_id": request.user_id,
-                                "mentioned_agent": agent_name,
-                            }
-                            
-                            # Add agent-specific data
-                            if queue_name == "objectives":
-                                job_data.update({
-                                    "thesis_id": request.workspace_id,
-                                    "topic": request.message,
-                                    "mode": "voting"
-                                })
-                            elif queue_name == "content":
-                                job_data.update({
-                                    "thesis_id": request.workspace_id,
-                                    "type": "chapter",
-                                    "section_title": "Content"
-                                })
-                            elif queue_name == "search":
-                                job_data.update({
-                                    "thesis_id": request.workspace_id,
-                                    "query": request.message,
-                                    "type": "papers",
-                                    "max_results": 20
-                                })
-                            
-                            # Queue the job
-                            queued_job_id = await JobQueue.push(
-                                queue_name=queue_name,
-                                data=job_data,
-                                job_id=f"{job_id}-{agent_name}",
-                                priority="high"  # High priority for mentioned agents
-                            )
-                            
-                            queued_jobs.append({"agent": agent_name, "queue": queue_name, "job_id": queued_job_id})
-                            print(f"📤 Queued job for @{agent_name} to {queue_name} worker", flush=True)
-                            
-                        except Exception as queue_error:
-                            print(f"⚠️ Failed to queue job for {agent_name}: {queue_error}", flush=True)
-                            import traceback
-                            traceback.print_exc()
-                
-                if queued_jobs:
-                    await events.publish(job_id, "agents_mentioned", {
-                        "agents": request.mentioned_agents,
-                        "queued_jobs": queued_jobs,
-                        "message": f"Queued {len(queued_jobs)} jobs to workers"
-                    })
-                    print(f"✅ Queued {len(queued_jobs)} jobs to workers for mentioned agents", flush=True)
-                
-            except Exception as e:
-                print(f"⚠️ Error handling mentioned agents: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                pass
-        
-        # Emit initial event immediately - ensure connection first
-        try:
-            await events.connect()  # Ensure Redis connection is established
-            # Don't log generic "starting" messages - let real content stream through
-            # await events.log(job_id, "🚀 Starting request processing...", "info")
-            # await events.publish(job_id, "stage_started", {"stage": "planning", "message": "Generating plan..."})
-        except Exception as event_error:
-            print(f"⚠️ Failed to emit initial event: {event_error}", flush=True)
-            import traceback
-            traceback.print_exc()
-            pass  # Don't fail if events fail
-        
-        # Generate plan for other requests
-        try:
-            # Check RAG for similar solutions
-            from services.rag_system import rag_system
-            similar_solutions = await rag_system.retrieve_similar(
-                query=request.message,
-                category="solutions",
-                top_k=2
-            )
-            
-            # Emit planning event
-            try:
-                await events.log(job_id, "💭 Generating plan...", "info")
-            except:
-                pass
-            
-            # Add timeout to prevent hanging
-            import asyncio
-            
-            # Create streaming callback for reasoning
-            reasoning_chunks = []
-            async def stream_reasoning_chunk(chunk: str):
-                """Stream reasoning chunks to frontend"""
-                reasoning_chunks.append(chunk)
-                try:
-                    await events.publish(job_id, "reasoning_chunk", {
-                        "chunk": chunk,
-                        "accumulated": "".join(reasoning_chunks)
-                    })
-                except:
-                    pass
-            
-            # Emit immediate planning status
-            try:
-                await events.log(job_id, "🔍 Analyzing your request and creating a plan...", "info")
-                await events.publish(job_id, "stage_started", {
-                    "stage": "planning",
-                    "message": "Analyzing request..."
-                })
-            except:
-                pass
-            
-            # Generate plan with streaming support
-            plan_data = await asyncio.wait_for(
-            planner_service.generate_plan(
-                user_request=request.message,
-                session_id=request.session_id,
-                workspace_id=request.workspace_id,
-                user_id=request.user_id,
-                job_id=job_id,
-                stream=True,
-                stream_callback=stream_reasoning_chunk,
-                mentioned_agents=request.mentioned_agents or []
-            ),
-                timeout=60.0  # 60 second timeout for planning
-            )
-            
-            # Don't log generic "plan generated" - let real content stream
-            # Plan completion is handled by the actual content streaming
-            # Ensure plan_data is a dict with required keys
-            if not isinstance(plan_data, dict):
-                plan_data = {"reasoning": "", "plan": []}
-            if "reasoning" not in plan_data:
-                plan_data["reasoning"] = ""
-            if "plan" not in plan_data:
-                plan_data["plan"] = []
-        except asyncio.TimeoutError:
-            print(f"⚠️ Planner timeout after 60 seconds")
-            plan_data = {
-                "reasoning": "Planning took too long. The request may be too complex. Please try breaking it into smaller steps.",
-                "plan": []
-            }
-        except Exception as plan_error:
-            import traceback
-            traceback.print_exc()
-            print(f"Planner error: {plan_error}")
-            # Return a safe response instead of crashing
-            plan_data = {
-                "reasoning": f"Error generating plan: {str(plan_error)[:200]}",
-                "plan": []
-            }
-        
-        reasoning = plan_data.get("reasoning", "")
-        plan = plan_data.get("plan", [])
-        
-        # Execute plan steps
-        response_parts = []
-        recent_actions = []
-        
-        tool_results = {}  # Store tool results by tool name for response
-        essay_content = None
-        essay_file_path = None
-        
-        # First pass: Execute all tools except save_file
-        for step_idx, step in enumerate(plan):
-            tool_name = step.get("tool")
-            if not tool_name or tool_name == "save_file" or tool_name == "write_file":
-                continue
-            
-            # Emit tool execution event
-            arguments = step.get("arguments", {})
-            try:
-                # Show BEFORE starting, not after
-                if tool_name == "web_search":
-                    query = arguments.get("query", "")
-                    await events.log(job_id, f"🌐 Searching the web for: {query[:60]}...", "info")
-                    
-                    # Open Internet Search Agent tab
-                    from core.agent_stream_factory import get_agent_stream_handler
-                    search_handler = get_agent_stream_handler("internet_search", job_id, request.workspace_id)
-                    await events.connect()
-                    await events.publish(job_id, "agent_stream", {
-                        "agent": "internet_search",
-                        "tab_id": search_handler.tab_id,
-                        "chunk": "",
-                        "content": f"🌐 **Internet Search Agent**\n\n_Searching for: {query}_\n\n",
-                        "type": "search",
-                        "completed": False,
-                        "workspace_id": request.workspace_id,
-                        "metadata": {
-                            "status": "running",
-                            "action": "searching",
-                            "query": query
-                        }
-                    })
-                else:
-                    await events.log(job_id, f"🔧 Executing {tool_name} (step {step_idx + 1}/{len(plan)})...", "info")
-                    
-                await events.publish(job_id, "tool_started", {
-                    "tool": tool_name,
-                    "step": step_idx + 1,
-                    "total": len(plan),
-                    "description": step.get("description", "")
-                })
-            except:
-                pass
-            
-            try:
-                result = await execute_tool(tool_name, arguments, request.workspace_id)
-                
-                # Emit tool completion event
-                try:
-                    status = result.get("status", "unknown")
-                    # Don't log generic "tool completed" - let real content stream
-                    # await events.log(job_id, f"✓ {tool_name} completed ({status})", "info" if status == "success" else "warning")
-                    await events.publish(job_id, "tool_completed", {
-                        "tool": tool_name,
-                        "step": step_idx + 1,
-                        "status": status
-                    })
-                except:
-                    pass
-                
-                if result.get("status") == "success":
-                    recent_actions.append(f"{tool_name}: {step.get('description', '')}")
-                    response_parts.append(f"✓ {step.get('description', tool_name)} completed.")
-                    
-                    # Store tool result by tool name for inclusion in response
-                    if tool_name == "web_search" and result.get("results"):
-                        tool_results[tool_name] = result.get("results", [])
-                    elif tool_name == "image_search" and result.get("images"):
-                        tool_results[tool_name] = result.get("images", [])
-                    elif tool_name == "image_generate" and result.get("image_url"):
-                        if "image_generate" not in tool_results:
-                            tool_results["image_generate"] = []
-                        tool_results["image_generate"].append({
-                            "url": result.get("image_url"),
-                            "prompt": arguments.get("prompt", "")
-                        })
-            except Exception as tool_error:
-                print(f"Tool execution error for {tool_name}: {tool_error}")
-                response_parts.append(f"⚠ {step.get('description', tool_name)} failed: {str(tool_error)}")
-        
-        # Generate essay content ONLY if user ACTUALLY asked for an essay
-        # Don't generate essays for image-only or search-only requests!
-        import re
-        user_wants_essay = bool(re.search(
-            r"(write|create|generate|make)\s+(an?\s+)?(essay|document|report|paper|article|content)",
-            request.message.lower()
-        ))
-        
-        # Skip essay if user just wanted an image or search results
-        user_wants_image_only = bool(re.search(
-            r"(generat|creat|mak|draw)(e|ing)\s+.*?(image|picture|photo)",
-            request.message.lower()
-        )) and not user_wants_essay
-        
-        user_wants_search_only = (
-            ("search" in request.message.lower() or "find" in request.message.lower()) and 
-            "results" in request.message.lower() and
-            not user_wants_essay
+        await chat_history_service.save_message(
+            session_id=request.session_id,
+            user_id=request.user_id,
+            message=request.message,
+            response=final_response,
+            metadata=metadata
         )
         
-        if tool_results and user_wants_essay and any(key in tool_results for key in ["web_search", "image_search", "image_generate"]):
-            try:
-                from services.deepseek_direct import deepseek_direct
-                
-                # Build context from tool results
-                context_parts = []
-                
-                if "web_search" in tool_results and tool_results["web_search"]:
-                    context_parts.append("## Research Findings:\n")
-                    for result in tool_results["web_search"][:3]:  # Use top 3
-                        if isinstance(result, dict):
-                            title = result.get('title', '')
-                            content = result.get('content', '') or result.get('snippet', '') or ''
-                            if title or content:
-                                context_parts.append(f"- {title}: {content[:200]}")
-                
-                # Build image markdown
-                image_markdown = []
-                if "image_search" in tool_results and tool_results["image_search"]:
-                    for img in tool_results["image_search"][:1]:  # First searched image
-                        if isinstance(img, dict):
-                            img_url = img.get("url") or img.get("full") or img.get("image_url")
-                            if img_url:
-                                image_markdown.append(f"![Searched Image: {img.get('title', 'Uganda')}]({img_url})")
-                
-                if "image_generate" in tool_results and tool_results["image_generate"]:
-                    for img in tool_results["image_generate"][:1]:  # First generated image
-                        if isinstance(img, dict):
-                            img_url = img.get("url") or img.get("image_url")
-                            if img_url:
-                                image_markdown.append(f"![Generated Image: {img.get('prompt', 'Uganda')}]({img_url})")
-                
-                context = "\n".join(context_parts) if context_parts else ""
-                
-                # Extract topic from user message (e.g., "write essay on computers" -> "computers")
-                import re
-                topic = request.message.lower().strip()
-                # Try to extract topic after common phrases
-                patterns = [
-                    r"write\s+(?:an\s+)?essay\s+(?:on|about)\s+(.+)",
-                    r"essay\s+(?:on|about)\s+(.+)",
-                    r"write\s+(?:an\s+)?essay\s+(.+)",
-                ]
-                extracted = None
-                for pattern in patterns:
-                    match = re.search(pattern, topic)
-                    if match:
-                        extracted = match.group(1).strip()
-                        break
-                
-                if extracted and len(extracted) > 2:
-                    topic = extracted
-                else:
-                    # Fallback: remove common words and use the rest
-                    words = topic.split()
-                    filtered = [w for w in words if w not in ["write", "an", "essay", "on", "about", "the", "a"]]
-                    topic = " ".join(filtered) if filtered else "the requested topic"
-                
-                # Generate essay
-                image_text = "\n".join(image_markdown) if image_markdown else ""
-                essay_prompt = f"""Write a comprehensive, well-structured essay about {topic}.
-
-{context if context else f"Write about {topic} covering key aspects, current state, and important information."}
-
-Requirements:
-- Well-structured with introduction, body paragraphs, and conclusion
-- Include relevant information from the research findings
-- Professional academic tone
-- Approximately 800-1200 words
-- Include the following images in appropriate places:
-{image_text if image_text else ""}
-
-Write the complete essay now:"""
-                
-                try:
-                    # Stream essay generation - OPEN WRITER AGENT TAB
-                    essay_chunks = []
-                    
-                    # Open Writer Agent tab BEFORE generating content
-                    from core.agent_stream_factory import get_agent_stream_handler
-                    writer_handler = get_agent_stream_handler("writer", job_id, request.workspace_id)
-                    
-                    await events.connect()
-                    # Open Writer tab immediately with distinct tab_id
-                    await events.publish(job_id, "agent_stream", {
-                        "agent": "writer",
-                        "tab_id": writer_handler.tab_id,
-                        "chunk": "",
-                        "content": "✍️ **Writer Agent**\n\n_Generating essay content..._\n\n",
-                        "type": "content",
-                        "completed": False,
-                        "workspace_id": request.workspace_id,
-                        "metadata": {
-                            "status": "running",
-                            "action": "writing"
-                        }
-                    })
-                    
-                    async def stream_essay_chunk(chunk: str):
-                        """Stream essay chunks to frontend AND Writer tab"""
-                        essay_chunks.append(chunk)
-                        accumulated = "".join(essay_chunks)
-                        try:
-                            await events.connect()
-                            # Standard response_chunk for workspace
-                            await events.publish(job_id, "response_chunk", {
-                                "chunk": chunk,
-                                "accumulated": accumulated
-                            })
-                            # Also stream to Writer agent tab
-                            await writer_handler.stream_chunk(chunk, {
-                                "word_count": len(accumulated.split()),
-                                "status": "writing"
-                            })
-                        except Exception as e:
-                            print(f"⚠️ Failed to stream essay chunk: {e}", flush=True)
-                    
-                    essay_content = await asyncio.wait_for(
-                        deepseek_direct.generate_content(
-                            prompt=essay_prompt,
-                            system_prompt="You are an expert academic writer. Write comprehensive, well-researched essays with proper formatting.",
-                            temperature=0.7,
-                            max_tokens=3000,
-                            use_reasoning=False,
-                            stream=True,
-                            stream_callback=stream_essay_chunk
-                        ),
-                        timeout=120.0
-                    )
-                    
-                    if not essay_content or len(essay_content.strip()) < 100:
-                        raise Exception("Generated essay content is too short or empty")
-                    
-                    # Insert images into essay if not already included
-                    if image_markdown and len(image_markdown) > 0:
-                        # Check if images are already in content
-                        images_in_content = any(img_md in essay_content for img_md in image_markdown)
-                        if not images_in_content:
-                            # Insert first image after first paragraph
-                            paragraphs = essay_content.split("\n\n")
-                            if len(paragraphs) > 1:
-                                paragraphs.insert(1, "\n".join(image_markdown))
-                                essay_content = "\n\n".join(paragraphs)
-                            else:
-                                essay_content = essay_content + "\n\n" + "\n".join(image_markdown)
-                    
-                    response_parts.append("✓ Essay content generated successfully.")
-                    
-                    # Publish final essay content as response_chunk to ensure frontend gets it
-                    try:
-                        await events.connect()
-                        await events.publish(job_id, "response_chunk", {
-                            "chunk": "",  # Empty chunk to signal completion
-                            "accumulated": essay_content,
-                            "completed": True
-                        })
-                    except Exception as e:
-                        print(f"⚠️ Failed to publish final essay: {e}", flush=True)
-                    
-                    # Emit content generation completed
-                    try:
-                        await events.log(job_id, f"✅ Essay generated ({len(essay_content)} characters)", "info")
-                        await events.publish(job_id, "stage_completed", {
-                            "stage": "content_generation",
-                            "metadata": {"length": len(essay_content)}
-                        })
-                    except:
-                        pass
-                except asyncio.TimeoutError:
-                    print("⚠️ Essay generation timed out")
-                    essay_content = f"# Essay About Uganda\n\n[Essay generation timed out. Please try again.]"
-                    try:
-                        await events.log(job_id, "⚠️ Essay generation timed out", "warning")
-                    except:
-                        pass
-                except Exception as gen_error:
-                    print(f"⚠️ Essay generation error: {gen_error}")
-                    import traceback
-                    traceback.print_exc()
-                    essay_content = f"# Essay About Uganda\n\n[Error generating essay: {str(gen_error)[:200]}]"
-                    try:
-                        await events.log(job_id, f"❌ Essay generation error: {str(gen_error)[:100]}", "error")
-                    except:
-                        pass
-                
-                # Detect and replace image placeholders
-                import re
-                image_placeholder_pattern = r'\[Image:([^\]]+)\]'
-                placeholders = re.findall(image_placeholder_pattern, essay_content)
-                
-                if placeholders and len(placeholders) > 0:
-                    try:
-                        await events.log(job_id, f"🖼️ Detected {len(placeholders)} image placeholders, generating images...", "info")
-                        
-                        # Generate images for placeholders
-                        for i, placeholder_desc in enumerate(placeholders[:3]):  # Limit to 3 images
-                            try:
-                                await events.log(job_id, f"🎨 Generating image {i+1}/{min(len(placeholders), 3)}: {placeholder_desc[:50]}...", "info")
-                                
-                                # Generate image
-                                result = await execute_tool("image_generate", {
-                                    "prompt": placeholder_desc.strip(),
-                                    "size": "1024x1024"
-                                }, request.workspace_id)
-                                
-                                if result.get("status") == "success" and result.get("image_url"):
-                                    image_url = result["image_url"]
-                                    # Replace first occurrence of this placeholder
-                                    placeholder_full = f"[Image:{placeholder_desc}]"
-                                    image_markdown = f"![Generated: {placeholder_desc.strip()}]({image_url})"
-                                    essay_content = essay_content.replace(placeholder_full, image_markdown, 1)
-                                    
-                                    await events.log(job_id, f"✅ Image {i+1} generated successfully", "info")
-                                else:
-                                    await events.log(job_id, f"⚠️ Failed to generate image {i+1}", "warning")
-                            except Exception as img_error:
-                                print(f"Image generation error for placeholder '{placeholder_desc}': {img_error}")
-                                await events.log(job_id, f"⚠️ Image generation failed: {str(img_error)[:50]}", "warning")
-                        
-                        # Publish updated essay with images
-                        try:
-                            await events.publish(job_id, "response_chunk", {
-                                "chunk": "",
-                                "accumulated": essay_content,
-                                "completed": True,
-                                "images_added": True
-                            })
-                        except:
-                            pass
-                            
-                    except Exception as e:
-                        print(f"Error processing image placeholders: {e}")
-                
-            except Exception as e:
-                print(f"Essay generation setup error: {e}")
-                import traceback
-                traceback.print_exc()
-                essay_content = f"# Essay About Uganda\n\n[Error: {str(e)[:200]}]"
+    except Exception as e:
+        print(f"⚠️ Background Workflow Failed for {job_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Notify user of error via SSE
+        await events.publish(job_id, "error", {"message": f"An error occurred: {str(e)}"}, session_id=request.session_id)
         
-        # Second pass: Save file if we have content
-        if essay_content:
-            for step in plan:
-                tool_name = step.get("tool")
-                if tool_name in ["save_file", "write_file"]:
-                    arguments = step.get("arguments", {})
-                    file_path = arguments.get("path", "uganda_essay_with_images.md")
-                    
-                    # Update arguments with actual content
-                    arguments["content"] = essay_content
-                    arguments["path"] = file_path
-                    
-                    try:
-                        # Emit file saving event
-                        try:
-                            await events.log(job_id, f"💾 Saving file: {file_path}...", "info")
-                        except:
-                            pass
-                        
-                        result = await execute_tool(tool_name, arguments, request.workspace_id)
-                        if result.get("status") == "success":
-                            essay_file_path = file_path
-                            response_parts.append(f"✓ Essay saved to {file_path}")
-                            recent_actions.append(f"{tool_name}: Saved essay to {file_path}")
-                            
-                            # Emit file created event for real-time updates
-                            try:
-                                await events.file_created(job_id, file_path, "markdown")
-                                await events.log(job_id, f"✅ File saved: {file_path}", "info")
-                                await events.publish(job_id, "stage_completed", {
-                                    "stage": "file_saving",
-                                    "metadata": {"file_path": file_path}
-                                })
-                            except:
-                                pass  # Don't fail if events fail
-                        else:
-                            response_parts.append(f"⚠ Failed to save file: {result.get('error', 'Unknown error')}")
-                    except Exception as tool_error:
-                        print(f"Save file error: {tool_error}")
-                        import traceback
-                        traceback.print_exc()
-                        response_parts.append(f"⚠ Failed to save file: {str(tool_error)}")
-                    break  # Only save once
-        elif not tool_results:
-            # No tools executed, no content to save
-            response_parts.append("⚠ No tools were executed, so no content was generated.")
-        
-        # Generate response text - include essay content if available
-        if essay_content:
-            # Use essay content as the main response
-            response_text = essay_content
-            # Add a brief summary at the end if file was saved
-            if essay_file_path:
-                response_text += f"\n\n✅ Essay saved to {essay_file_path}"
-        else:
-            response_text = "\n".join(response_parts) if response_parts else "I've processed your request."
-        
-        # Include tool results in response for frontend to display (limit size to avoid huge responses)
-        # tool_results is now a dict with tool_name as key
         try:
-            for tool_name, result_data in list(tool_results.items())[:3]:  # Limit to 3 tool types
-                if tool_name == "web_search" and result_data:
-                    # Limit results to avoid huge base64 strings
-                    limited_results = result_data[:3] if isinstance(result_data, list) else result_data
-                    # Encode search results for frontend
-                    search_data = {
-                        "type": "web_search",
-                        "query": "Search Results",
-                        "results": limited_results
-                    }
-                    try:
-                        search_json = json.dumps(search_data)
-                        if len(search_json) > 10000:  # Limit JSON size
-                            search_data["results"] = limited_results[:2] if isinstance(limited_results, list) else limited_results
-                            search_json = json.dumps(search_data)
-                        search_b64 = base64.b64encode(search_json.encode()).decode()
-                        response_text += f"\n\n<!-- SEARCH_RESULTS_JSON_B64: {search_b64} -->"
-                    except Exception as e:
-                        print(f"Warning: Failed to encode search results: {e}")
-                
-                elif tool_name == "image_search" and result_data:
-                    # Limit images to avoid huge base64 strings
-                    limited_images = result_data[:2] if isinstance(result_data, list) else result_data
-                    # Encode image search results for frontend
-                    image_data = {
-                        "type": "image_search",
-                        "query": "Image Search Results",
-                        "results": limited_images
-                    }
-                    try:
-                        image_json = json.dumps(image_data)
-                        if len(image_json) > 10000:  # Limit JSON size
-                            image_data["results"] = limited_images[:1] if isinstance(limited_images, list) else limited_images
-                            image_json = json.dumps(image_data)
-                        image_b64 = base64.b64encode(image_json.encode()).decode()
-                        response_text += f"\n\n<!-- IMAGE_SEARCH_JSON_B64: {image_b64} -->"
-                    except Exception as e:
-                        print(f"Warning: Failed to encode image results: {e}")
-        except Exception as e:
-            print(f"Warning: Failed to encode tool results: {e}")
-        
-        # Save to chat history (non-blocking, don't wait)
-        try:
-            # Don't wait for chat history save - it can be slow
-            asyncio.create_task(chat_history_service.save_message(
+            # Fallback save if possible
+            resp = locals().get('final_response', f"Error in research: {str(e)}")
+            await chat_history_service.save_message(
                 session_id=request.session_id,
                 user_id=request.user_id,
                 message=request.message,
-                response=response_text[:1000],  # Truncate to avoid large responses
-                metadata={
-                    "reasoning": reasoning[:500] if reasoning else "",
-                    "plan": plan,
-                    "recent_actions": recent_actions,
-                    "workspace_id": request.workspace_id,
-                    "tool_results": {}  # Don't store full tool results in history
-                }
-            ))
-        except Exception as e:
-            print(f"Warning: Failed to save chat history: {e}")
-        
-        # Limit tool_results size to avoid huge responses
-        limited_tool_results = {}
-        for tool_name, result_data in tool_results.items():
-            if tool_name == "web_search" and result_data:
-                # Limit to first 3 results
-                limited_tool_results[tool_name] = result_data[:3] if isinstance(result_data, list) else result_data
-            elif tool_name == "image_search" and result_data:
-                # Limit to first 2 images
-                limited_tool_results[tool_name] = result_data[:2] if isinstance(result_data, list) else result_data
-            elif tool_name == "image_generate" and result_data:
-                # Limit to first 1 generated image
-                limited_tool_results[tool_name] = result_data[:1] if isinstance(result_data, list) else result_data
-        
-        # Ensure essay content is in response
-        final_response = response_text
-        if essay_content and len(essay_content) > 100:
-            # Use essay content as the main response
-            final_response = essay_content
-            if essay_file_path:
-                final_response += f"\n\n✅ Essay saved to {essay_file_path}"
-            
-            # Publish final essay as response_chunk if not already published
-            try:
-                await events.connect()
-                await events.publish(job_id, "response_chunk", {
-                    "chunk": "",
-                    "accumulated": final_response,
-                    "completed": True
-                })
-            except Exception as e:
-                print(f"⚠️ Failed to publish final response: {e}", flush=True)
-        elif not final_response or len(final_response.strip()) < 50:
-            # Fallback if no good response
-            final_response = response_text if response_text else "I've processed your request."
-        
-        response_data = {
-            "response": final_response[:10000],  # Increased limit for essays
-            "reasoning": reasoning[:1000] if reasoning else "",
-            "plan": plan,
-            "tool_results": limited_tool_results  # Include limited tool results
-        }
-        
-        # If essay was created, include file path for auto-opening
-        if essay_file_path:
-            response_data["file_created"] = {
-                "path": essay_file_path,
-                "workspace_id": request.workspace_id
-            }
-        
-        # Include job_id for frontend to subscribe to events
-        response_data["job_id"] = job_id
-        
-        # Emit completion event
-        try:
-            await events.log(job_id, "✅ Request processing completed!", "info")
-            await events.publish(job_id, "stage_completed", {
-                "stage": "complete",
-                "metadata": {"file_path": essay_file_path or "none"}
-            })
-        except:
-            pass
-        
-        print(f"✅ Returning response (file: {essay_file_path or 'none'}, response_len: {len(response_text)}, job_id: {job_id})")
-        
-        # Ensure response is serializable
-        try:
-            json.dumps(response_data)  # Test serialization
-            print("✅ Response is serializable")
-        except Exception as ser_error:
-            print(f"⚠️ Response serialization error: {ser_error}")
-            # Remove problematic data
-            response_data["tool_results"] = {}
-            response_data["response"] = response_text[:1000]
-            response_data["plan"] = []
-        
-        print(f"✅ About to return response_data")
-        return response_data
-        
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        print(f"❌ Chat endpoint error: {e}")
-        print(f"Traceback: {error_trace}")
-        
-        # Always return a response, never raise
-        try:
-            # Try self-healing (but don't wait for it)
-            try:
-                from services.self_healing import self_healing_system
-                from services.rag_system import rag_system
-                
-                # Store error in RAG (async, but don't wait)
-                asyncio.create_task(rag_system.store_solution(
-                    problem=f"Chat endpoint error: {str(e)}",
-                    solution="",
-                    context={"traceback": error_trace[:500]},
-                    category="errors"
-                ))
-            except:
-                pass  # Don't fail on self-healing errors
-        except:
-            pass
-        
-        # Emit error event (job_id already exists from function start)
-        try:
-            await events.log(job_id, f"❌ Error: {str(e)[:200]}", "error")
-        except:
-            pass
-        
-        # Return error response with job_id so frontend can connect to stream
-        error_response = {
-            "response": f"I apologize, but I encountered an error processing your request: {str(e)[:200]}. Please try again or rephrase your message.",
-            "reasoning": f"Error: {str(e)[:200]}",
-            "plan": [],
-            "tool_results": {},
-            "job_id": job_id  # Always include job_id so frontend can connect
-        }
-        
-        # Include job_id if we have one
-        if 'job_id' in locals():
-            error_response["job_id"] = job_id
-        
-        return error_response
+                response=resp,
+                metadata={"job_id": job_id, "error": True}
+            )
+        except Exception as save_err:
+            print(f"Failed to save error chat history: {save_err}")
 
-# ============================================================================
-# SSE STREAMING ENDPOINT
-# ============================================================================
+        return {"status": "error", "message": str(e), "job_id": job_id}
 
-@app.head("/api/stream/agent-actions")
 async def stream_actions_head(request: Request):
     """HEAD handler for SSE endpoint to prevent 405 errors."""
     origin = request.headers.get("origin", "http://localhost:3000")
@@ -5558,8 +3100,6 @@ async def stream_actions_head(request: Request):
 
 async def event_generator(session_id: str = "default", job_id: Optional[str] = None):
     """Generate SSE events for agent actions and job progress."""
-    import redis.asyncio as redis
-    from core.config import settings
     
     # Send connection event
     yield {
@@ -5574,18 +3114,17 @@ async def event_generator(session_id: str = "default", job_id: Optional[str] = N
     
     # Subscribe to BOTH session and job channels for continuous chat
     pubsub = None
-    redis_client = None
     try:
-        redis_url = settings.REDIS_URL
-        if redis_url.startswith("redis://redis:") and not os.path.exists("/.dockerenv"):
-            redis_url = redis_url.replace("redis://redis:", "redis://localhost:")
-        
-        redis_client = redis.from_url(redis_url, decode_responses=True)
         pubsub = redis_client.pubsub()
         
-        # Subscribe to session channel (receives ALL messages for this session)
+        # Subscriptions
         await pubsub.subscribe(f"session:{session_id}")
-        print(f"📡 Subscribed to session:{session_id} for continuous chat", flush=True)
+        
+        # Derive workspace_id for browser events
+        workspace_id = f"ws_{session_id[:12]}" if session_id not in ["default", "new"] else "default"
+        await pubsub.subscribe(f"browser:{workspace_id}")
+        
+        print(f"📡 Subscribed to session:{session_id} and browser:{workspace_id}", flush=True)
         
         # Also subscribe to job channel if provided
         if job_id:
@@ -5680,7 +3219,7 @@ async def event_generator(session_id: str = "default", job_id: Optional[str] = N
                 print(f"⚠️ Error closing redis client: {e}", flush=True)
 
 @app.get("/api/stream/agent-actions")
-async def stream_actions(request: Request, session_id: str = "default", job_id: Optional[str] = None):
+async def stream_actions(request: Request, session_id: str = "new", job_id: Optional[str] = None):
     """SSE endpoint for streaming agent actions and job progress."""
     origin = request.headers.get("origin", "http://localhost:3000")
     allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -6272,60 +3811,7 @@ async def get_job_status(job_id: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/workspace/{workspace_id}/serve/{file_path:path}")
-async def serve_workspace_file(workspace_id: str, file_path: str):
-    """Serve files from workspace (images, PDFs, etc.) - for browser loading."""
-    try:
-        workspace_dir = Path(__file__).parent.parent.parent / "workspaces" / workspace_id
-        
-        # Security: prevent directory traversal
-        file_path_obj = Path(file_path)
-        if ".." in str(file_path_obj):
-            raise HTTPException(status_code=403, detail="Directory traversal not allowed")
-        
-        # Resolve the full path
-        full_path = (workspace_dir / file_path).resolve()
-        
-        # Verify it's within workspace
-        if not str(full_path).startswith(str(workspace_dir.resolve())):
-            raise HTTPException(status_code=403, detail="File outside workspace")
-        
-        # Check if file exists
-        if not full_path.exists():
-            # Try alternate paths
-            alt_paths = [
-                workspace_dir / "images" / file_path_obj.name,
-                workspace_dir / "figures" / file_path_obj.name,
-                workspace_dir / "static" / file_path,
-                workspace_dir / "assets" / file_path,
-            ]
-            
-            full_path = None
-            for alt_path in alt_paths:
-                if alt_path.exists():
-                    full_path = alt_path
-                    break
-            
-            if not full_path:
-                raise HTTPException(status_code=404, detail="File not found")
-        
-        # Determine media type
-        media_type, _ = mimetypes.guess_type(str(full_path))
-        if not media_type:
-            media_type = "application/octet-stream"
-        
-        return FileResponse(
-            path=full_path,
-            media_type=media_type,
-            filename=full_path.name
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/rag/search")
 async def search_rag(query: str, category: str = "solutions", top_k: int = 5):
@@ -6774,9 +4260,56 @@ async def get_thesis_template(university_type: str):
     
     return templates.get(university_type, {})
 
+@app.get("/api/thesis/workflows")
+async def list_thesis_workflows():
+    """List all available thesis generation workflows"""
+    from pathlib import Path
+    import re
+    
+    workflows = []
+    workflows_dir = Path("/home/gemtech/Desktop/thesis/.agent/workflows")
+    
+    if workflows_dir.exists():
+        for workflow_file in workflows_dir.glob("*.md"):
+            try:
+                content = workflow_file.read_text(encoding='utf-8')
+                
+                # Parse frontmatter
+                frontmatter_match = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
+                if frontmatter_match:
+                    frontmatter = frontmatter_match.group(1)
+                    
+                    # Extract metadata
+                    description_match = re.search(r'description:\s*(.+)', frontmatter)
+                    icon_match = re.search(r'icon:\s*(.+)', frontmatter)
+                    category_match = re.search(r'category:\s*(.+)', frontmatter)
+                    
+                    command = workflow_file.stem  # filename without extension
+                    
+                    workflows.append({
+                        "command": command,
+                        "description": description_match.group(1).strip() if description_match else command,
+                        "icon": icon_match.group(1).strip() if icon_match else "📄",
+                        "category": category_match.group(1).strip() if category_match else "general"
+                    })
+            except Exception as e:
+                print(f"Error parsing workflow {workflow_file}: {e}")
+                continue
+    
+    return {"workflows": workflows}
+
 # ============================================================================
 # THESIS GENERATION ENDPOINTS
 # ============================================================================
+
+from services.parameter_processor import validate_parameters as backend_validate_params, generate_demographic_df
+from services.realistic_data_generator import generate_realistic_responses, generate_qualitative_feedback
+
+@app.post("/api/thesis/validate-parameters")
+async def validate_thesis_parameters_endpoint(request: dict):
+    """Validate thesis generation parameters"""
+    result = backend_validate_params(request.get('parameters', {}))
+    return result
 
 @app.post("/api/thesis/generate")
 async def generate_thesis(request: dict):
@@ -6793,14 +4326,26 @@ async def generate_thesis(request: dict):
     from pathlib import Path
     from datetime import datetime
     
+    parameters = request.get('parameters', {})
+    
     university_type = request.get('university_type', 'generic')
     title = request.get('title', 'Research Thesis')
-    topic = request.get('topic', '')
+    topic = parameters.get('topic') or request.get('topic', '')
     objectives = request.get('objectives', [topic]) if topic else []
     workspace_id = request.get('workspace_id', 'default')
     session_id = request.get('session_id', 'default')
-    raw_case_study = request.get('case_study', '')
+    raw_case_study = parameters.get('caseStudy') or request.get('case_study', '')
     background_style = request.get('background_style', 'inverted_pyramid')
+    
+    # NEW: Extract Sample Size (n) from parameters or topic string
+    sample_size = parameters.get('sample_size') or request.get('sample_size')
+    if not sample_size:
+        import re
+        n_match = re.search(r'\b(n|sample_size)\s*[:=]\s*(\d+)', f"{topic} {title}", re.IGNORECASE)
+        if n_match:
+            sample_size = int(n_match.group(2))
+        else:
+            sample_size = 385  # Academic standard default
     
     # Extract meaningful case study (not just repeating the topic)
     case_study = extract_case_study(topic, raw_case_study)
@@ -6816,9 +4361,16 @@ async def generate_thesis(request: dict):
     if not objectives or (len(objectives) == 1 and objectives[0] == topic):
         objectives = generate_smart_objectives(topic, 6)
     
-    # Ensure exactly 6 objectives
-    short_theme = extract_short_theme(topic)
-    objectives = objectives[:6] if len(objectives) >= 6 else objectives + [f"To investigate aspect {i+1} of {short_theme}" for i in range(6 - len(objectives))]
+    # Ensure minimum 5, maximum 6 for professional PhD balance
+    if len(objectives) < 5:
+        more_objs = generate_smart_objectives(topic, 6)
+        for obj in more_objs:
+            if obj not in objectives and len(objectives) < 5:
+                objectives.append(obj)
+    
+    if len(objectives) > 6:
+        objectives = objectives[:6]
+
     
     print(f"📚 FULL THESIS request: {topic}")
     
@@ -6900,6 +4452,7 @@ async def generate_thesis(request: dict):
                 case_study=case_study,
                 job_id=job_id,
                 session_id=session_id,
+                workspace_id=workspace_id,
                 background_style=background_style
             )
             chapter_contents['chapter1'] = chapter1_result
@@ -7040,7 +4593,8 @@ async def generate_thesis(request: dict):
                     objectives=objectives,
                     output_dir=str(workspace_path),
                     job_id=job_id,
-                    session_id=session_id
+                    session_id=session_id,
+                    sample_size=sample_size
                 )
                 questionnaire_path = tools_result.get('questionnaire_path')
             except Exception as e:
@@ -7083,10 +4637,10 @@ async def generate_thesis(request: dict):
             await events.publish(
                 job_id,
                 "response_chunk",
-                {"chunk": """## 📊 STEP 5/8: SYNTHETIC DATASET GENERATION
+                {"chunk": f"""## 📊 STEP 5/8: SYNTHETIC DATASET GENERATION
 
 🔄 **Status:** Generating...
-- Questionnaire responses (n=385)
+- Questionnaire responses (n={sample_size})
 - Key Informant Interview transcripts
 - Focus Group Discussion transcripts
 - Field observation notes
@@ -7101,9 +4655,11 @@ async def generate_thesis(request: dict):
             try:
                 dataset_result = await generate_research_dataset(
                     topic=topic,
+                    case_study=case_study,
                     objectives=objectives,
                     questionnaire_path=str(questionnaire_path) if questionnaire_path else None,
                     output_dir=str(datasets_path),
+                    sample_size=sample_size,
                     job_id=job_id,
                     session_id=session_id
                 )
@@ -7114,22 +4670,48 @@ async def generate_thesis(request: dict):
                 import csv
                 import random
                 
-                dataset_file = datasets_path / f"questionnaire_data_{timestamp}.csv"
-                with open(dataset_file, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    headers = ['respondent_id', 'age', 'gender', 'education'] + [f'q{i}' for i in range(1, 19)]
-                    writer.writerow(headers)
-                    for r in range(385):
-                        row = [f'R{r+1:03d}', random.choice(['18-25', '26-35', '36-45', '46-55', '55+']),
-                               random.choice(['Male', 'Female']), random.choice(['Secondary', 'Tertiary', 'Postgraduate'])]
-                        row.extend([random.randint(1, 5) for _ in range(18)])
-                        writer.writerow(row)
+                # Use DataCollectionWorker for robust, variable-aligned dataset generation
+                try:
+                    from services.data_collection_worker import DataCollectionWorker
+                    
+                    dataset_worker = DataCollectionWorker(
+                        topic=topic,
+                        case_study=case_study,
+                        objectives=objectives,
+                        methodology_content="",  # Optional
+                        sample_size=sample_size
+                    )
+                    
+                    # Generate dataset
+                    dataset_file = await dataset_worker.generate_dataset(output_dir=datasets_path)
+                    print(f"✅ Generated enhanced dataset: {dataset_file}")
+                    
+                except Exception as worker_err:
+                    print(f"⚠️ DataCollectionWorker failed, falling back to simple generation: {worker_err}")
+                    # Fallback to simple generation
+                    dataset_file = datasets_path / f"questionnaire_data_{timestamp}.csv"
+                    with open(dataset_file, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        headers = ['respondent_id', 'age_group', 'gender', 'education', 'work_experience', 'position', 'org_type'] + [f'q{i}' for i in range(1, 19)]
+                        writer.writerow(headers)
+                        for r in range(sample_size):
+                            row = [
+                                f'R{r+1:03d}', 
+                                random.choice(['18-25', '26-35', '36-45', '46-55', '55+']),
+                                random.choice(['Male', 'Female']), 
+                                random.choice(['Secondary', 'Tertiary', 'Postgraduate']),
+                                random.choice(['<2 years', '2-5 years', '6-10 years', '11-15 years', '15+ years']),
+                                random.choice(['Senior Manager', 'Middle Manager', 'Supervisor', 'Staff']),
+                                random.choice(['Public', 'Private', 'NGO'])
+                            ]
+                            row.extend([random.randint(1, 5) for _ in range(18)])
+                            writer.writerow(row)
             
             await events.publish(job_id, "step_completed", {"step": 5, "name": "Synthetic Dataset", "file": str(dataset_file) if dataset_file else None}, session_id=session_id)
             await events.publish(
                 job_id,
                 "response_chunk",
-                {"chunk": "✅ **Dataset Generated!** (385 respondents)\n\n---\n\n", "accumulated": ""},
+                {"chunk": f"✅ **Dataset Generated!** ({sample_size} respondents)\n\n---\n\n", "accumulated": ""},
                 session_id=session_id
             )
             print(f"✅ Dataset generated!")
@@ -7165,12 +4747,32 @@ async def generate_thesis(request: dict):
                     objectives=objectives,
                     datasets_dir=str(datasets_path),
                     output_dir=str(chapters_path),
+                    sample_size=sample_size,
                     job_id=job_id,
-                    session_id=session_id
+                    session_id=session_id,
+                    workspace_id=workspace_id
                 )
                 chapter4_result = ch4_result.get('content', '') or ch4_result.get('markdown', '')
+                
+                # Handling logic to ensure visibility in frontend (copy to root)
+                if ch4_result.get('filepath'):
+                    import shutil
+                    try:
+                        source_path = Path(ch4_result['filepath'])
+                        dest_path = workspace_path / source_path.name
+                        shutil.copy2(source_path, dest_path)
+                        print(f"✅ Copied Chapter 4 to root for visibility: {dest_path}")
+                        
+                        # Use the content from file if missing in connection
+                        if not chapter4_result:
+                            with open(source_path, 'r', encoding='utf-8') as f:
+                                chapter4_result = f.read()
+                    except Exception as copy_err:
+                        print(f"⚠️ Error copying Chapter 4 to root: {copy_err}")
+
                 if not chapter4_result and ch4_result.get('filepath'):
-                    with open(ch4_result['filepath'], 'r') as f:
+                     # Fallback read if copy failed or logic above didn't catch it
+                     with open(ch4_result['filepath'], 'r') as f:
                         chapter4_result = f.read()
             except Exception as e:
                 print(f"⚠️ Chapter 4 error: {e}")
@@ -7237,17 +4839,23 @@ This chapter has presented the key findings related to {topic}.
                 session_id=session_id
             )
             
-            from services.chapter5_generator_v2 import generate_chapter5
+            # Find Chapter 3 file
+            ch3_files_all = list(chapters_path.glob("Chapter_3*.md")) + list(chapters_path.glob("chapter_3*.md"))
+            ch3_filepath = str(ch3_files_all[0]) if ch3_files_all else None
+            
+            from services.chapter5_generator_v2 import generate_chapter5_v2
             try:
-                ch5_result = await generate_chapter5(
+                ch5_result = await generate_chapter5_v2(
                     topic=topic,
                     case_study=case_study,
                     objectives=objectives,
                     chapter_two_filepath=str(ch2_file),
+                    chapter_three_filepath=ch3_filepath,
                     chapter_four_filepath=str(ch4_file),
                     output_dir=str(chapters_path),
                     job_id=job_id,
-                    session_id=session_id
+                    session_id=session_id,
+                    workspace_id=workspace_id
                 )
                 chapter5_result = ch5_result.get('content', '') if isinstance(ch5_result, dict) else ch5_result
                 if not chapter5_result and isinstance(ch5_result, dict) and ch5_result.get('filepath'):
@@ -7324,7 +4932,8 @@ This chapter has discussed the key findings in relation to existing literature o
                     chapter4_content=chapter_contents.get('chapter4', ''),
                     chapter5_content=chapter_contents.get('chapter5', ''),
                     job_id=job_id,
-                    session_id=session_id
+                    session_id=session_id,
+                    workspace_id=workspace_id
                 )
                 chapter6_result = ch6_result if isinstance(ch6_result, str) else ch6_result.get('content', '')
             except Exception as e:
@@ -7534,10 +5143,23 @@ The study concludes that evidence-based interventions are essential for addressi
 **Keywords:** {topic.split()[0]}, {topic.split()[1] if len(topic.split()) > 1 else 'Research'}, {case_study.split()[0]}, Mixed Methods, PhD Research, {case_study.split()[-1] if len(case_study.split()) > 1 else 'Study'}"""
 
             # Combine all chapters into final thesis with proper academic structure
+            logo_path = "/home/gemtech/Desktop/thesis/backend/lightweight/uoj_logo.png"
             full_thesis = f"""
 <div style="text-align: center; page-break-after: always;">
 
+![UNIVERSITY OF JUBA LOGO]({logo_path})
+
 # {title.upper()}
+
+&nbsp;
+
+**BY**
+
+&nbsp;
+
+### {student_name or '_________________________'}
+
+&nbsp;
 
 ---
 

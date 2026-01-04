@@ -2,8 +2,8 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
-import { ChevronLeft, ChevronRight, Menu } from 'lucide-react';
+import { usePathname, useRouter } from 'next/navigation';
+import { ChevronLeft, ChevronRight, Menu, LogOut, Settings, Sparkles } from 'lucide-react';
 import { StreamingWorkspace, AgentAction } from '../workspace/StreamingWorkspace';
 import { FilePreviewPanel } from './FilePreviewPanel';
 import { TabbedPreviewPanel, Tab, TabType } from './TabbedPreviewPanel';
@@ -18,15 +18,76 @@ import { SourcesPanel } from '../sources/SourcesPanel';
 import { TopMenuBar } from './TopMenuBar';
 import { ProcessStatus } from '../ProcessStatus';
 import { cn } from '../../lib/utils';
-import ThesisProgressPopup from '../ThesisProgressPopup';
+import UniversalProgressOverlay from '../UniversalProgressOverlay';
 import { ChatHistoryService } from '../../lib/chat-history';
+import { ThesisParameters } from '../../lib/thesisParameters';
+import { Button } from '../ui/button';
+import { LoginScreen } from '../auth/LoginScreen'; // 1. Import LoginScreen
 
 interface ManusStyleLayoutProps {
   children?: React.ReactNode;
   leftPanel?: React.ReactNode;
+  workspaceId?: string; // Optional prop to override default/local storage
 }
 
-export function ManusStyleLayout({ children, leftPanel }: ManusStyleLayoutProps) {
+export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspaceId }: ManusStyleLayoutProps) {
+  const router = useRouter();
+  const pathname = usePathname();
+  // Auth State
+  const [isAuthenticated, setIsAuthenticated] = useState(false); // 2. Add isAuthenticated state
+  const [hasCheckedAuth, setHasCheckedAuth] = useState(false); // Add hasCheckedAuth state
+  const [currentUser, setCurrentUser] = useState<any>(null);
+
+  // Check auth on mount
+  useEffect(() => {
+    const token = localStorage.getItem('auth_token');
+    const user = localStorage.getItem('auth_user');
+    if (token && user) {
+      const parsedUser = JSON.parse(user);
+      setIsAuthenticated(true);
+      setCurrentUser(parsedUser);
+
+      // Load user's private workspace ONLY if not already in a specific workspace
+      if (parsedUser.workspaces && parsedUser.workspaces.length > 0 && (!propWorkspaceId || propWorkspaceId === 'default')) {
+        const userWs = parsedUser.workspaces[0];
+        setWorkspaceId(userWs);
+        localStorage.setItem('workspace_id', userWs);
+      }
+    }
+    setHasCheckedAuth(true); // Mark check as complete
+  }, []);
+
+  const handleLoginSuccess = (token: string, user: any) => {
+    setIsAuthenticated(true);
+    setCurrentUser(user);
+
+    // Switch to user's private workspace immediately
+    if (user.workspaces && user.workspaces.length > 0) {
+      const userWs = user.workspaces[0];
+      setWorkspaceId(userWs);
+      localStorage.setItem('workspace_id', userWs);
+
+      // Clear previous chat messages from view (they will reload from new key)
+      setChatMessages([]);
+    }
+  };
+
+  // Logout Handler
+  const handleLogout = () => {
+    // Clear all auth storage
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('auth_user');
+    localStorage.removeItem('workspace_id');
+
+    // Reset React state
+    setIsAuthenticated(false);
+    setCurrentUser(null);
+    setWorkspaceId('default');
+
+    // Force reload to clear any lingering memory/cache state
+    window.location.reload();
+  };
+
   const [isProgressPanelOpen, setIsProgressPanelOpen] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [messageQueue, setMessageQueue] = useState<string[]>([]);
@@ -72,15 +133,87 @@ export function ManusStyleLayout({ children, leftPanel }: ManusStyleLayoutProps)
   const [isRightPanelCollapsed, setIsRightPanelCollapsed] = useState(false);
 
   // Workspace State
-  const [workspaceId, setWorkspaceId] = useState<string>('default');
+  const [workspaceId, setWorkspaceId] = useState<string>(propWorkspaceId || 'default');
+
+  // Sync state with URL when workspaceId changes
+  useEffect(() => {
+    if (workspaceId && workspaceId !== 'default' && !pathname.includes(workspaceId)) {
+      // Only update if not already on that path
+      router.push(`/workspace/${workspaceId}`);
+    } else if (workspaceId === 'default' && pathname !== '/' && !pathname.startsWith('/workspace/default')) {
+      // Optional: Redirect default to specialized path if desired, or keep at root
+      // router.push('/workspace/default');
+    }
+  }, [workspaceId, router, pathname]);
+
+  // If prop changes, sync internal state
+  useEffect(() => {
+    if (propWorkspaceId && propWorkspaceId !== workspaceId) {
+      setWorkspaceId(propWorkspaceId);
+    }
+  }, [propWorkspaceId]);
+  const [sessionId, setSessionId] = useState<string>(''); // Session ID for chat isolation
+
+  // Restore workspace/session from localStorage on mount - only if not in a specific workspace
+  useEffect(() => {
+    if (!propWorkspaceId || propWorkspaceId === 'default') {
+      const savedWs = localStorage.getItem('workspace_id');
+      const savedSession = localStorage.getItem('session_id');
+      if (savedWs) setWorkspaceId(savedWs);
+      if (savedSession) setSessionId(savedSession);
+    }
+  }, [propWorkspaceId]);
+
+  // Fetch workspace details if propWorkspaceId is provided (sharable URL)
+  useEffect(() => {
+    if (propWorkspaceId && propWorkspaceId !== 'default') {
+      const loadWorkspace = async () => {
+        try {
+          const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+          const response = await fetch(`${backendUrl}/api/workspace/${propWorkspaceId}/load`);
+          if (response.ok) {
+            const data = await response.json();
+
+            // Only update if it's different to prevent loops
+            setSessionId(data.session_id);
+            // setWorkspaceId is already handled by the sync useEffect or the initial state
+
+            // Update messages
+            const messages = (data.messages || []).map((msg: any) => ({
+              id: msg.id,
+              type: msg.role === 'user' ? 'user' : (msg.role === 'system' ? 'system' : 'assistant'),
+              content: msg.content,
+              timestamp: new Date(msg.timestamp),
+              isStreaming: false,
+              agent: msg.role === 'assistant' ? 'assistant' : undefined
+            }));
+
+            setChatMessages(messages);
+            setShowWelcome(false);
+            setWorkspaceFiles(data.files || []);
+
+            // Persist to local storage so other parts of the app know
+            localStorage.setItem('workspace_id', data.workspace_id);
+            localStorage.setItem('session_id', data.session_id);
+          }
+        } catch (error) {
+          console.error('Failed to load shared workspace:', error);
+        }
+      };
+
+      loadWorkspace();
+    }
+  }, [propWorkspaceId]);
+  const [workspaceFiles, setWorkspaceFiles] = useState<any[]>([]); // Workspace files list
   const [showWelcome, setShowWelcome] = useState(false); // Skip welcome screen
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [selectedUniversity, setSelectedUniversity] = useState<string | null>(null); // Track selected university for thesis generation
 
-  // Thesis Progress Popup State
-  const [showThesisProgress, setShowThesisProgress] = useState(false);
-  const [thesisJobId, setThesisJobId] = useState<string | null>(null);
-  const [thesisTopic, setThesisTopic] = useState<string>('');
+  // Universal Progress Overlay State
+  const [showProgressOverlay, setShowProgressOverlay] = useState(false);
+  const [progressJobId, setProgressJobId] = useState<string | null>(null);
+  const [progressTopic, setProgressTopic] = useState<string>('');
+  const [progressType, setProgressType] = useState<'thesis' | 'general'>('general');
 
   // Store interval ref for cleanup
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -114,25 +247,6 @@ export function ManusStyleLayout({ children, leftPanel }: ManusStyleLayoutProps)
       }
     }
   }, [chatMessages, workspaceId]);
-
-  // Auto-load most recent workspace
-  useEffect(() => {
-    const fetchWorkspaces = async () => {
-      try {
-        const response = await fetch('/api/workspaces/list');
-        if (response.ok) {
-          const data = await response.json();
-          if (data.workspaces && data.workspaces.length > 0) {
-            setWorkspaceId(data.workspaces[0].workspace_id);
-          }
-        }
-      } catch (error) {
-        console.error('Failed to fetch workspaces:', error);
-      }
-    };
-
-    fetchWorkspaces();
-  }, []);
 
   // Cleanup interval on unmount
   useEffect(() => {
@@ -262,7 +376,7 @@ export function ManusStyleLayout({ children, leftPanel }: ManusStyleLayoutProps)
   }, [isProgressPanelOpen]);
 
   // Handle university thesis generation
-  const handleUniversityThesisGeneration = async (universityType: string, userInput: string) => {
+  const handleUniversityThesisGeneration = async (universityType: string, userInput: string, parameters?: ThesisParameters) => {
     setIsProcessing(true);
     setLiveResponse('');
     setCurrentStatus(`📚 Generating thesis for ${universityType}...`);
@@ -358,7 +472,8 @@ Objectives:
           title: title,
           topic: topic,
           objectives: objectives.length > 0 ? objectives : [topic],
-          workspace_id: workspaceId
+          workspace_id: workspaceId,
+          parameters: parameters
         }),
       });
 
@@ -375,22 +490,25 @@ Objectives:
           ? thesisData.objectives.map((obj: string, i: number) => `${i + 1}. ${obj}`).join('\n')
           : 'Auto-generating 6 research objectives...';
 
-        // Add status message - thesis is being generated in background
-        const statusMessage: ChatMessage = {
-          id: `assistant-${Date.now()}`,
-          type: 'assistant',
-          content: `# 🚀 COMPLETE PhD THESIS GENERATION STARTED!
+        // Conditional Pipeline Display
+        const isGeneral = universityType === 'uoj_general';
+        const pipelineTitle = isGeneral ? '🚀 GENERAL ACADEMIC THESIS GENERATION STARTED! (5 CHAPTERS)' : '🚀 COMPLETE PhD THESIS GENERATION STARTED!';
 
-**University:** ${universityType}
-**Title:** ${title}
-**Topic:** ${topic}
+        let pipelineTable = '';
+        if (isGeneral) {
+          pipelineTable = `## 📊 Generation Pipeline (7 Steps)
 
-## 📋 Research Objectives:
-${objectivesDisplay}
-
----
-
-## 📊 Generation Pipeline (8 Steps)
+| Step | Component | Status |
+|------|-----------|--------|
+| 1 | Chapter 1: Introduction | ⏳ Pending |
+| 2 | Chapter 2: Literature Review (General + Empirical) | ⏳ Pending |
+| 3 | Chapter 3: Methodology (8 Sections) | ⏳ Pending |
+| 4 | Study Tools (Questionnaire, Interview Guide) | ⏳ Pending |
+| 5 | Synthetic Dataset (Hypothetical Data) | ⏳ Pending |
+| 6 | Chapter 4: Data Analysis (Tables & Figures) | ⏳ Pending |
+| 7 | Chapter 5: Discussion, Conclusion & Recommendations | ⏳ Pending |`;
+        } else {
+          pipelineTable = `## 📊 Generation Pipeline (8 Steps)
 
 | Step | Component | Status |
 |------|-----------|--------|
@@ -401,9 +519,27 @@ ${objectivesDisplay}
 | 5 | Synthetic Dataset (385 respondents) | ⏳ Pending |
 | 6 | Chapter 4: Data Analysis | ⏳ Pending |
 | 7 | Chapter 5: Discussion | ⏳ Pending |
-| 8 | Chapter 6: Conclusion & Recommendations | ⏳ Pending |
+| 8 | Chapter 6: Conclusion & Recommendations | ⏳ Pending |`;
+        }
 
-⏱️ **Estimated time:** 10-15 minutes for complete thesis
+        // Add status message - thesis is being generated in background
+        const statusMessage: ChatMessage = {
+          id: `assistant-${Date.now()}`,
+          type: 'assistant',
+          content: `# ${pipelineTitle}
+
+**University:** ${universityType}
+**Title:** ${title}
+**Topic:** ${topic}
+
+## 📋 Research Objectives:
+${objectivesDisplay}
+
+---
+
+${pipelineTable}
+
+⏱️ **Estimated time:** ${isGeneral ? '5-8' : '10-15'} minutes for complete thesis
 
 📡 **Job ID:** \`${thesisData.job_id}\`
 
@@ -417,19 +553,19 @@ ${objectivesDisplay}
         setStreamingMessageId(statusMessage.id);
         setCurrentJobId(thesisData.job_id);
 
-        // Show the thesis progress popup
-        setThesisJobId(thesisData.job_id);
-        setThesisTopic(topic);
-        setShowThesisProgress(true);
+        // Show the universal progress overlay
+        setProgressJobId(thesisData.job_id);
+        setProgressTopic(topic);
+        setProgressType('thesis');
+        setShowProgressOverlay(true);
 
         // The popup now handles its own SSE connection
         // We can still keep a lightweight listener here for chat updates
 
         // Subscribe to SSE for progress updates - using Redis-based endpoint
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
-        const sessionId = 'default'; // Use default session for thesis generation
-        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${sessionId}&job_id=${thesisData.job_id}`;
-        // console.log('📡 Connecting to SSE:', streamUrl);
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+        const sessionForStream = sessionId || 'new';
+        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${sessionForStream}&job_id=${thesisData.job_id}`;
         const eventSource = new EventSource(streamUrl);
 
         eventSource.onopen = () => {
@@ -460,12 +596,19 @@ ${objectivesDisplay}
             // console.log('📋 Status:', data.message);
           }
 
-          if (eventType === 'agent_activity' && data) {
+          if (eventType === 'agent_activity' || eventType === 'agent_working') {
             setCurrentAgent(data.agent_name || data.agent || '');
             setCurrentAction(data.action || '');
           }
 
+          if (eventType === 'figure_generated' && data?.message) {
+            setCurrentStatus(`📈 ${data.message}`);
+          }
+
           if (eventType === 'file_created' && data?.path) {
+            // Dispatch event to refresh file explorer
+            window.dispatchEvent(new CustomEvent('workspace-refresh'));
+
             // File was created - add completion message
             const completionMessage: ChatMessage = {
               id: `assistant-complete-${Date.now()}`,
@@ -484,6 +627,7 @@ The thesis has been saved and is ready for download!`,
 
           if (eventType === 'stage_completed') {
             if (data?.status === 'success') {
+              window.dispatchEvent(new CustomEvent('workspace-refresh'));
               eventSource.close();
               setIsProcessing(false);
               setStreamingMessageId(null);
@@ -618,7 +762,127 @@ Objectives:
     }
   };
 
-  const handleChatStart = async (message?: string, mentionedAgents?: string[]) => {
+  // Handle PDF file uploads
+  const handleFileUpload = async (files: File[]) => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+      const pdfFiles = files.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+
+      if (pdfFiles.length === 0) {
+        console.warn('No PDF files selected');
+        return;
+      }
+
+      // 1. Create a persistent progress message
+      const progressId = `upload-progress-${Date.now()}`;
+      setChatMessages(prev => [...prev, {
+        id: progressId,
+        role: 'assistant',
+        content: `🚀 Starting upload of ${pdfFiles.length} PDF(s)...`,
+        timestamp: new Date(),
+        type: 'assistant',
+      }]);
+
+      const allResults = [];
+      const failed = [];
+
+      // 2. Upload files one by one to show progress
+      for (let i = 0; i < pdfFiles.length; i++) {
+        const file = pdfFiles[i];
+
+        // Update progress message
+        setChatMessages(prev => prev.map(msg =>
+          msg.id === progressId
+            ? { ...msg, content: `⏳ Uploading file ${i + 1} of ${pdfFiles.length}:\n**${file.name}**...` }
+            : msg
+        ));
+
+        const formData = new FormData();
+        formData.append('files', file);
+
+        try {
+          const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/upload-pdfs`, {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!response.ok) throw new Error(response.statusText);
+
+          const result = await response.json();
+          if (result.results && result.results.length > 0) {
+            allResults.push(...result.results);
+          }
+          if (result.errors && result.errors.length > 0) {
+            failed.push(...result.errors);
+          }
+        } catch (err) {
+          failed.push({ filename: file.name, error: String(err) });
+        }
+      }
+
+      // 3. Remove progress message (or update it to completion)
+      setChatMessages(prev => prev.filter(msg => msg.id !== progressId));
+
+      // 4. Show final summary
+      const successCount = allResults.length;
+      const failCount = failed.length;
+
+      let summary = `✅ **Upload Complete**\nSuccessfully added ${successCount} source(s).`;
+
+      if (allResults.length > 0) {
+        summary += `\n\n**📚 Added Sources:**\n` +
+          allResults.map((r: any) => `• [${r.original_filename || r.filename}] ${r.title}`).join('\n');
+      }
+
+      if (failCount > 0) {
+        summary += `\n\n⚠️ **Failed:**\n` +
+          failed.map((f: any) => `• ${f.filename}: ${f.error}`).join('\n');
+      }
+
+      setChatMessages(prev => [...prev, {
+        id: `upload-report-${Date.now()}`,
+        role: 'assistant',
+        content: summary,
+        timestamp: new Date(),
+        type: 'assistant',
+      }]);
+
+      // Refresh workspace files
+      window.dispatchEvent(new Event('workspace-refresh'));
+
+      // Open sources tab if successful
+      if (successCount > 0) {
+        const sourcesTab: Tab = {
+          id: `sources-${Date.now()}`,
+          type: 'sources',
+          title: '📚 Uploaded Sources',
+          data: {
+            sources: allResults,
+            workspace_id: workspaceId
+          },
+          workspaceId: workspaceId,
+        };
+
+        setTabs(prev => {
+          const existing = prev.find(t => t.type === 'sources');
+          return existing ? prev.map(t => t.type === 'sources' ? sourcesTab : t) : [...prev, sourcesTab];
+        });
+        setActiveTabId(sourcesTab.id);
+      }
+
+    } catch (error) {
+      console.error('PDF upload workflow error:', error);
+      setChatMessages(prev => [...prev, {
+        id: `error-${Date.now()}`,
+        role: 'assistant',
+        content: `❌ Error during upload: ${String(error)}`,
+        timestamp: new Date(),
+        type: 'assistant',
+      }]);
+    }
+  };
+
+  const handleChatStart = async (message?: string, mentionedAgents?: string[], parameters?: ThesisParameters) => {
     if (!message || !message.trim()) return;
 
     // Check if this is a university slash command
@@ -629,11 +893,11 @@ Objectives:
       const restOfMessage = (universityMatch[2] || '').trim();
 
       // Check if it's a known university
-      const validUniversities = ['uoj_phd', 'generic'];
+      const validUniversities = ['uoj_phd', 'uoj_general', 'generic'];
       if (validUniversities.includes(universityType)) {
         // Handle university thesis generation
         // console.log(`📚 University selected: ${universityType}`);
-        await handleUniversityThesisGeneration(universityType, restOfMessage);
+        await handleUniversityThesisGeneration(universityType, restOfMessage, parameters);
         return;
       }
     }
@@ -652,18 +916,6 @@ Objectives:
     localStorage.removeItem('current_job_id');
 
     // Don't auto-open progress panel - user can open manually with Cmd+P
-    // setIsProgressPanelOpen(true);
-    setIsProcessing(true);
-    setLiveResponse('');
-    setCurrentStatus('🚀 Starting request processing...');
-    setCurrentStage('initializing');
-
-    // Clear progress steps - will be populated by real-time SSE events
-    setProgressSteps([]);
-    setReasoning('');
-    setActiveAgents([]); // Clear agents for new request
-
-    // Close existing SSE connection if any
     if (eventSourceRef.current) {
       // console.log("🔌 Closing existing SSE connection before new request");
       eventSourceRef.current.close();
@@ -691,13 +943,46 @@ Objectives:
     };
     setChatMessages(prev => [...prev, userChatMessage]);
 
+    // Ensure we have a conversation context
+    let currentSessionId = sessionId;
+    if (!currentSessionId) {
+      try {
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+        const convResponse = await fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: message.trim().slice(0, 50) })
+        });
+        if (convResponse.ok) {
+          const convData = await convResponse.json();
+          currentSessionId = convData.conversation_id;
+          setSessionId(currentSessionId);
+        }
+      } catch (e) {
+        console.error('Failed to create conversation:', e);
+        currentSessionId = 'new';
+      }
+    }
+
+    // Post user message to backend memory
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+      await fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${currentSessionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'user', content: message.trim() })
+      });
+    } catch (e) {
+      console.error('Failed to persist user message:', e);
+    }
+
     try {
       // Use backend directly - proxy is causing issues
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
-      // Build conversation history for context (last 5 messages)
+      // Build conversation history for context (last 10 messages)
       const recentHistory = chatMessages.slice(-10).map(msg => ({
-        type: msg.type,
+        role: msg.type === 'assistant' ? 'assistant' : 'user',
         content: msg.content
       }));
 
@@ -710,6 +995,8 @@ Objectives:
           message: message.trim(),
           mentioned_agents: mentionedAgents || [],
           conversation_history: recentHistory,
+          session_id: currentSessionId || sessionId,
+          workspace_id: workspaceId
         }),
       });
 
@@ -838,6 +1125,13 @@ Objectives:
 
         // Store job_id for SSE connection
         localStorage.setItem('current_job_id', jobId);
+
+        // Show universal progress overlay for general agent job
+        setProgressJobId(jobId);
+        setProgressTopic(message.trim());
+        setProgressType('general');
+        setShowProgressOverlay(true);
+
         // Trigger SSE reconnect with new job_id
         window.dispatchEvent(new CustomEvent('job-id-updated', { detail: { jobId } }));
 
@@ -865,12 +1159,25 @@ Objectives:
             agent: 'assistant'
           };
           setChatMessages(prev => [...prev, assistantChatMessage]);
+
+          // Persist assistant message to backend memory
+          try {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+            await fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${currentSessionId || sessionId}/messages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ role: 'assistant', content: data.response, job_id: jobId })
+            });
+          } catch (e) {
+            console.error('Failed to persist assistant message:', e);
+          }
         }
 
         // Connect to real-time SSE stream for this job
         const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-        const sessionId = 'default'; // Use default session for now
-        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${sessionId}&job_id=${jobId}`;
+        const streamSessionId = currentSessionId || sessionId || 'new';
+        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${streamSessionId}&job_id=${jobId}`;
+        streamUrl;
 
         const eventSource = new EventSource(streamUrl);
 
@@ -1099,7 +1406,7 @@ Objectives:
             // Create or update agent tab for search/research/writing activities
             // Include chapter generator agents
             const agentTypes = [
-              'search', 'researcher', 'image_search', 'image_generator',
+              'search', 'research', 'researcher', 'image_search', 'image_generator',
               'research_swarm', 'writer_swarm', 'quality_control', 'chapter_generator',
               'intro_writer', 'background_writer', 'problem_writer', 'scope_writer', 'justification_writer'
             ];
@@ -1152,10 +1459,20 @@ Objectives:
                     workspaceId: workspaceId,
                   };
 
-                  // Auto-open agent tab for chapter generators
-                  if (agent === 'chapter_generator' || agent === 'research_swarm' || agent === 'writer_swarm') {
+                  // Auto-open agent tab for chapter generators and research
+                  if (agent === 'chapter_generator' || agent === 'research_swarm' || agent === 'writer_swarm' || agent === 'research') {
                     setActiveTabId(tabId);
                     setIsRightPanelOpen(true);
+
+                    // Also trigger browser tab if it's a research agent performing an action
+                    if (agent === 'research' || agent === 'search') {
+                      window.dispatchEvent(new CustomEvent('open-browser-tab', {
+                        detail: {
+                          title: `🌐 ${agentName}`,
+                          sessionId: sessionId || 'default'
+                        }
+                      }));
+                    }
                   }
 
                   return [...prev, agentTab];
@@ -1239,7 +1556,7 @@ Objectives:
               window.dispatchEvent(new CustomEvent('open-browser-tab', {
                 detail: {
                   title: stageData.message || '🌐 Live Browser',
-                  sessionId: 'default'
+                  sessionId: sessionId || 'default'
                 }
               }));
             }
@@ -1455,6 +1772,11 @@ Objectives:
               setCurrentStage('');
             }
 
+            // Mark progress step as completed
+            setProgressSteps(prev => prev.map(step =>
+              step.id.includes(`stage-${stage}`) ? { ...step, status: 'completed' } : step
+            ));
+
             // Don't show stage completion messages - they're generic progress updates
             // Only real content (reasoning_chunk, response_chunk) should be visible
           } catch (err) {
@@ -1462,8 +1784,34 @@ Objectives:
           }
         });
 
-        eventSource.addEventListener('done', (e) => {
+        eventSource.addEventListener('done', async (e) => {
           // console.log(`🏁 Received done event for job: ${jobId}`);
+
+          // Persist the final response when the job is done
+          try {
+            // Get the final content from the current state (need to be careful with closures here)
+            // In React, we'd ideally use a ref or the updater function.
+            // Since this is an event listener added once, it might have stale sessionId.
+            setChatMessages(prev => {
+              const finalMsg = prev.find(m => m.id === `chat-${jobId}-response`);
+              if (finalMsg && finalMsg.content) {
+                const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+                fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${sessionId || 'default'}/messages`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    role: 'assistant',
+                    content: finalMsg.content,
+                    job_id: jobId
+                  })
+                }).catch(err => console.error('Failed to persist final streaming message:', err));
+              }
+              return prev;
+            });
+          } catch (err) {
+            console.error('Error during final message persistence:', err);
+          }
+
           setIsProcessing(false);
           setCurrentStatus('');
           setCurrentStage('');
@@ -1825,13 +2173,14 @@ I'm having trouble connecting to the backend server. Please check:
 
   // Handle file opening from workspace - opens as a new tab
   const handleFileOpen = useCallback(async (file: { name: string; path: string; type: string }) => {
-    openTab('file', file.name, file, workspaceId);
-  }, [openTab, workspaceId]);
+    const currentWorkspaceId = workspaceId || `ws_${sessionId.substring(0, 12)}`;
+    openTab('file', file.name, file, currentWorkspaceId);
+  }, [openTab, workspaceId, sessionId]);
 
   // Handle browser/search actions from agent actions - auto-open as tabs
   useEffect(() => {
     const browserActions = agentActions.filter(a =>
-      (a.type === 'browser_action' || a.type === 'research_result') && a.status === 'completed'
+      (a.type === 'browser_action' || a.type === 'research_result') && (a.status === 'completed' || a.status === 'running')
     );
 
     if (browserActions.length > 0) {
@@ -1869,40 +2218,94 @@ I'm having trouble connecting to the backend server. Please check:
     }
   }, [agentActions, openTab, workspaceId]);
 
-  // Handle new chat - clear state
-  const handleNewChat = useCallback(() => {
-    setCurrentJobId(null);
-    setLiveResponse('');
-    setProgressSteps([]);
-    setAgentActions([]);
-    setReasoning('');
-    setCurrentStatus('');
-    setCurrentStage('');
-    setIsProcessing(false);
-    setChatMessages([]); // Clear chat messages for new chat
-  }, []);
-
-  // Handle selecting a job from history
-  const handleSelectJob = useCallback(async (jobId: string) => {
-    setCurrentJobId(jobId);
-
-    // Fetch job details and restore state
+  // Handle new chat - create new session and clear workspace
+  const handleNewChat = useCallback(async () => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
-      const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/jobs/${jobId}`);
-      if (response.ok) {
-        const data = await response.json();
-        const job = data.job;
 
-        // If job is still running, reconnect to stream
-        if (job.status === 'running' || job.status === 'paused') {
-          setIsProcessing(job.status === 'running');
-          setCurrentStatus(job.current_step || 'Processing...');
-          // TODO: Reconnect to SSE stream
-        } else {
-          setIsProcessing(false);
-          if (job.result?.content) {
-            // Restore chat message from job result
+      // 1. Create new session with auto-created workspace
+      const response = await fetch(`${backendUrl}/api/session/init`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: 'default' })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to create new session');
+      }
+
+      const newSession = await response.json();
+
+      // 2. Update state and persistence
+      setSessionId(newSession.session_id);
+      setWorkspaceId(newSession.workspace_id);
+      localStorage.setItem('session_id', newSession.session_id);
+      localStorage.setItem('workspace_id', newSession.workspace_id);
+
+      // 3. Clear all chat-related state
+      setCurrentJobId(null);
+      setLiveResponse('');
+      setProgressSteps([]);
+      setAgentActions([]);
+      setReasoning('');
+      setCurrentStatus('');
+      setCurrentStage('');
+      setIsProcessing(false);
+
+      // Crucial: Clear messages and localStorage for the old workspace
+      setChatMessages([]);
+      setWorkspaceFiles([]);
+      setStreamingMessageId(null);
+      setActiveAgents([]);
+
+      // 4. Load new workspace files (should be empty for new workspace)
+      try {
+        const filesResponse = await fetch(`${backendUrl}/api/workspace/${newSession.workspace_id}/structure`);
+        if (filesResponse.ok) {
+          const filesData = await filesResponse.json();
+          setWorkspaceFiles(filesData.files || []);
+        }
+      } catch (error) {
+        console.error('Failed to load new workspace files:', error);
+        // Non-critical, continue anyway
+      }
+
+      console.log('✅ New chat created:', {
+        sessionId: newSession.session_id,
+        workspaceId: newSession.workspace_id
+      });
+
+    } catch (error) {
+      console.error('Failed to create new chat:', error);
+
+      // Fallback: just clear state without creating new session
+      setCurrentJobId(null);
+      setLiveResponse('');
+      setProgressSteps([]);
+      setAgentActions([]);
+      setReasoning('');
+      setCurrentStatus('');
+      setCurrentStage('');
+      setIsProcessing(false);
+      setChatMessages([]);
+    }
+  }, []);
+
+  // Handle selecting an item from history
+  const handleSelectHistoryItem = useCallback(async (id: string, type: 'job' | 'conversation') => {
+    if (type === 'job') {
+      setCurrentJobId(id);
+      // Existing job selection logic...
+      try {
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+        const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/jobs/${id}`);
+        if (response.ok) {
+          const data = await response.json();
+          const job = data.job;
+          if (job.status === 'running' || job.status === 'paused') {
+            setIsProcessing(job.status === 'running');
+            setCurrentStatus(job.current_step || 'Processing...');
+          } else if (job.result?.content) {
             const resultMessage: ChatMessage = {
               id: `job-${job.job_id}-result`,
               type: 'assistant',
@@ -1914,22 +2317,74 @@ I'm having trouble connecting to the backend server. Please check:
             setChatMessages(prev => [...prev, resultMessage]);
           }
         }
+      } catch (error) {
+        console.error('Failed to load job:', error);
       }
-    } catch (error) {
-      console.error('Failed to load job:', error);
+    } else {
+      // Load conversation/session
+      try {
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+        const response = await fetch(`${backendUrl}/api/session/${id}/load`);
+        if (response.ok) {
+          const data = await response.json();
+
+          // Update both session and workspace
+          setSessionId(data.session_id);
+          setWorkspaceId(data.workspace_id);
+
+          // Update messages
+          const messages = (data.messages || []).map((msg: any) => ({
+            id: msg.id,
+            type: msg.role === 'user' ? 'user' : (msg.role === 'system' ? 'system' : 'assistant'),
+            content: msg.content,
+            timestamp: new Date(msg.timestamp),
+            isStreaming: false,
+            agent: msg.role === 'assistant' ? 'assistant' : undefined
+          }));
+
+          setChatMessages(messages);
+          setShowWelcome(false);
+
+          // Update workspace files
+          setWorkspaceFiles(data.files || []);
+
+          // Update localStorage for persistence
+          localStorage.setItem('workspace_id', data.workspace_id);
+          localStorage.setItem('session_id', data.session_id);
+        }
+      } catch (error) {
+        console.error('Failed to load conversation session:', error);
+      }
     }
   }, [workspaceId]);
 
+  // Authentication Gate
+  if (!hasCheckedAuth) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-4">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent"></div>
+          <p className="text-sm text-muted-foreground">Initializing...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <LoginScreen onLoginSuccess={handleLoginSuccess} />;
+  }
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden" style={{ backgroundColor: 'var(--color-bg, #F4F4F4)' }}>
-      {/* Thesis Progress Popup - Fixed position bottom-left */}
-      {showThesisProgress && thesisJobId && (
-        <ThesisProgressPopup
-          jobId={thesisJobId}
-          topic={thesisTopic}
+      {/* Universal Progress Overlay - Fixed position bottom-right */}
+      {showProgressOverlay && progressJobId && (
+        <UniversalProgressOverlay
+          jobId={progressJobId}
+          title={progressTopic}
+          type={progressType}
           onClose={() => {
-            setShowThesisProgress(false);
-            setThesisJobId(null);
+            setShowProgressOverlay(false);
+            setProgressJobId(null);
           }}
           backendUrl={process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000'}
         />
@@ -1939,9 +2394,9 @@ I'm having trouble connecting to the backend server. Please check:
       <TopMenuBar
         workspaceId={workspaceId}
         onNewChat={handleNewChat}
-        onSelectJob={handleSelectJob}
-        currentJobId={currentJobId}
-        chatTitle={agentActions.find(a => a.type === 'user_message')?.content?.slice(0, 50) || undefined}
+        onSelectHistoryItem={handleSelectHistoryItem}
+        currentHistoryId={sessionId || currentJobId}
+        chatTitle={chatMessages.find(a => a.type === 'user')?.content?.slice(0, 50) || undefined}
       />
 
       <ResizableLayout
@@ -1960,12 +2415,32 @@ I'm having trouble connecting to the backend server. Please check:
             {!isLeftPanelCollapsed && (
               leftPanel || (
                 <div className="h-full flex flex-col">
-                  {/* Workspace Selector / Header */}
-                  <div className="p-4 border-b flex items-center justify-between font-semibold text-gray-700">
-                    <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-green-500"></span>
-                      Thesis Workspace
-                    </div>
+                  {/* Header */}
+                  <div className="flex h-16 items-center px-4 border-b border-border/40 justify-between">
+                    {!isLeftPanelCollapsed ? (
+                      <>
+                        <div className="flex items-center gap-2 animate-in fade-in duration-300">
+                          <div className="w-8 h-8 rounded-xl bg-primary/10 flex items-center justify-center">
+                            <Sparkles className="w-5 h-5 text-primary" />
+                          </div>
+                          <span className="font-bold text-lg tracking-tight">Thesis Platform</span>
+                        </div>
+
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 opacity-70 hover:opacity-100 hover:bg-destructive/10 hover:text-destructive"
+                          onClick={handleLogout}
+                          title="Sign Out"
+                        >
+                          <LogOut className="w-4 h-4" />
+                        </Button>
+                      </>
+                    ) : (
+                      <div className="w-8 h-8 rounded-xl bg-primary/10 flex items-center justify-center mx-auto">
+                        <Sparkles className="w-5 h-5 text-primary" />
+                      </div>
+                    )}
                   </div>
 
                   {/* Left Panel Tabs */}
@@ -2064,10 +2539,11 @@ I'm having trouble connecting to the backend server. Please check:
                 }}
               >
                 <ChatBar
-                  onChatStart={(message, mentionedAgents) => {
+                  onChatStart={(message, mentionedAgents, parameters) => {
                     if (showWelcome) setShowWelcome(false);
-                    handleChatStart(message, mentionedAgents);
+                    handleChatStart(message, mentionedAgents, parameters);
                   }}
+                  onFileUpload={handleFileUpload}
                   isProcessing={isProcessing}
                   placeholder="Type a message... (use @ to mention agents)"
                   currentStatus={currentStatus}

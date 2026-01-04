@@ -40,7 +40,7 @@ class DeepSeekDirectService:
     
     def __init__(self):
         self.api_key = getattr(settings, 'DEEPSEEK_API_KEY', None)
-        self.base_url = "https://api.deepseek.com/v1"
+        self.base_url = "https://api.deepseek.com"  # Updated to official base
         
         if not self.api_key:
             print("⚠️  WARNING: DEEPSEEK_API_KEY not configured. DeepSeek direct API will not work.")
@@ -50,7 +50,7 @@ class DeepSeekDirectService:
         prompt: str,
         system_prompt: str = "You are a helpful academic assistant.",
         temperature: float = 0.7,
-        max_tokens: int = 16000,  # Increased for long-form content (500k+ word docs)
+        max_tokens: int = 4000,
         use_reasoning: bool = False,
         model_key: Optional[str] = None,
         stream: bool = False,
@@ -71,8 +71,6 @@ class DeepSeekDirectService:
             Generated content
         """
         if not self.api_key:
-            # Don't raise error - just return None or empty string
-            # The caller should check api_key before using
             return ""
         
         # Select model
@@ -98,13 +96,13 @@ class DeepSeekDirectService:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": stream  # Enable streaming if requested
+            "stream": stream
         }
         
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:  # 5 min timeout for long docs
-                if stream and stream_callback:
-                    # Streaming mode - call callback for each chunk
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                if stream:
+                    # Streaming mode with callback
                     full_content = []
                     async with client.stream(
                         "POST",
@@ -112,14 +110,15 @@ class DeepSeekDirectService:
                         headers=headers,
                         json=payload
                     ) as response:
-                        response.raise_for_status()
+                        if response.status_code != 200:
+                             err_body = await response.aread()
+                             print(f"❌ DeepSeek Error {response.status_code}: {err_body}")
+                             response.raise_for_status()
+                        
                         async for line in response.aiter_lines():
-                            if not line or line.strip() == "":
-                                continue
-                            if line.startswith("data: "):
-                                line = line[6:]  # Remove "data: " prefix
-                            if line.strip() == "[DONE]":
-                                break
+                            if not line or line.strip() == "": continue
+                            if line.startswith("data: "): line = line[6:]
+                            if line.strip() == "[DONE]": break
                             
                             try:
                                 import json
@@ -129,23 +128,21 @@ class DeepSeekDirectService:
                                     content = delta.get("content", "")
                                     if content:
                                         full_content.append(content)
-                                        # Call the callback with the chunk
-                                        await stream_callback(content)
-                            except json.JSONDecodeError:
-                                # Skip malformed lines
-                                continue
+                                        if stream_callback:
+                                            await stream_callback(content)
+                            except json.JSONDecodeError: continue
                     
                     return "".join(full_content)
                 else:
-                    # Non-streaming mode - wait for full response
+                    # Non-streaming mode
                     response = await client.post(
                         f"{self.base_url}/chat/completions",
                         headers=headers,
                         json=payload
                     )
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        response.raise_for_status()
                     data = response.json()
-                    
                     return data["choices"][0]["message"]["content"]
         except Exception as e:
             print(f"⚠️  DeepSeek API error: {e}")

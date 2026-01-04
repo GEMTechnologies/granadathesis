@@ -126,6 +126,35 @@ def init_db():
         )
     """)
     
+    # Research configuration table - NEW
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS research_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL UNIQUE,
+            sample_size INTEGER DEFAULT 385,
+            research_design TEXT DEFAULT 'survey',
+            measurement_scale TEXT DEFAULT 'likert',
+            data_collection_methods TEXT,  -- JSON array
+            confidence_level REAL DEFAULT 0.95,
+            preferred_analyses TEXT,  -- JSON array of analysis types
+            excluded_analyses TEXT,  -- JSON array of excluded analysis types
+            has_hypotheses BOOLEAN DEFAULT 1,
+            has_control_group BOOLEAN DEFAULT 0,
+            is_longitudinal BOOLEAN DEFAULT 0,
+            custom_instructions TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES thesis_sessions(id)
+        )
+    """)
+    
+    # Migration: Add custom_instructions column if it doesn't exist
+    try:
+        cursor.execute("ALTER TABLE research_config ADD COLUMN custom_instructions TEXT")
+    except sqlite3.OperationalError:
+        # Already exists
+        pass
+        
     conn.commit()
     conn.close()
 
@@ -450,6 +479,58 @@ class ThesisSessionDB:
         conn.close()
         
         return result or 0
+    
+    # ============ RESEARCH CONFIGURATION OPERATIONS ============
+    
+    def save_research_config(self, config: Dict[str, Any]):
+        """Save research configuration for intelligent analysis."""
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO research_config 
+            (session_id, sample_size, research_design, measurement_scale, 
+             data_collection_methods, confidence_level, preferred_analyses, 
+             excluded_analyses, has_hypotheses, has_control_group, is_longitudinal, 
+             custom_instructions, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            self.session_id,
+            config.get('sample_size', 385),
+            config.get('research_design', 'survey'),
+            config.get('measurement_scale', 'likert'),
+            json.dumps(config.get('data_collection_methods', ['questionnaire'])),
+            config.get('confidence_level', 0.95),
+            json.dumps(config.get('preferred_analyses', [])),
+            json.dumps(config.get('excluded_analyses', [])),
+            config.get('has_hypotheses', True),
+            config.get('has_control_group', False),
+            config.get('is_longitudinal', False),
+            config.get('custom_instructions', '')
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_research_config(self) -> Optional[Dict[str, Any]]:
+        """Get research configuration."""
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM research_config WHERE session_id = ?", (self.session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+        
+        config = dict(row)
+        # Parse JSON fields
+        config['data_collection_methods'] = json.loads(config['data_collection_methods']) if config['data_collection_methods'] else []
+        config['preferred_analyses'] = json.loads(config['preferred_analyses']) if config['preferred_analyses'] else []
+        config['excluded_analyses'] = json.loads(config['excluded_analyses']) if config['excluded_analyses'] else []
+        
+        return config
 
 
 # Initialize database on import

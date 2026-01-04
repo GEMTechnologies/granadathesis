@@ -47,8 +47,22 @@ class AppendixGenerator:
         self.objectives = objectives or []
         self.methodology_content = methodology_content.lower() if methodology_content else ""
         self.variables = variables or {"independent": [], "dependent": [], "moderating": []}
+        self.objective_variables = {}
         self.research_questions = research_questions or []
         self.appendices_dir = os.path.join(workspace_dir, "appendices")
+        
+        # Load the Golden Thread variables from thesis_plan.json
+        try:
+            import json
+            from pathlib import Path
+            plan_path = Path(workspace_dir) / "thesis_plan.json"
+            if plan_path.exists():
+                with open(plan_path, 'r') as f:
+                    plan_data = json.load(f)
+                    self.objective_variables = plan_data.get("objective_variables", {})
+                print(f"✅ Loaded {len(self.objective_variables)} objective variables for instrumentation")
+        except Exception as e:
+            print(f"⚠️ Failed to load objective variables: {e}")
         
         # Analyze methodology to determine research design
         self.research_design = self._detect_research_design()
@@ -179,14 +193,20 @@ class AppendixGenerator:
         return tools
 
     
-    async def _generate_questionnaire_items_ai(self, objective: str, section_num: int) -> str:
-        """Uses AI to generate Likert-scale questionnaire items for a specific objective."""
+    async def _generate_questionnaire_items_ai(self, objective_num: int, objective: str, section_num: int) -> str:
+        """Uses AI to generate Likert-scale questionnaire items for a specific objective using extracted variables."""
         try:
             from services.deepseek_direct_service import deepseek_service
             
-            prompt = f"""Generate 8 Likert-scale questionnaire items to measure the following research objective:
+            # Get specific variables for this objective for deeper measurement
+            vars_context = ""
+            obj_vars = self.objective_variables.get(str(objective_num), self.objective_variables.get(objective_num, []))
+            if obj_vars:
+                vars_context = f"\nSPECIFIC VARIABLES TO MEASURE:\n- " + "\n- ".join(obj_vars) + "\n"
+            
+            prompt = f"""Generate 8 Likert-scale questionnaire items to measure the following research objective and its associated variables:
 
-OBJECTIVE: {objective}
+OBJECTIVE: {objective}{vars_context}
 
 TOPIC: {self.topic}
 CASE STUDY: {self.case_study}
@@ -261,14 +281,20 @@ Format your response as a numbered list ONLY, no explanations:
         
         return table_rows
     
-    async def _generate_interview_theme_ai(self, objective: str, theme_num: int) -> str:
-        """Uses AI to generate interview questions for a specific objective."""
+    async def _generate_interview_theme_ai(self, objective_num: int, objective: str, theme_num: int) -> str:
+        """Uses AI to generate interview questions for a specific objective using extracted variables."""
         try:
             from services.deepseek_direct_service import deepseek_service
             
-            prompt = f"""Generate interview questions for the following research objective:
-
-OBJECTIVE: {objective}
+            # Get specific variables for this objective
+            vars_context = ""
+            obj_vars = self.objective_variables.get(str(objective_num), self.objective_variables.get(objective_num, []))
+            if obj_vars:
+                vars_context = f"\nSPECIFIC VARIABLES/THEMES:\n- " + "\n- ".join(obj_vars) + "\n"
+            
+            prompt = f"""Generate interview questions for the following research objective and its associated variables:
+            
+OBJECTIVE: {objective}{vars_context}
 
 TOPIC: {self.topic}
 CASE STUDY: {self.case_study}
@@ -385,8 +411,9 @@ FOLLOWUP2: [Second follow-up question]
         tools_needed = self.analyse_objectives_for_tools()
         generated_files = []
         
-        for tool in tools_needed:
+        for i, tool in enumerate(tools_needed):
             if tool == 'questionnaire':
+                # Pass 1-based index for objective variables
                 file_path = await self.generate_questionnaire()
                 generated_files.append(file_path)
             
@@ -420,8 +447,8 @@ FOLLOWUP2: [Second follow-up question]
         section_letter = ord('B')  # Start from Section B
         
         for i, objective in enumerate(self.objectives if self.objectives else []):
-            # Generate AI-powered questionnaire items
-            items_table = await self._generate_questionnaire_items_ai(objective, i + 1)
+            # Generate AI-powered questionnaire items (passing objective index + 1 for variable lookup)
+            items_table = await self._generate_questionnaire_items_ai(i + 1, objective, i + 1)
             
             objective_sections += f"""
 ---
@@ -587,7 +614,7 @@ Data Entry: __________
         # Generate interview themes for each objective
         interview_themes = ""
         for i, objective in enumerate(self.objectives if self.objectives else [], 1):
-            theme_content = await self._generate_interview_theme_ai(objective, i)
+            theme_content = await self._generate_interview_theme_ai(i, objective, i)
             interview_themes += theme_content
         
         # If no objectives, add default themes

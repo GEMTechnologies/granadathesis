@@ -16,12 +16,63 @@ interface University {
     description: string;
 }
 
+const DEFAULT_WORKFLOWS: University[] = [
+    {
+        type: 'combine-thesis',
+        name: 'Combine Thesis',
+        abbreviation: 'JOIN',
+        description: 'Combine all chapters into single thesis document'
+    },
+    {
+        type: 'generate-chapter1',
+        name: 'Generate Chapter 1',
+        abbreviation: 'CH1',
+        description: 'Generate Chapter 1 (Introduction)'
+    },
+    {
+        type: 'generate-chapter2',
+        name: 'Generate Chapter 2',
+        abbreviation: 'CH2',
+        description: 'Generate Chapter 2 (Literature Review)'
+    },
+    {
+        type: 'generate-chapter3',
+        name: 'Generate Chapter 3',
+        abbreviation: 'CH3',
+        description: 'Generate Chapter 3 (Methodology)'
+    },
+    {
+        type: 'generate-chapter4',
+        name: 'Generate Chapter 4',
+        abbreviation: 'CH4',
+        description: 'Generate Chapter 4 (Data Analysis)'
+    },
+    {
+        type: 'generate-dataset',
+        name: 'Generate Dataset',
+        abbreviation: 'DATA',
+        description: 'Generate synthetic research dataset'
+    },
+    {
+        type: 'generate-full-thesis',
+        name: 'Generate Full Thesis',
+        abbreviation: 'FULL',
+        description: 'Generate complete PhD thesis (all 6 chapters)'
+    },
+    {
+        type: 'generate-study-tools',
+        name: 'Generate Study Tools',
+        abbreviation: 'TOOLS',
+        description: 'Generate study tools (questionnaire, interview guides)'
+    }
+];
+
 export function CleanChatInput({ onSend, placeholder = "What do you want to create?", disabled }: CleanChatInputProps) {
     const [message, setMessage] = useState('');
     const [images, setImages] = useState<File[]>([]);
-    const [showUniversities, setShowUniversities] = useState(false);
-    const [universities, setUniversities] = useState<University[]>([]);
-    const [selectedUniversity, setSelectedUniversity] = useState<University | null>(null);
+    const [showWorkflows, setShowWorkflows] = useState(false);
+    const [workflows, setWorkflows] = useState<University[]>(DEFAULT_WORKFLOWS);
+    const [selectedWorkflow, setSelectedWorkflow] = useState<University | null>(null);
     const [cursorPosition, setCursorPosition] = useState(0);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const suggestionsRef = useRef<HTMLDivElement>(null);
@@ -34,24 +85,12 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
                 const response = await fetch('http://localhost:8000/api/thesis/universities');
                 const data = await response.json();
                 console.log('Universities loaded:', data.universities);
-                setUniversities(data.universities);
+                if (data.universities && data.universities.length > 0) {
+                    setUniversities(data.universities);
+                }
             } catch (error) {
                 console.error('Failed to load universities:', error);
-                // Set default universities if API fails
-                setUniversities([
-                    {
-                        type: 'uoj_phd',
-                        name: 'University of Juba PhD',
-                        abbreviation: 'UoJ',
-                        description: 'PhD thesis template for University of Juba'
-                    },
-                    {
-                        type: 'generic',
-                        name: 'Generic University',
-                        abbreviation: 'GEN',
-                        description: 'Generic thesis template'
-                    }
-                ]);
+                // Keep defaults
             }
         };
         loadUniversities();
@@ -82,25 +121,25 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
         // Check if last typed character is "/" or if we're at the start with "/"
         const lastCharIsSlash = value[value.length - 1] === '/';
         const startsWithSlash = value.trim().startsWith('/');
-        
+
         console.log('Input changed:', { value, lastCharIsSlash, startsWithSlash, universitiesCount: universities.length });
-        
+
         if (lastCharIsSlash || startsWithSlash) {
-            console.log('Slash detected! Showing universities dropdown');
-            setShowUniversities(true);
+            console.log('Slash detected! Showing workflows dropdown');
+            setShowWorkflows(true);
         } else {
-            setShowUniversities(false);
+            setShowWorkflows(false);
         }
     };
 
-    // Select a university
-    const selectUniversity = (uni: University) => {
-        // Replace the "/" with the university command
-        const newMessage = message.replace(/\/$/, `/${uni.type} `);
+    // Select a workflow
+    const selectWorkflow = (wf: University) => {
+        // Replace the "/" with the workflow command
+        const newMessage = message.replace(/\/$/, `/${wf.type} `);
         setMessage(newMessage);
-        setSelectedUniversity(uni);
-        setShowUniversities(false);
-        
+        setSelectedWorkflow(wf);
+        setShowWorkflows(false);
+
         // Focus back on textarea
         setTimeout(() => textareaRef.current?.focus(), 0);
     };
@@ -123,8 +162,8 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
         onSend(message, images);
         setMessage('');
         setImages([]);
-        setSelectedUniversity(null);
-        setShowUniversities(false);
+        setSelectedWorkflow(null);
+        setShowWorkflows(false);
     };
 
     // Handle Enter key
@@ -139,7 +178,7 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
             if (suggestionsRef.current && !suggestionsRef.current.contains(event.target as Node)) {
-                setShowUniversities(false);
+                setShowWorkflows(false);
             }
         };
 
@@ -148,7 +187,7 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
     }, []);
 
     return (
-        <div className="border-t border-gray-200 bg-white p-4">
+        <div className="border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-[#0B0B0B] p-4">
             {/* Image Previews */}
             {images.length > 0 && (
                 <div className="mb-3 flex gap-2 flex-wrap">
@@ -170,17 +209,17 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
                 </div>
             )}
 
-            {/* Selected University Badge */}
-            {selectedUniversity && (
-                <div className="mb-3 inline-flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-full px-3 py-1 text-sm">
-                    <BookOpen className="w-4 h-4 text-blue-600" />
-                    <span className="text-blue-700 font-medium">{selectedUniversity.name}</span>
+            {/* Selected Workflow Badge */}
+            {selectedWorkflow && (
+                <div className="mb-3 inline-flex items-center gap-2 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-full px-3 py-1 text-sm">
+                    <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                    <span className="text-blue-700 dark:text-blue-300 font-medium">{selectedWorkflow.name}</span>
                     <button
                         onClick={() => {
-                            setSelectedUniversity(null);
+                            setSelectedWorkflow(null);
                             setMessage(message.replace(/\/\w+\s?/, '/'));
                         }}
-                        className="text-blue-400 hover:text-blue-600 ml-1"
+                        className="text-blue-400 hover:text-blue-600 dark:hover:text-blue-200 ml-1"
                     >
                         ×
                     </button>
@@ -199,35 +238,35 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
                         placeholder={placeholder}
                         disabled={disabled}
                         rows={1}
-                        className="w-full resize-none rounded-lg border border-gray-300 px-4 py-3 pr-12 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                        className="w-full resize-none rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-4 py-3 pr-12 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 text-gray-900 dark:text-gray-100 placeholder-gray-500 dark:placeholder-gray-400"
                         style={{ maxHeight: '150px', minHeight: '48px' }}
                     />
 
-                    {/* University Suggestions */}
-                    {showUniversities && universities.length > 0 && (
+                    {/* Workflow Suggestions */}
+                    {showWorkflows && workflows.length > 0 && (
                         <div
                             ref={suggestionsRef}
-                            className="absolute bottom-full left-0 right-0 mb-2 bg-white border border-gray-200 rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto"
+                            className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-[100] max-h-64 overflow-y-auto"
                         >
-                            <div className="p-2 border-b border-gray-100 bg-gray-50">
-                                <p className="text-xs font-semibold text-gray-600 px-2 py-1">
-                                    Select University
+                            <div className="p-2 border-b border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50">
+                                <p className="text-xs font-semibold text-gray-600 dark:text-gray-400 px-2 py-1">
+                                    Select Workflow
                                 </p>
                             </div>
-                            {universities.map((uni) => (
+                            {workflows.map((wf) => (
                                 <button
-                                    key={uni.type}
-                                    onClick={() => selectUniversity(uni)}
-                                    className="w-full text-left px-3 py-2 hover:bg-blue-50 border-b border-gray-100 last:border-b-0 transition-colors"
+                                    key={wf.type}
+                                    onClick={() => selectWorkflow(wf)}
+                                    className="w-full text-left px-3 py-2 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-b border-gray-100 dark:border-gray-700 last:border-b-0 transition-colors"
                                 >
                                     <div className="flex items-start gap-2">
-                                        <BookOpen className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+                                        <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
                                         <div className="flex-1 min-w-0">
-                                            <p className="font-medium text-gray-900 text-sm">
-                                                /{uni.type}
+                                            <p className="font-medium text-gray-900 dark:text-gray-100 text-sm">
+                                                /{wf.type}
                                             </p>
-                                            <p className="text-xs text-gray-600 truncate">
-                                                {uni.name}
+                                            <p className="text-xs text-gray-600 dark:text-gray-400 truncate">
+                                                {wf.description}
                                             </p>
                                         </div>
                                     </div>
@@ -272,7 +311,7 @@ export function WelcomeScreen({ onStart }: { onStart: (message?: string) => void
     const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
     const [inputValue, setInputValue] = useState('');
     const [showUniversities, setShowUniversities] = useState(false);
-    const [universities, setUniversities] = useState<University[]>([]);
+    const [universities, setUniversities] = useState<University[]>(DEFAULT_UNIVERSITIES);
 
     // Load universities on mount
     useEffect(() => {
@@ -358,7 +397,7 @@ export function WelcomeScreen({ onStart }: { onStart: (message?: string) => void
                     />
                     {/* University Suggestions on Welcome */}
                     {showUniversities && universities.length > 0 && (
-                        <div className="absolute bottom-full left-0 right-0 mb-2 bg-white border border-gray-200 rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
+                        <div className="absolute bottom-full left-0 right-0 mb-2 bg-white text-gray-900 border border-gray-200 rounded-lg shadow-xl z-[100] max-h-64 overflow-y-auto">
                             <div className="p-2 border-b border-gray-100 bg-gray-50">
                                 <p className="text-xs font-semibold text-gray-600 px-2 py-1">
                                     Select University

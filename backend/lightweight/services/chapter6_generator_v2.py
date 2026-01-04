@@ -18,6 +18,9 @@ All content is LLM-generated, not template-filled.
 """
 
 import asyncio
+import os
+import json
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -65,7 +68,8 @@ async def generate_chapter6(
     chapter4_content: str = "",
     chapter5_content: str = "",
     job_id: str = None,
-    session_id: str = None
+    session_id: str = None,
+    workspace_id: str = "default"
 ) -> str:
     """
     Generate Chapter 6 using LLM for all content.
@@ -73,6 +77,27 @@ async def generate_chapter6(
     Returns complete chapter as markdown string.
     """
     from core.events import events
+    from services.workspace_service import WORKSPACES_DIR
+    
+    # Standard workspace path
+    workspace_path = WORKSPACES_DIR / (workspace_id or "default")
+    
+    # Try to load Golden Thread variables for context
+    objective_variables = {}
+    try:
+        plan_path = workspace_path / "thesis_plan.json"
+        if plan_path.exists():
+            with open(plan_path, 'r') as f:
+                plan_data = json.load(f)
+                objective_variables = plan_data.get("objective_variables", {})
+    except Exception:
+        pass
+
+    vars_ctx = ""
+    if objective_variables:
+        vars_ctx = "\nARCHITECTURAL VARIABLES (The Golden Thread):\n"
+        for o_num, v_list in objective_variables.items():
+            vars_ctx += f"- Objective {o_num}: {', '.join(v_list)}\n"
     
     chapter = "# CHAPTER SIX\n# SUMMARY, CONCLUSIONS AND RECOMMENDATIONS\n\n"
     
@@ -129,6 +154,8 @@ Write 4-5 substantial paragraphs covering:
 
 4. **Key Findings Overview**: Brief synthesis of what the study discovered - highlight 2-3 major findings without repeating per-objective details
 
+{vars_ctx}
+
 **LANGUAGE**: UK English
 **TENSE**: Past tense throughout (was conducted, revealed, demonstrated)
 **STYLE**: Flowing academic prose, synthesise don't list
@@ -177,6 +204,8 @@ Write 2-3 paragraphs summarising the KEY FINDINGS for this objective:
 - What were the main patterns, trends, or themes identified?
 - How did quantitative and qualitative findings complement each other?
 - What were any notable or unexpected findings?
+
+{vars_ctx}
 
 **IMPORTANT**: 
 - Do NOT repeat the full objective text verbatim

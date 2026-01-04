@@ -18,21 +18,26 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     username: str
+    invitation_code: str
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str
     user: dict
 
+
 class UserResponse(BaseModel):
     user_id: str
     email: str
     username: str
     workspaces: list[str]
+
 
 # ============================================================================
 # DEPENDENCY: Get current user from token
@@ -65,7 +70,15 @@ async def register(request: RegisterRequest):
     Creates user account and default workspace.
     Returns access token for immediate login.
     """
+    import os
     from services.auth_service import auth_service
+    
+    # Simple secure invitation check
+    # In production, this would verify against a DB table of invites
+    ADMIN_INVITE_CODE = os.getenv("ADMIN_INVITE_CODE", "wabden")
+    
+    if request.invitation_code != ADMIN_INVITE_CODE:
+        raise HTTPException(status_code=403, detail="Invalid invitation code. Please contact administrator.")
     
     try:
         user = await auth_service.register_user(
