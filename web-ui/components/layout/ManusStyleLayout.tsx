@@ -14,11 +14,11 @@ import { FileExplorer } from '../workspace/FileExplorer';
 import { CleanChatInput, WelcomeScreen } from '../chat/CleanChatInput';
 import { AgentActivityTracker } from '../chat/AgentActivityBadge';
 import { EnhancedChatDisplay } from '../chat/EnhancedChatDisplay';
+import UniversalProgressOverlay from '../UniversalProgressOverlay';
 import { SourcesPanel } from '../sources/SourcesPanel';
 import { TopMenuBar } from './TopMenuBar';
 import { ProcessStatus } from '../ProcessStatus';
 import { cn } from '../../lib/utils';
-import UniversalProgressOverlay from '../UniversalProgressOverlay';
 import { ChatHistoryService } from '../../lib/chat-history';
 import { ThesisParameters } from '../../lib/thesisParameters';
 import { Button } from '../ui/button';
@@ -96,6 +96,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const [liveResponse, setLiveResponse] = useState('');
   // Force empty state on load - ignore any potential caching
   const [progressSteps, setProgressSteps] = useState<any[]>([]);
+  const [plannerSteps, setPlannerSteps] = useState<any[]>([]);
   const [agentActions, setAgentActions] = useState<AgentAction[]>([]);
   const [leftPanelTab, setLeftPanelTab] = useState<'files' | 'menu'>('files');
   const [reasoning, setReasoning] = useState<string>('');
@@ -107,6 +108,32 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const [currentDescription, setCurrentDescription] = useState<string>(''); // Current action description
   const [currentProgress, setCurrentProgress] = useState<number>(0); // Current progress percentage
   const [statusUpdates, setStatusUpdates] = useState<any[]>([]); // History of status updates
+
+  // Tabbed Preview State
+  const [tabs, setTabs] = useState<Tab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [sourcesRefreshKey, setSourcesRefreshKey] = useState(0);
+  const activeTabIdRef = useRef<string | null>(null);
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState(true); // Default to open for 3-column layout
+  const [isRightPanelCollapsed, setIsRightPanelCollapsed] = useState(false);
+
+  const scheduleAutoCloseTab = useCallback((tabId: string) => {
+    setTimeout(() => {
+      setTabs(prev => {
+        const next = prev.filter(t => t.id !== tabId);
+        if (next.length === prev.length) return prev;
+        const activeId = activeTabIdRef.current;
+        if (activeId === tabId) {
+          const fallback = next[next.length - 1];
+          setActiveTabId(fallback ? fallback.id : null);
+          if (!fallback) {
+            setIsRightPanelOpen(false);
+          }
+        }
+        return next;
+      });
+    }, 1200);
+  }, []);
 
   // Chat Messages State
   interface ChatMessage {
@@ -125,12 +152,22 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   }
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [assistantVariants, setAssistantVariants] = useState<Record<string, string[]>>({});
+  const [assistantVariantIndex, setAssistantVariantIndex] = useState<Record<string, number>>({});
+  const latestAssistantContentRef = useRef<Record<string, string>>({});
+  const jobReplacementRef = useRef<Record<string, string>>({});
+  type ActiveJob = {
+    jobId: string;
+    workspaceId: string;
+    sessionId?: string;
+    type?: 'thesis' | 'general';
+    responseMessageId?: string;
+    startedAt?: number;
+  };
 
-  // Tabbed Preview State
-  const [tabs, setTabs] = useState<Tab[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
-  const [isRightPanelOpen, setIsRightPanelOpen] = useState(true); // Default to open for 3-column layout
-  const [isRightPanelCollapsed, setIsRightPanelCollapsed] = useState(false);
+  useEffect(() => {
+    activeTabIdRef.current = activeTabId;
+  }, [activeTabId]);
 
   // Workspace State
   const [workspaceId, setWorkspaceId] = useState<string>(propWorkspaceId || 'default');
@@ -215,13 +252,1131 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const [progressTopic, setProgressTopic] = useState<string>('');
   const [progressType, setProgressType] = useState<'thesis' | 'general'>('general');
 
+  const normalizePlannerSteps = useCallback((steps: any[]) => {
+    return steps.map((step: any) => {
+      const status = step.status === 'done'
+        ? 'completed'
+        : step.status === 'running'
+          ? 'running'
+          : step.status === 'error'
+            ? 'error'
+            : 'pending';
+      return {
+        id: step.id || step.name || `${step.icon || 'step'}-${Math.random().toString(36).slice(2)}`,
+        name: step.name || step.title || 'Step',
+        status,
+        description: step.description,
+        icon: step.icon
+      };
+    });
+  }, []);
+
+  const persistActiveJobs = useCallback((nextJobs?: Record<string, ActiveJob>) => {
+    const payload = Object.values(nextJobs || activeJobsRef.current);
+    try {
+      localStorage.setItem('active_jobs', JSON.stringify(payload));
+    } catch (error) {
+      console.error('Failed to persist active jobs:', error);
+    }
+  }, []);
+
+  const registerActiveJob = useCallback((job: ActiveJob) => {
+    const mergedJob: ActiveJob = {
+      workspaceId: workspaceId,
+      ...job
+    };
+    activeJobsRef.current[job.jobId] = mergedJob;
+    const ids = Object.keys(activeJobsRef.current);
+    setActiveJobIds(ids);
+    persistActiveJobs();
+    setIsProcessing(true);
+    setCurrentJobId(job.jobId);
+    localStorage.setItem('current_job_id', job.jobId);
+  }, [persistActiveJobs, workspaceId]);
+
+  const unregisterActiveJob = useCallback((jobId: string) => {
+    const stream = jobStreamsRef.current[jobId];
+    if (stream) {
+      stream.close();
+      delete jobStreamsRef.current[jobId];
+    }
+    delete activeJobsRef.current[jobId];
+    const ids = Object.keys(activeJobsRef.current);
+    setActiveJobIds(ids);
+    persistActiveJobs();
+    setIsProcessing(Object.values(activeJobsRef.current).some(job => job.workspaceId === workspaceId));
+  }, [persistActiveJobs, workspaceId]);
+
+  const syncProcessingState = useCallback(() => {
+    const activeInWorkspace = Object.values(activeJobsRef.current)
+      .some(job => job.workspaceId === workspaceId);
+    setIsProcessing(activeInWorkspace);
+  }, [workspaceId]);
+
+  const ensureAssistantVariantBase = useCallback((messageId: string, content: string) => {
+    if (!content.trim()) return;
+    setAssistantVariants(prev => {
+      if (prev[messageId] && prev[messageId].length > 0) {
+        return prev;
+      }
+      return { ...prev, [messageId]: [content] };
+    });
+    setAssistantVariantIndex(prev => {
+      if (prev[messageId] !== undefined) return prev;
+      return { ...prev, [messageId]: 0 };
+    });
+  }, []);
+
+  const appendAssistantVariant = useCallback((messageId: string, content: string) => {
+    const trimmed = content.trim();
+    if (!trimmed) return;
+    setAssistantVariants(prev => {
+      const existing = prev[messageId] || [];
+      const last = existing[existing.length - 1];
+      if (last === trimmed) {
+        return prev;
+      }
+      const next = [...existing, trimmed];
+      setAssistantVariantIndex(prevIndex => ({ ...prevIndex, [messageId]: next.length - 1 }));
+      return { ...prev, [messageId]: next };
+    });
+  }, []);
+
+  const deriveWorkspaceId = useCallback((rawPath: string) => {
+    if (!rawPath) return null;
+    const path = rawPath.replace(/\\/g, '/');
+    const match = path.match(/thesis_data\/([^/]+)\//);
+    return match ? match[1] : null;
+  }, []);
+
+  const normalizeWorkspacePath = useCallback((rawPath: string, wsId: string) => {
+    if (!rawPath) return rawPath;
+    const path = rawPath.replace(/\\/g, '/');
+    const markers = [
+      `/thesis_data/${wsId}/`,
+      `thesis_data/${wsId}/`,
+    ];
+    for (const marker of markers) {
+      const idx = path.indexOf(marker);
+      if (idx >= 0) {
+        return path.slice(idx + marker.length);
+      }
+    }
+    if (path.startsWith(`${wsId}/`)) {
+      return path.slice(wsId.length + 1);
+    }
+    return path;
+  }, []);
+
+  const pruneAssistantVariants = useCallback((allowedIds: Set<string>) => {
+    setAssistantVariants(prev => {
+      const next: Record<string, string[]> = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (allowedIds.has(key)) {
+          next[key] = value;
+        }
+      });
+      return next;
+    });
+    setAssistantVariantIndex(prev => {
+      const next: Record<string, number> = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (allowedIds.has(key)) {
+          next[key] = value;
+        }
+      });
+      return next;
+    });
+  }, []);
+
+  const startJobStream = useCallback((params: {
+    jobId: string;
+    streamSessionId: string;
+    responseMessageId?: string;
+    type?: 'thesis' | 'general';
+    resume?: boolean;
+  }) => {
+    const { jobId, streamSessionId, responseMessageId, type } = params;
+    if (!jobId) return;
+    if (jobStreamsRef.current[jobId]) return;
+
+    const resolvedMessageId = responseMessageId || `chat-${jobId}-response`;
+    registerActiveJob({
+      jobId,
+      sessionId: streamSessionId,
+      type: type || 'general',
+      responseMessageId: resolvedMessageId,
+      startedAt: Date.now(),
+      workspaceId: workspaceId
+    });
+
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+    const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${streamSessionId}&job_id=${jobId}`;
+    const eventSource = new EventSource(streamUrl);
+    jobStreamsRef.current[jobId] = eventSource;
+
+    const finalizeJob = (shouldPersist: boolean) => {
+      const targetMessageId = jobReplacementRef.current[jobId] || resolvedMessageId;
+      setChatMessages(prev => {
+        const updated = prev.map(msg =>
+          msg.id === targetMessageId ? { ...msg, isStreaming: false } : msg
+        );
+        if (shouldPersist) {
+          const finalMsg = updated.find(msg => msg.id === targetMessageId);
+          if (finalMsg && finalMsg.content) {
+            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+            fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${sessionId || 'default'}/messages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                role: 'assistant',
+                content: finalMsg.content,
+                job_id: jobId
+              })
+            }).catch(err => console.error('Failed to persist final streaming message:', err));
+          }
+        }
+        return updated;
+      });
+
+      if (jobReplacementRef.current[jobId]) {
+        const finalContent = latestAssistantContentRef.current[targetMessageId] || '';
+        if (finalContent) {
+          appendAssistantVariant(targetMessageId, finalContent);
+        }
+        delete jobReplacementRef.current[jobId];
+      }
+
+      setCurrentStatus('');
+      setCurrentStage('');
+      unregisterActiveJob(jobId);
+    };
+
+    eventSource.onopen = () => {
+      setCurrentStatus('✅ Connected - receiving updates...');
+    };
+
+    eventSource.addEventListener('connected', (e) => {
+      try {
+        const connData = JSON.parse(e.data);
+        if (connData.job_id === jobId) {
+          setCurrentStatus('✅ Connected to real-time stream');
+        }
+      } catch (err) {
+        console.error('Error parsing connected event:', err);
+      }
+    });
+
+    eventSource.addEventListener('log', (e) => {
+      try {
+        const eventData = JSON.parse(e.data);
+        const message = eventData.message || '';
+
+        setCurrentStatus(message);
+
+        const skipPatterns = [
+          /^progress$/i,
+          /^completed$/i,
+          /^\d+%/,
+          /^step \d/i,
+          /^processing/i,
+          /^working/i,
+          /^generating\.{0,3}$/i,
+        ];
+
+        const isSpam = skipPatterns.some(pattern => pattern.test(message.trim()));
+        if (isSpam || message.length < 10) {
+          return;
+        }
+
+        const isMilestone =
+          message.includes('✅') ||
+          message.includes('❌') ||
+          message.includes('📄') ||
+          message.includes('Chapter') ||
+          message.includes('generated') ||
+          message.includes('saved') ||
+          message.includes('created') ||
+          message.includes('Starting');
+
+        if (isMilestone) {
+          const logAction: AgentAction = {
+            id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+            type: 'log' as any,
+            timestamp: new Date(),
+            title: message.substring(0, 60) + (message.length > 60 ? '...' : ''),
+            content: message.length > 60 ? message : undefined,
+            status: 'completed'
+          };
+          setAgentActions(prev => [...prev, logAction]);
+        }
+      } catch (err) {
+        console.error('Error parsing log event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_activity', (e) => {
+      try {
+        const activityData = JSON.parse(e.data);
+        const agent = activityData.agent || 'agent';
+        const action = activityData.action || 'working';
+        const description = activityData.description || activityData.details || '';
+        const progress = activityData.progress || 0;
+        const agentName = activityData.agent_name || agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
+
+        setCurrentAgent(agent);
+        setCurrentAction(action);
+        setCurrentDescription(description);
+        setCurrentProgress(progress);
+
+        setStatusUpdates(prev => [...prev, {
+          timestamp: new Date(),
+          agent: agent,
+          action: action,
+          description: description,
+          status: 'running'
+        }].slice(-10));
+
+        const statusText = (activityData.status || 'running').toLowerCase();
+        const normalizedStatus = statusText.includes('error') || statusText.includes('failed')
+          ? 'error'
+          : statusText.includes('completed') || statusText.includes('done')
+            ? 'completed'
+            : 'running';
+
+        setAgentActions(prev => {
+          const last = prev[prev.length - 1];
+          if (
+            last &&
+            last.type === 'agent_activity' &&
+            last.metadata?.agent === agent &&
+            last.metadata?.action === action &&
+            last.content === description
+          ) {
+            return prev;
+          }
+          const activityAction: AgentAction = {
+            id: `activity-${jobId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            type: 'agent_activity',
+            timestamp: new Date(),
+            title: `${agentName} · ${action}`,
+            content: description || activityData.query || '',
+            metadata: { ...activityData, agent, action, agent_name: agentName },
+            status: normalizedStatus
+          };
+          return [...prev, activityAction];
+        });
+
+      } catch (err) {
+        console.error('Error parsing agent_activity event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_working', (e) => {
+      try {
+        const activityData = JSON.parse(e.data);
+        const agent = activityData.agent || 'agent';
+        const action = activityData.action || 'working';
+        const description = activityData.description || activityData.details || '';
+        const progress = activityData.progress || 0;
+        const agentName = activityData.agent_name || agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
+
+        setCurrentAgent(agent);
+        setCurrentAction(action);
+        setCurrentDescription(description);
+        setCurrentProgress(progress);
+
+        setStatusUpdates(prev => [...prev, {
+          timestamp: new Date(),
+          agent: agent,
+          action: action,
+          description: description,
+          status: 'running'
+        }].slice(-10));
+
+        const statusText = (activityData.status || 'running').toLowerCase();
+        const normalizedStatus = statusText.includes('error') || statusText.includes('failed')
+          ? 'error'
+          : statusText.includes('completed') || statusText.includes('done')
+            ? 'completed'
+            : 'running';
+
+        setAgentActions(prev => {
+          const last = prev[prev.length - 1];
+          if (
+            last &&
+            last.type === 'agent_activity' &&
+            last.metadata?.agent === agent &&
+            last.metadata?.action === action &&
+            last.content === description
+          ) {
+            return prev;
+          }
+          const activityAction: AgentAction = {
+            id: `activity-${jobId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            type: 'agent_activity',
+            timestamp: new Date(),
+            title: `${agentName} · ${action}`,
+            content: description || activityData.query || '',
+            metadata: { ...activityData, agent, action, agent_name: agentName },
+            status: normalizedStatus
+          };
+          return [...prev, activityAction];
+        });
+      } catch (err) {
+        console.error('Error parsing agent_working event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_stream', (e) => {
+      try {
+        const streamData = JSON.parse(e.data);
+        const tabId = streamData.tab_id;
+        const chunk = streamData.chunk || '';
+        const content = streamData.content || '';
+        const isCompleted = streamData.completed === true;
+
+        if (streamData.agent === 'planner' && Array.isArray(streamData.metadata?.steps)) {
+          setPlannerSteps(normalizePlannerSteps(streamData.metadata.steps));
+        }
+
+        setTabs(prev => {
+          const existingTab = prev.find(t => t.id === tabId);
+
+          if (existingTab) {
+            const updatedTabs = prev.map(tab => {
+              if (tab.id === tabId) {
+                return {
+                  ...tab,
+                  data: {
+                    ...tab.data,
+                    content: content || (tab.data?.content || '') + chunk,
+                    isStreaming: !isCompleted,
+                    agent: streamData.agent || 'agent',
+                    metadata: streamData.metadata || {}
+                  }
+                };
+              }
+              return tab;
+            });
+            return updatedTabs;
+          } else {
+            const agentName = streamData.agent || 'agent';
+            const agentTab: Tab = {
+              id: tabId,
+              type: 'agent',
+              title: `${agentName.charAt(0).toUpperCase() + agentName.slice(1)} Agent`,
+              data: {
+                content: content || chunk,
+                isStreaming: !isCompleted,
+                agent: agentName,
+                type: streamData.type || 'content',
+                metadata: streamData.metadata || {}
+              },
+              workspaceId: streamData.workspace_id || workspaceId,
+            };
+
+            setActiveTabId(tabId);
+            setIsRightPanelOpen(true);
+
+            return [...prev, agentTab];
+          }
+        });
+      } catch (err) {
+        console.error('Error parsing agent_stream event:', err);
+      }
+    });
+
+    eventSource.addEventListener('file_created', (e) => {
+      try {
+        const eventData = JSON.parse(e.data);
+        const fileAction: AgentAction = {
+          id: `job-${jobId}-file-${Date.now()}`,
+          type: 'file_write',
+          timestamp: new Date(),
+          title: `✅ File Created: ${eventData.path}`,
+          content: `File created: ${eventData.path}`,
+          metadata: { path: eventData.path, type: eventData.type },
+          status: 'completed',
+        };
+        setAgentActions(prev => [...prev, fileAction]);
+
+        const rawPath = eventData.full_path || eventData.path || '';
+        const wsId = eventData.workspace_id || deriveWorkspaceId(rawPath) || workspaceId;
+        const normalizedPath = normalizeWorkspacePath(rawPath, wsId);
+        const filename = eventData.filename || normalizedPath.split('/').pop() || normalizedPath;
+        const fileType = normalizedPath.includes('.') ? 'file' : 'folder';
+
+        const fileTab: Tab = {
+          id: `file-${normalizedPath}-${Date.now()}`,
+          type: 'file',
+          title: filename,
+          data: {
+            name: filename,
+            path: normalizedPath,
+            type: fileType,
+            workspaceId: wsId
+          },
+          workspaceId: wsId,
+        };
+
+        setTabs(prev => {
+          const exists = prev.find(t => t.data?.path === normalizedPath);
+          if (exists) {
+            setActiveTabId(exists.id);
+            return prev;
+          }
+          return [...prev, fileTab];
+        });
+        setActiveTabId(fileTab.id);
+        setIsRightPanelOpen(true);
+
+        window.dispatchEvent(new Event('workspace-refresh'));
+      } catch (err) {
+        console.error('Error parsing file_created event:', err);
+      }
+    });
+
+    eventSource.addEventListener('sources_updated', (e) => {
+      try {
+        const eventData = JSON.parse(e.data);
+        if (eventData?.count) {
+          setSourcesRefreshKey(prev => prev + 1);
+        }
+      } catch (err) {
+        console.error('Error parsing sources_updated event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_activity', (e) => {
+      try {
+        const activityData = JSON.parse(e.data);
+        const agent = activityData.agent || 'agent';
+        const action = activityData.action || 'working';
+        const query = activityData.query || '';
+        const status = activityData.status || 'running';
+
+        const normalizedAgent = agent.toLowerCase();
+        const agentType = (activityData.agent_type || '').toLowerCase();
+        const explicitAgents = new Set([
+          'search',
+          'research',
+          'researcher',
+          'image_search',
+          'image_generator',
+          'research_swarm',
+          'writer_swarm',
+          'quality_control',
+          'quality_swarm',
+          'chapter_generator',
+          'intro_writer',
+          'background_writer',
+          'problem_writer',
+          'scope_writer',
+          'justification_writer',
+          'objectives_writer',
+          'planner'
+        ]);
+        const agentPattern = /(writer|swarm|quality|research|search|chapter|dataset|tool|analysis|discussion|conclusion|methodology|literature|framework|empirical)/i;
+        const shouldOpenAgentTab = !['assistant', 'system'].includes(normalizedAgent)
+          && (explicitAgents.has(normalizedAgent)
+            || agentPattern.test(normalizedAgent)
+            || ['understanding', 'research', 'action', 'verification'].includes(agentType));
+        const agentActivityStatusText = (status || '').toLowerCase();
+        const isAgentActivityCompleted = agentActivityStatusText.includes('completed') || agentActivityStatusText.includes('done') || agentActivityStatusText.includes('success');
+        const agentActivityAutoCloseAgents = new Set([
+          'research_swarm',
+          'writer_swarm',
+          'quality_swarm',
+          'quality_control',
+          'analysis_swarm',
+          'discussion_swarm',
+          'conclusion_swarm'
+        ]);
+        const agentActivityAutoClosePattern = /(writer|swarm|quality|research|analysis|discussion|conclusion|methodology|literature|framework|empirical|dataset|tool)/i;
+        const shouldAutoCloseAgentActivity = isAgentActivityCompleted && (agentActivityAutoCloseAgents.has(normalizedAgent) || agentActivityAutoClosePattern.test(normalizedAgent));
+
+        if (shouldOpenAgentTab) {
+          const tabId = `${agent}-${jobId}`;
+          const icon = activityData.icon || '🤖';
+          const agentName = activityData.agent_name || agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
+
+          setTabs(prev => {
+            const existingTab = prev.find(t => t.id === tabId);
+
+            if (existingTab) {
+              if (status === 'running') {
+                setActiveTabId(tabId);
+                setIsRightPanelOpen(true);
+              }
+              return prev.map(tab => {
+                if (tab.id === tabId) {
+                  return {
+                    ...tab,
+                    title: `${icon} ${agentName}`,
+                    data: {
+                      ...tab.data,
+                      query: query,
+                      action: action,
+                      status: status,
+                      results: activityData.results || tab.data?.results,
+                      content: activityData.content || tab.data?.content || '',
+                      isStreaming: status === 'running'
+                    }
+                  };
+                }
+                return tab;
+              });
+            } else {
+              const agentTab: Tab = {
+                id: tabId,
+                type: 'agent',
+                title: `${icon} ${agentName}`,
+                data: {
+                  agent: agent,
+                  query: query,
+                  action: action,
+                  status: status,
+                  results: activityData.results,
+                  content: activityData.content || '',
+                  isStreaming: status === 'running',
+                  type: agent.includes('search') ? 'search' : 'activity',
+                  metadata: activityData
+                },
+                workspaceId: workspaceId,
+              };
+
+              if (agent === 'chapter_generator' || agent === 'research_swarm' || agent === 'writer_swarm' || agent === 'research') {
+                setActiveTabId(tabId);
+                setIsRightPanelOpen(true);
+
+                if (/(search|research|internet_search)/i.test(agent)) {
+                  window.dispatchEvent(new CustomEvent('open-browser-tab', {
+                    detail: {
+                      title: `🌐 ${agentName}`,
+                      sessionId: sessionId || 'default',
+                      workspaceId: workspaceId
+                    }
+                  }));
+                }
+              }
+
+              return [...prev, agentTab];
+            }
+          });
+
+          if (shouldAutoCloseAgentActivity) {
+            scheduleAutoCloseTab(tabId);
+          }
+        }
+
+        setCurrentStage(agent);
+        setCurrentStatus(`${agent} ${action}: ${query || ''}`);
+      } catch (err) {
+        console.error('Error parsing agent_activity event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_working', (e) => {
+      try {
+        const activityData = JSON.parse(e.data);
+        const agent = activityData.agent || 'agent';
+        const action = activityData.action || 'working';
+        const query = activityData.query || '';
+        const status = activityData.status || 'running';
+
+        const normalizedAgent = agent.toLowerCase();
+        const agentType = (activityData.agent_type || '').toLowerCase();
+        const explicitAgents = new Set([
+          'search',
+          'research',
+          'researcher',
+          'image_search',
+          'image_generator',
+          'research_swarm',
+          'writer_swarm',
+          'quality_control',
+          'quality_swarm',
+          'chapter_generator',
+          'intro_writer',
+          'background_writer',
+          'problem_writer',
+          'scope_writer',
+          'justification_writer',
+          'objectives_writer',
+          'planner'
+        ]);
+        const agentPattern = /(writer|swarm|quality|research|search|chapter|dataset|tool|analysis|discussion|conclusion|methodology|literature|framework|empirical)/i;
+        const shouldOpenAgentTab = !['assistant', 'system'].includes(normalizedAgent)
+          && (explicitAgents.has(normalizedAgent)
+            || agentPattern.test(normalizedAgent)
+            || ['understanding', 'research', 'action', 'verification'].includes(agentType));
+        const agentWorkingStatusText = (status || '').toLowerCase();
+        const isAgentWorkingCompleted = agentWorkingStatusText.includes('completed') || agentWorkingStatusText.includes('done') || agentWorkingStatusText.includes('success');
+        const agentWorkingAutoCloseAgents = new Set([
+          'research_swarm',
+          'writer_swarm',
+          'quality_swarm',
+          'quality_control',
+          'analysis_swarm',
+          'discussion_swarm',
+          'conclusion_swarm'
+        ]);
+        const agentWorkingAutoClosePattern = /(writer|swarm|quality|research|analysis|discussion|conclusion|methodology|literature|framework|empirical|dataset|tool)/i;
+        const shouldAutoCloseAgentWorking = isAgentWorkingCompleted && (agentWorkingAutoCloseAgents.has(normalizedAgent) || agentWorkingAutoClosePattern.test(normalizedAgent));
+
+        if (shouldOpenAgentTab) {
+          const tabId = `${agent}-${jobId}`;
+          const icon = activityData.icon || '🤖';
+          const agentName = activityData.agent_name || agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
+
+          setTabs(prev => {
+            const existingTab = prev.find(t => t.id === tabId);
+
+            if (existingTab) {
+              if (status === 'running') {
+                setActiveTabId(tabId);
+                setIsRightPanelOpen(true);
+              }
+              return prev.map(tab => {
+                if (tab.id === tabId) {
+                  return {
+                    ...tab,
+                    title: `${icon} ${agentName}`,
+                    data: {
+                      ...tab.data,
+                      query: query,
+                      action: action,
+                      status: status,
+                      results: activityData.results || tab.data?.results,
+                      content: activityData.content || tab.data?.content || '',
+                      isStreaming: status === 'running'
+                    }
+                  };
+                }
+                return tab;
+              });
+            } else {
+              const agentTab: Tab = {
+                id: tabId,
+                type: 'agent',
+                title: `${icon} ${agentName}`,
+                data: {
+                  agent: agent,
+                  query: query,
+                  action: action,
+                  status: status,
+                  results: activityData.results,
+                  content: activityData.content || '',
+                  isStreaming: status === 'running',
+                  type: agent.includes('search') ? 'search' : 'activity',
+                  metadata: activityData
+                },
+                workspaceId: workspaceId,
+              };
+
+              if (agent === 'chapter_generator' || agent === 'research_swarm' || agent === 'writer_swarm' || agent === 'research') {
+                setActiveTabId(tabId);
+                setIsRightPanelOpen(true);
+
+                if (/(search|research|internet_search)/i.test(agent)) {
+                  window.dispatchEvent(new CustomEvent('open-browser-tab', {
+                    detail: {
+                      title: `🌐 ${agentName}`,
+                      sessionId: sessionId || 'default',
+                      workspaceId: workspaceId
+                    }
+                  }));
+                }
+              }
+
+              return [...prev, agentTab];
+            }
+          });
+
+          if (shouldAutoCloseAgentWorking) {
+            scheduleAutoCloseTab(tabId);
+          }
+        }
+
+        setCurrentStage(agent);
+        setCurrentStatus(`${agent} ${action}: ${query || ''}`);
+      } catch (err) {
+        console.error('Error parsing agent_working event:', err);
+      }
+    });
+
+    eventSource.addEventListener('tool_started', (e) => {
+      try {
+        const toolData = JSON.parse(e.data);
+        setCurrentStage(toolData.tool || '');
+        setCurrentStatus(`Executing ${toolData.tool} (step ${toolData.step}/${toolData.total})...`);
+        const toolName = toolData.tool || 'tool';
+        const toolAction: AgentAction = {
+          id: `tool-${jobId}-${toolName}-${toolData.step || Date.now()}`,
+          type: 'tool_call',
+          timestamp: new Date(),
+          title: `🧰 ${toolName}`,
+          content: toolData.message || (toolData.step ? `Step ${toolData.step}/${toolData.total || '?'}` : ''),
+          metadata: toolData,
+          status: 'running'
+        };
+        setAgentActions(prev => [...prev, toolAction]);
+      } catch (err) {
+        console.error('Error parsing tool_started event:', err);
+      }
+    });
+
+    eventSource.addEventListener('tool_completed', (e) => {
+      try {
+        const toolData = JSON.parse(e.data);
+        setCurrentStatus(`✓ ${toolData.tool} completed`);
+        const toolName = toolData.tool || 'tool';
+        setAgentActions(prev => {
+          const index = [...prev].reverse().findIndex(action =>
+            action.type === 'tool_call' &&
+            action.metadata?.tool === toolName &&
+            action.status === 'running'
+          );
+          if (index < 0) return prev;
+          const targetIndex = prev.length - 1 - index;
+          const updated = [...prev];
+          updated[targetIndex] = {
+            ...updated[targetIndex],
+            status: 'completed',
+            content: toolData.message || updated[targetIndex].content,
+            metadata: { ...updated[targetIndex].metadata, ...toolData }
+          };
+          return updated;
+        });
+      } catch (err) {
+        console.error('Error parsing tool_completed event:', err);
+      }
+    });
+
+    eventSource.addEventListener('agent_working', (e) => {
+      try {
+        const agentData = JSON.parse(e.data);
+        const { agent, agent_name, status, action, icon } = agentData;
+
+        setActiveAgents(prev => {
+          const existing = prev.find(a => a.agent === agent);
+          if (existing) {
+            return prev.map(a => a.agent === agent
+              ? { ...a, status, action, icon }
+              : a
+            );
+          } else {
+            return [...prev, { agent, agent_name, status, action, icon }];
+          }
+        });
+
+        if (status === 'running') {
+          const tabId = `${agent}-${jobId}`;
+          setActiveTabId(tabId);
+          setIsRightPanelOpen(true);
+        }
+
+        if (agent) {
+          const activityTitle = `${agent_name || agent} · ${action || 'working'}`;
+          setAgentActions(prev => {
+            const last = prev[prev.length - 1];
+            if (last && last.type === 'agent_activity' && last.title === activityTitle && last.status === status) {
+              return prev;
+            }
+            const activityAction: AgentAction = {
+              id: `agent-working-${jobId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              type: 'agent_activity',
+              timestamp: new Date(),
+              title: activityTitle,
+              content: agentData.details || agentData.description || '',
+              metadata: agentData,
+              status: status === 'completed' ? 'completed' : status === 'error' ? 'error' : 'running'
+            };
+            return [...prev, activityAction];
+          });
+        }
+      } catch (err) {
+        console.error('Error parsing agent_working event:', err);
+      }
+    });
+
+    eventSource.addEventListener('step_started', (e) => {
+      try {
+        const stepData = JSON.parse(e.data);
+        const stepId = `step-${stepData.step || stepData.name || 'unknown'}`;
+        const label = stepData.name || `Step ${stepData.step || ''}`.trim();
+        setProgressSteps(prev => {
+          const existingIndex = prev.findIndex(step => step.id === stepId);
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = { ...updated[existingIndex], label, name: label, status: 'running' };
+            return updated;
+          }
+          return [...prev, { id: stepId, label, name: label, status: 'running', timestamp: new Date() }];
+        });
+        setCurrentStatus(label);
+      } catch (err) {
+        console.error('Error parsing step_started event:', err);
+      }
+    });
+
+    eventSource.addEventListener('step_completed', (e) => {
+      try {
+        const stepData = JSON.parse(e.data);
+        const stepId = `step-${stepData.step || stepData.name || 'unknown'}`;
+        const label = stepData.name || `Step ${stepData.step || ''}`.trim();
+        setProgressSteps(prev => {
+          const existingIndex = prev.findIndex(step => step.id === stepId);
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = { ...updated[existingIndex], label, name: label, status: 'completed' };
+            return updated;
+          }
+          return [...prev, { id: stepId, label, name: label, status: 'completed', timestamp: new Date() }];
+        });
+      } catch (err) {
+        console.error('Error parsing step_completed event:', err);
+      }
+    });
+
+    eventSource.addEventListener('stage_started', (e) => {
+      try {
+        const stageData = JSON.parse(e.data);
+        setCurrentStage(stageData.stage || '');
+        setCurrentStatus(stageData.message || `Starting ${stageData.stage}...`);
+
+        if (stageData.stage === 'web_search' || stageData.stage === 'browse' || stageData.stage === 'browser') {
+          window.dispatchEvent(new CustomEvent('open-browser-tab', {
+            detail: {
+              title: stageData.message || '🌐 Live Browser',
+              sessionId: sessionId || 'default',
+              workspaceId: workspaceId
+            }
+          }));
+        }
+
+        const label = stageData.message || `Starting ${stageData.stage}...`;
+        const newStep = {
+          id: `stage-${stageData.stage}-${Date.now()}`,
+          label,
+          name: label,
+          status: 'running' as const,
+          timestamp: new Date()
+        };
+        setProgressSteps(prev => [...prev, newStep]);
+      } catch (err) {
+        console.error('Error parsing stage_started event:', err);
+      }
+    });
+
+    eventSource.addEventListener('reasoning_chunk', (e) => {
+      try {
+        const chunkData = JSON.parse(e.data);
+        const accumulated = chunkData.accumulated || '';
+
+        setAgentActions(prev => {
+          const existingIndex = prev.findIndex(
+            action => action.type === 'thinking' && action.id?.startsWith(`job-${jobId}-reasoning`)
+          );
+
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = {
+              ...updated[existingIndex],
+              content: accumulated,
+              isStreaming: true,
+              status: 'running'
+            };
+            return updated;
+          } else {
+            const reasoningAction: AgentAction = {
+              id: `job-${jobId}-reasoning-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              type: 'thinking',
+              timestamp: new Date(),
+              title: '',
+              content: accumulated,
+              metadata: {},
+              status: 'running',
+              isStreaming: true
+            };
+            return [...prev, reasoningAction];
+          }
+        });
+      } catch (err) {
+        console.error('Error parsing reasoning_chunk event:', err);
+      }
+    });
+
+    eventSource.addEventListener('response_chunk', (e) => {
+      try {
+        const chunkData = JSON.parse(e.data);
+        const accumulated = chunkData.accumulated || '';
+        const targetMessageId = jobReplacementRef.current[jobId] || resolvedMessageId;
+        latestAssistantContentRef.current[targetMessageId] = accumulated;
+
+        setChatMessages(prev => {
+          const existingIndex = prev.findIndex(
+            msg => msg.id === targetMessageId
+          );
+
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = {
+              ...updated[existingIndex],
+              content: accumulated,
+              isStreaming: true,
+              agent: 'assistant',
+              metadata: {
+                ...updated[existingIndex].metadata,
+                progress: currentProgress
+              }
+            };
+            return updated;
+          } else {
+            const chatMessage: ChatMessage = {
+              id: targetMessageId,
+              type: 'assistant',
+              content: accumulated,
+              timestamp: new Date(),
+              isStreaming: true,
+              agent: 'assistant',
+              metadata: {
+                progress: currentProgress
+              }
+            };
+            return [...prev, chatMessage];
+          }
+        });
+
+        setAgentActions(prev => {
+          const existingIndex = prev.findIndex(
+            action => action.type === 'stream' && action.id.startsWith(`job-${jobId}-response`)
+          );
+
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            if (accumulated.length >= (updated[existingIndex].content?.length || 0)) {
+              updated[existingIndex] = {
+                ...updated[existingIndex],
+                content: accumulated,
+                isStreaming: true,
+                status: 'running'
+              };
+            }
+            return updated;
+          } else {
+            const streamAction: AgentAction = {
+              id: `job-${jobId}-response-main`,
+              type: 'stream',
+              timestamp: new Date(),
+              title: '✨ Response',
+              content: accumulated,
+              metadata: {},
+              status: 'running',
+              isStreaming: true
+            };
+            return [...prev, streamAction];
+          }
+        });
+      } catch (err) {
+        console.error('Error parsing response_chunk event:', err);
+      }
+    });
+
+    eventSource.addEventListener('content', (e: any) => {
+      try {
+        const contentData = JSON.parse(e.data);
+        const chunk = contentData.text || contentData.chunk || '';
+        const targetMessageId = jobReplacementRef.current[jobId] || resolvedMessageId;
+
+        setChatMessages(prev => {
+          const existingIndex = prev.findIndex(msg => msg.id === targetMessageId);
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = {
+              ...updated[existingIndex],
+              content: (updated[existingIndex].content || '') + chunk,
+              isStreaming: true
+            };
+            return updated;
+          }
+          return [...prev, {
+            id: targetMessageId,
+            type: 'assistant',
+            content: chunk,
+            timestamp: new Date(),
+            isStreaming: true,
+            agent: 'assistant'
+          }];
+        });
+      } catch (err) {
+        console.error('Error parsing content event:', err);
+      }
+    });
+
+    eventSource.addEventListener('stage_completed', (e) => {
+
+    eventSource.addEventListener('archived_response', (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload && payload.path) {
+          const fileName = payload.path.split('/').pop() || 'response.md';
+          addLog(`📝 Saved Markdown: ${fileName} (${payload.path})`);
+          openTab('file', fileName, { name: fileName, path: payload.path, type: 'markdown' }, workspaceId);
+        }
+      } catch (err) {
+        console.error('Failed to handle archived response event', err);
+      }
+    });
+      try {
+        const stageData = JSON.parse(e.data);
+        const stage = stageData.stage || '';
+
+        setProgressSteps(prev => prev.map(step =>
+          step.id.includes(`stage-${stage}`) ? { ...step, status: 'completed' } : step
+        ));
+
+        if (stage === 'complete') {
+          finalizeJob(true);
+        }
+      } catch (err) {
+        console.error('Error parsing stage_completed event:', err);
+      }
+    });
+
+    eventSource.addEventListener('done', () => {
+      finalizeJob(true);
+    });
+
+    eventSource.onerror = (error) => {
+      console.error('SSE stream error for job:', jobId, error);
+      if (eventSource.readyState === EventSource.CLOSED) {
+        console.error('SSE stream closed permanently for job:', jobId);
+        setCurrentStatus('❌ Stream connection lost');
+      }
+    };
+  }, [
+    appendAssistantVariant,
+    normalizePlannerSteps,
+    registerActiveJob,
+    sessionId,
+    unregisterActiveJob,
+    workspaceId,
+    currentProgress
+  ]);
+
   // Store interval ref for cleanup
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const jobStreamsRef = useRef<Record<string, EventSource>>({});
+  const activeJobsRef = useRef<Record<string, ActiveJob>>({});
+  const [activeJobIds, setActiveJobIds] = useState<string[]>([]);
 
   // Load chat messages from localStorage on mount
   useEffect(() => {
     try {
+      setAssistantVariants({});
+      setAssistantVariantIndex({});
       const saved = localStorage.getItem(`chat-messages-${workspaceId}`);
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -247,6 +1402,30 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
       }
     }
   }, [chatMessages, workspaceId]);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('active_jobs');
+      if (!saved) return;
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return;
+      parsed
+        .filter((job: ActiveJob) => job && job.jobId && (!job.workspaceId || job.workspaceId === workspaceId))
+        .forEach((job: ActiveJob) => {
+          const streamSessionId = job.sessionId || sessionId || 'new';
+          const responseMessageId = job.responseMessageId || `chat-${job.jobId}-response`;
+          startJobStream({
+            jobId: job.jobId,
+            streamSessionId,
+            responseMessageId,
+            type: job.type || 'general',
+            resume: true
+          });
+        });
+    } catch (error) {
+      console.error('Failed to restore active jobs:', error);
+    }
+  }, [workspaceId, sessionId, startJobStream]);
 
   // Cleanup interval on unmount
   useEffect(() => {
@@ -314,6 +1493,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const handleOpenBrowserTab = useCallback((e: Event) => {
     const detail = (e as CustomEvent).detail || {};
 
+    const derivedWorkspaceId = detail.workspaceId || workspaceId || (detail.sessionId ? `ws_${detail.sessionId.substring(0, 12)}` : 'default');
     const browserTab: Tab = {
       id: `browser-${Date.now()}`,
       type: 'browser',
@@ -322,7 +1502,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
         sessionId: detail.sessionId || 'default',
         url: detail.url || ''
       },
-      workspaceId: workspaceId
+      workspaceId: derivedWorkspaceId
     };
 
     setTabs(prev => {
@@ -440,7 +1620,7 @@ Objectives:
           isStreaming: false
         };
         setChatMessages(prev => [...prev, assistantResponse]);
-        setIsProcessing(false);
+        syncProcessingState();
         return;
       }
 
@@ -453,13 +1633,41 @@ Objectives:
       const title = titleMatch ? titleMatch[1].trim() : 'Research Thesis';
       const topic = topicMatch ? topicMatch[1].trim() : userInput;
 
+      const parseObjectiveLines = (text: string) => text
+        .split(/\n/)
+        .map(obj => obj.replace(/^\s*\d+\.\s*/, '').replace(/^\s*[-•]\s*/, '').trim())
+        .filter(obj => obj.length > 5);
+
+      const paramObjectives: string[] = [];
+      const generalObjective = parameters?.generalObjective?.trim();
+      if (generalObjective) {
+        const normalized = generalObjective.toLowerCase().startsWith('general objective')
+          ? generalObjective
+          : `General Objective: ${generalObjective}`;
+        paramObjectives.push(normalized);
+      }
+      const specificObjectivesText = parameters?.specificObjectivesText?.trim();
+      if (specificObjectivesText) {
+        paramObjectives.push(...parseObjectiveLines(specificObjectivesText));
+      }
+
       // Parse objectives - handle numbered lists (1. 2. 3.) and bullet points
       const objectives = objectivesMatch
-        ? objectivesMatch[1]
-          .split(/\n/)
-          .map(obj => obj.replace(/^\s*\d+\.\s*/, '').replace(/^\s*[-•]\s*/, '').trim())
-          .filter(obj => obj.length > 5) // Filter out empty or very short lines
+        ? parseObjectiveLines(objectivesMatch[1])
         : []; // Empty array means backend will auto-generate 6 objectives
+
+      const sampleSizeMatch = userInput.match(/\b(n|sample[ _]size)\s*[:=]\s*(\d+)/i);
+      const mergedParameters = parameters ? { ...parameters } : undefined;
+      if (mergedParameters?.studyType) {
+        const studyNote = `Study Type: ${mergedParameters.studyType}`;
+        mergedParameters.customInstructions = mergedParameters.customInstructions
+          ? `${mergedParameters.customInstructions}\n${studyNote}`
+          : studyNote;
+      }
+
+      const sampleSize = mergedParameters?.sampleSize
+        || (sampleSizeMatch ? parseInt(sampleSizeMatch[2], 10) : undefined)
+        || 385;
 
       // Call thesis generation API
       const thesisResponse = await fetch(`${backendUrl}/api/thesis/generate`, {
@@ -471,9 +1679,11 @@ Objectives:
           university_type: universityType,
           title: title,
           topic: topic,
-          objectives: objectives.length > 0 ? objectives : [topic],
+          objectives: paramObjectives.length > 0
+            ? paramObjectives
+            : (objectives.length > 0 ? objectives : [topic]),
           workspace_id: workspaceId,
-          parameters: parameters
+          parameters: mergedParameters
         }),
       });
 
@@ -504,7 +1714,7 @@ Objectives:
 | 2 | Chapter 2: Literature Review (General + Empirical) | ⏳ Pending |
 | 3 | Chapter 3: Methodology (8 Sections) | ⏳ Pending |
 | 4 | Study Tools (Questionnaire, Interview Guide) | ⏳ Pending |
-| 5 | Synthetic Dataset (Hypothetical Data) | ⏳ Pending |
+| 5 | Synthetic Dataset (n=${sampleSize}) | ⏳ Pending |
 | 6 | Chapter 4: Data Analysis (Tables & Figures) | ⏳ Pending |
 | 7 | Chapter 5: Discussion, Conclusion & Recommendations | ⏳ Pending |`;
         } else {
@@ -516,7 +1726,7 @@ Objectives:
 | 2 | Chapter 2: Literature Review (50+ sources) | ⏳ Pending |
 | 3 | Chapter 3: Methodology | ⏳ Pending |
 | 4 | Study Tools (Questionnaire, Interview Guide) | ⏳ Pending |
-| 5 | Synthetic Dataset (385 respondents) | ⏳ Pending |
+| 5 | Synthetic Dataset (n=${sampleSize}) | ⏳ Pending |
 | 6 | Chapter 4: Data Analysis | ⏳ Pending |
 | 7 | Chapter 5: Discussion | ⏳ Pending |
 | 8 | Chapter 6: Conclusion & Recommendations | ⏳ Pending |`;
@@ -562,159 +1772,8 @@ ${pipelineTable}
         // The popup now handles its own SSE connection
         // We can still keep a lightweight listener here for chat updates
 
-        // Subscribe to SSE for progress updates - using Redis-based endpoint
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-        const sessionForStream = sessionId || 'new';
-        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${sessionForStream}&job_id=${thesisData.job_id}`;
-        const eventSource = new EventSource(streamUrl);
-
-        eventSource.onopen = () => {
-          // console.log('✅ SSE connection opened for thesis generation');
-        };
-
-        let accumulatedContent = '';
-
-        // Helper function to handle incoming events
-        const handleEvent = (eventType: string, data: any) => {
-          // console.log(`📥 SSE event [${eventType}]:`, data);
-
-          if (eventType === 'response_chunk' && data?.chunk) {
-            accumulatedContent += data.chunk;
-            setLiveResponse(accumulatedContent);
-
-            // Update the streaming message with accumulated content
-            setChatMessages(prev => prev.map(msg =>
-              msg.id === statusMessage.id
-                ? { ...msg, content: accumulatedContent }
-                : msg
-            ));
-          }
-
-          if (eventType === 'log' && data?.message) {
-            setCurrentStatus(data.message);
-            // Also add log messages to the chat as progress updates
-            // console.log('📋 Status:', data.message);
-          }
-
-          if (eventType === 'agent_activity' || eventType === 'agent_working') {
-            setCurrentAgent(data.agent_name || data.agent || '');
-            setCurrentAction(data.action || '');
-          }
-
-          if (eventType === 'figure_generated' && data?.message) {
-            setCurrentStatus(`📈 ${data.message}`);
-          }
-
-          if (eventType === 'file_created' && data?.path) {
-            // Dispatch event to refresh file explorer
-            window.dispatchEvent(new CustomEvent('workspace-refresh'));
-
-            // File was created - add completion message
-            const completionMessage: ChatMessage = {
-              id: `assistant-complete-${Date.now()}`,
-              type: 'assistant',
-              content: `✅ **Thesis File Created!**
-
-📄 **File:** \`${data.filename}\`
-📁 **Path:** ${data.path}
-
-The thesis has been saved and is ready for download!`,
-              timestamp: new Date(),
-              isStreaming: false
-            };
-            setChatMessages(prev => [...prev, completionMessage]);
-          }
-
-          if (eventType === 'stage_completed') {
-            if (data?.status === 'success') {
-              window.dispatchEvent(new CustomEvent('workspace-refresh'));
-              eventSource.close();
-              setIsProcessing(false);
-              setStreamingMessageId(null);
-              setCurrentJobId(null);
-              setCurrentStatus('✅ Thesis generated successfully!');
-
-              // Mark the streaming message as complete
-              setChatMessages(prev => prev.map(msg =>
-                msg.id === statusMessage.id
-                  ? { ...msg, isStreaming: false }
-                  : msg
-              ));
-            } else if (data?.status === 'error') {
-              eventSource.close();
-              setIsProcessing(false);
-              setStreamingMessageId(null);
-              setCurrentJobId(null);
-              setCurrentStatus('❌ Thesis generation failed');
-            }
-          }
-        };
-
-        // Listen for named events (SSE sends event: type)
-        eventSource.addEventListener('connected', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          // console.log('🔗 SSE connected:', data);
-        });
-
-        eventSource.addEventListener('response_chunk', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('response_chunk', data);
-        });
-
-        eventSource.addEventListener('log', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('log', data);
-        });
-
-        eventSource.addEventListener('agent_activity', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('agent_activity', data);
-        });
-
-        eventSource.addEventListener('agent_working', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('agent_activity', data);
-        });
-
-        eventSource.addEventListener('file_created', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('file_created', data);
-        });
-
-        eventSource.addEventListener('stage_completed', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          handleEvent('stage_completed', data);
-        });
-
-        eventSource.addEventListener('stage_started', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          // console.log('🚀 Stage started:', data);
-        });
-
-        eventSource.addEventListener('progress', (e) => {
-          const data = JSON.parse((e as MessageEvent).data);
-          // console.log('📊 Progress:', data);
-          if (data.percentage) {
-            setCurrentStatus(`Progress: ${data.percentage}% - ${data.current_section || ''}`);
-          }
-        });
-
-        // Fallback for unnamed events
-        eventSource.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type) {
-              handleEvent(data.type, data.data || data);
-            }
-          } catch (e) {
-            console.error('Error parsing SSE message:', e);
-          }
-        };
-
-        eventSource.onerror = (error) => {
-          console.error('SSE error:', error);
-          // Don't close immediately - might be temporary
-        };
+        const streamSessionId = sessionId || 'new';
+        startJobStream({ jobId: thesisData.job_id, streamSessionId, responseMessageId: statusMessage.id, type: 'thesis' });
 
         return; // Don't show the fake success message
       }
@@ -736,7 +1795,7 @@ ${thesisData.message || 'Your thesis document has been created.'}`,
       setChatMessages(prev => [...prev, successMessage]);
 
       setCurrentStatus('✅ Thesis generated successfully!');
-      setIsProcessing(false);
+      syncProcessingState();
     } catch (error) {
       console.error('Thesis generation error:', error);
       const errorMessage: ChatMessage = {
@@ -758,42 +1817,50 @@ Objectives:
       };
       setChatMessages(prev => [...prev, errorMessage]);
       setCurrentStatus('Error: Thesis generation failed');
-      setIsProcessing(false);
+      syncProcessingState();
     }
   };
 
-  // Handle PDF file uploads
+  // Handle PDF + dataset uploads
   const handleFileUpload = async (files: File[]) => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
       const pdfFiles = files.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+      const datasetExtensions = ['.csv', '.tsv', '.xlsx', '.xls', '.sav', '.dta', '.json'];
+      const datasetFiles = files.filter(file =>
+        datasetExtensions.some(ext => file.name.toLowerCase().endsWith(ext))
+      );
 
-      if (pdfFiles.length === 0) {
-        console.warn('No PDF files selected');
+      if (pdfFiles.length === 0 && datasetFiles.length === 0) {
+        console.warn('No supported files selected');
         return;
       }
 
       // 1. Create a persistent progress message
       const progressId = `upload-progress-${Date.now()}`;
+      const totalUploads = pdfFiles.length + datasetFiles.length;
       setChatMessages(prev => [...prev, {
         id: progressId,
         role: 'assistant',
-        content: `🚀 Starting upload of ${pdfFiles.length} PDF(s)...`,
+        content: `🚀 Starting upload of ${totalUploads} file(s)...`,
         timestamp: new Date(),
         type: 'assistant',
       }]);
 
       const allResults = [];
+      const datasetResults: Array<{ filename: string }> = [];
       const failed = [];
 
       // 2. Upload files one by one to show progress
+      let uploadedCount = 0;
       for (let i = 0; i < pdfFiles.length; i++) {
         const file = pdfFiles[i];
+        uploadedCount += 1;
 
         // Update progress message
         setChatMessages(prev => prev.map(msg =>
           msg.id === progressId
-            ? { ...msg, content: `⏳ Uploading file ${i + 1} of ${pdfFiles.length}:\n**${file.name}**...` }
+            ? { ...msg, content: `⏳ Uploading file ${uploadedCount} of ${totalUploads}:\n**${file.name}**...` }
             : msg
         ));
 
@@ -820,18 +1887,55 @@ Objectives:
         }
       }
 
+      for (let i = 0; i < datasetFiles.length; i++) {
+        const file = datasetFiles[i];
+        uploadedCount += 1;
+
+        setChatMessages(prev => prev.map(msg =>
+          msg.id === progressId
+            ? { ...msg, content: `⏳ Uploading file ${uploadedCount} of ${totalUploads}:\n**${file.name}**...` }
+            : msg
+        ));
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('description', '');
+
+        try {
+          const response = await fetch(`${backendUrl}/api/workspace/${workspaceId}/register-dataset`, {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!response.ok) throw new Error(response.statusText);
+
+          const result = await response.json();
+          if (result.dataset) {
+            datasetResults.push({ filename: result.dataset.filename || file.name });
+          }
+        } catch (err) {
+          failed.push({ filename: file.name, error: String(err) });
+        }
+      }
+
       // 3. Remove progress message (or update it to completion)
       setChatMessages(prev => prev.filter(msg => msg.id !== progressId));
 
       // 4. Show final summary
       const successCount = allResults.length;
+      const datasetCount = datasetResults.length;
       const failCount = failed.length;
 
-      let summary = `✅ **Upload Complete**\nSuccessfully added ${successCount} source(s).`;
+      let summary = `✅ **Upload Complete**\nSuccessfully added ${successCount} source(s) and ${datasetCount} dataset(s).`;
 
       if (allResults.length > 0) {
         summary += `\n\n**📚 Added Sources:**\n` +
           allResults.map((r: any) => `• [${r.original_filename || r.filename}] ${r.title}`).join('\n');
+      }
+
+      if (datasetResults.length > 0) {
+        summary += `\n\n**📊 Registered Datasets:**\n` +
+          datasetResults.map((d) => `• ${d.filename}`).join('\n');
       }
 
       if (failCount > 0) {
@@ -882,8 +1986,133 @@ Objectives:
     }
   };
 
-  const handleChatStart = async (message?: string, mentionedAgents?: string[], parameters?: ThesisParameters) => {
+  const shouldUseAgentMode = useCallback((message: string): boolean => {
+    const normalized = message.trim().toLowerCase();
+    if (normalized.length > 180) {
+      return true;
+    }
+    const keywords = [
+      '/thesis',
+      '/general',
+      '/rag',
+      '/agent',
+      'generate chapter',
+      'write chapter',
+      'analysis',
+      'analyze',
+      'dataset',
+      'xls',
+      'csv',
+      'pdf',
+      'research',
+      'methodology',
+      'plot',
+      'objective',
+      'findings',
+      'conclude',
+      'recommendation',
+      'experiment',
+      'survey'
+    ];
+    return keywords.some(keyword => normalized.includes(keyword));
+  }, []);
+
+  const streamAgentTask = useCallback(async (message: string) => {
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+    const agentMessageId = `agent-${Date.now()}`;
+    const streamingMessage: ChatMessage = {
+      id: agentMessageId,
+      type: 'assistant',
+      content: '🤖 Agent thinking...',
+      timestamp: new Date(),
+      isStreaming: true,
+      agent: 'autonomous-agent'
+    };
+    setIsProcessing(true);
+    setCurrentStatus('📡 Agent planning...');
+    setChatMessages(prev => [...prev, streamingMessage]);
+
+    try {
+      const response = await fetch(`${backendUrl}/api/agent/solve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: message.trim(),
+          workspace_id: workspaceId
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Agent error: ${response.statusText}`);
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+
+        for (const event of events) {
+          if (!event.startsWith('data:')) continue;
+          try {
+            const payload = JSON.parse(event.replace(/^data:\s*/, ''));
+            if (payload.type === 'complete') {
+              const resultText = payload.result?.result || payload.result || payload.result_text || '✅ Agent task complete.';
+              setChatMessages(prev => prev.map(msg =>
+                msg.id === agentMessageId ? { ...msg, content: resultText, isStreaming: false } : msg
+              ));
+              setCurrentStatus('✅ Agent complete');
+              setIsProcessing(false);
+            } else if (payload.type === 'error') {
+              setChatMessages(prev => prev.map(msg =>
+                msg.id === agentMessageId ? { ...msg, content: `❌ Agent error: ${payload.error}`, isStreaming: false } : msg
+              ));
+              setCurrentStatus('❌ Agent failed');
+              setIsProcessing(false);
+            } else if (payload.type === 'thought') {
+              setChatMessages(prev => prev.map(msg =>
+                msg.id === agentMessageId
+                  ? { ...msg, content: `${msg.content}\n🧠 ${payload.content}` }
+                  : msg
+              ));
+            }
+          } catch (e) {
+            console.warn('Failed to parse agent event', e);
+          }
+        }
+      }
+
+      reader?.releaseLock();
+    } catch (error) {
+      console.error('Agent task failed', error);
+      setChatMessages(prev => prev.map(msg =>
+        msg.id === agentMessageId ? { ...msg, content: `🛑 Agent error: ${error.message}`, isStreaming: false } : msg
+      ));
+      setCurrentStatus('❌ Agent error');
+      setIsProcessing(false);
+    }
+  }, [workspaceId]);
+
+  const handleChatStart = async (
+    message?: string,
+    mentionedAgents?: string[],
+    parameters?: ThesisParameters,
+    options?: {
+      skipUserMessage?: boolean;
+      replaceAssistantMessageId?: string;
+      historyOverride?: ChatMessage[];
+    }
+  ) => {
     if (!message || !message.trim()) return;
+    const skipUserMessage = options?.skipUserMessage === true;
+    const replaceAssistantMessageId = options?.replaceAssistantMessageId;
+    const historyForContext = options?.historyOverride || chatMessages;
 
     // Check if this is a university slash command
     // Match both: /uoj_phd and /uoj_phd some details
@@ -911,37 +2140,31 @@ Objectives:
       return;
     }
 
-    // Clear old job_id when starting a new request
-    // DON'T clear actions - keep chat history visible
-    localStorage.removeItem('current_job_id');
+    // Keep previous jobs active; only reset planner for the new request
+    setPlannerSteps([]);
 
-    // Don't auto-open progress panel - user can open manually with Cmd+P
-    if (eventSourceRef.current) {
-      // console.log("🔌 Closing existing SSE connection before new request");
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+    if (!skipUserMessage) {
+      // Add user message to workspace immediately
+      const userAction: AgentAction = {
+        id: `user-${Date.now()}`,
+        type: 'user_message',
+        timestamp: new Date(),
+        title: 'You',
+        content: message.trim(),
+        status: 'completed'
+      };
+      setAgentActions(prev => [...prev, userAction]);
+
+      // Also add to chat messages
+      const userChatMessage: ChatMessage = {
+        id: `user-${Date.now()}`,
+        type: 'user',
+        content: message.trim(),
+        timestamp: new Date(),
+        isStreaming: false
+      };
+      setChatMessages(prev => [...prev, userChatMessage]);
     }
-
-    // Add user message to workspace immediately
-    const userAction: AgentAction = {
-      id: `user-${Date.now()}`,
-      type: 'user_message',
-      timestamp: new Date(),
-      title: 'You',
-      content: message.trim(),
-      status: 'completed'
-    };
-    setAgentActions(prev => [...prev, userAction]);
-
-    // Also add to chat messages
-    const userChatMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
-      type: 'user',
-      content: message.trim(),
-      timestamp: new Date(),
-      isStreaming: false
-    };
-    setChatMessages(prev => [...prev, userChatMessage]);
 
     // Ensure we have a conversation context
     let currentSessionId = sessionId;
@@ -964,16 +2187,23 @@ Objectives:
       }
     }
 
-    // Post user message to backend memory
-    try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-      await fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${currentSessionId}/messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'user', content: message.trim() })
-      });
-    } catch (e) {
-      console.error('Failed to persist user message:', e);
+    if (!skipUserMessage) {
+      // Post user message to backend memory
+      try {
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+        await fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${currentSessionId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'user', content: message.trim() })
+        });
+      } catch (e) {
+        console.error('Failed to persist user message:', e);
+      }
+    }
+
+    if (shouldUseAgentMode(message)) {
+      await streamAgentTask(message);
+      return;
     }
 
     try {
@@ -981,11 +2211,12 @@ Objectives:
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
       // Build conversation history for context (last 10 messages)
-      const recentHistory = chatMessages.slice(-10).map(msg => ({
+      const recentHistory = historyForContext.slice(-10).map(msg => ({
         role: msg.type === 'assistant' ? 'assistant' : 'user',
         content: msg.content
       }));
 
+      console.log(`📤 Sending chat: workspace_id=${workspaceId}, session_id=${currentSessionId || sessionId}`);
       const response = await fetch(`${backendUrl}/api/chat/message`, {
         method: 'POST',
         headers: {
@@ -1026,7 +2257,7 @@ Objectives:
             const decoder = new TextDecoder();
 
             // Create a streaming chat message immediately
-            const streamingMessageId = `chat-direct-${Date.now()}`;
+            const streamingMessageId = replaceAssistantMessageId || `chat-direct-${Date.now()}`;
             const streamingMessage: ChatMessage = {
               id: streamingMessageId,
               type: 'assistant',
@@ -1035,7 +2266,15 @@ Objectives:
               isStreaming: true,
               agent: 'assistant'
             };
-            setChatMessages(prev => [...prev, streamingMessage]);
+            setChatMessages(prev => {
+              const existingIndex = prev.findIndex(msg => msg.id === streamingMessageId);
+              if (existingIndex >= 0) {
+                const updated = [...prev];
+                updated[existingIndex] = { ...updated[existingIndex], ...streamingMessage };
+                return updated;
+              }
+              return [...prev, streamingMessage];
+            });
 
             try {
               while (true) {
@@ -1059,6 +2298,7 @@ Objectives:
                       const eventData = JSON.parse(line.slice(5).trim());
                       if (eventData.chunk) {
                         accumulatedResponse += eventData.chunk;
+                        latestAssistantContentRef.current[streamingMessageId] = accumulatedResponse;
                         // Update the streaming message with accumulated content
                         setChatMessages(prev => prev.map(msg =>
                           msg.id === streamingMessageId
@@ -1067,6 +2307,7 @@ Objectives:
                         ));
                       } else if (eventData.accumulated) {
                         accumulatedResponse = eventData.accumulated;
+                        latestAssistantContentRef.current[streamingMessageId] = accumulatedResponse;
                         setChatMessages(prev => prev.map(msg =>
                           msg.id === streamingMessageId
                             ? { ...msg, content: accumulatedResponse }
@@ -1086,10 +2327,13 @@ Objectives:
                   ? { ...msg, isStreaming: false }
                   : msg
               ));
+              if (replaceAssistantMessageId && accumulatedResponse) {
+                appendAssistantVariant(replaceAssistantMessageId, accumulatedResponse);
+              }
 
               // If we got a complete response, we're done
               if (accumulatedResponse) {
-                setIsProcessing(false);
+                syncProcessingState();
                 setCurrentStatus('');
                 return; // Exit early - response is complete
               }
@@ -1104,7 +2348,7 @@ Objectives:
                   ? { ...msg, content: 'Error receiving response', isStreaming: false }
                   : msg
               ));
-              setIsProcessing(false);
+              syncProcessingState();
               return;
             }
           } else {
@@ -1119,6 +2363,10 @@ Objectives:
       // Handle jobs with job_id - connect to real-time SSE stream (both queued and direct execution)
       if (data.job_id) {
         const jobId = data.job_id;
+        const responseMessageId = replaceAssistantMessageId || `chat-${jobId}-response`;
+        if (replaceAssistantMessageId) {
+          jobReplacementRef.current[jobId] = replaceAssistantMessageId;
+        }
         // console.log(`🔗 Connecting to SSE stream for job: ${jobId}`);
         setCurrentStatus('🔗 Connecting to real-time stream...');
         setIsProcessing(true); // Ensure processing state is set
@@ -1151,14 +2399,23 @@ Objectives:
 
           // ALSO add to chat messages so it displays in the chat UI
           const assistantChatMessage: ChatMessage = {
-            id: `chat-${jobId}-response`,
+            id: responseMessageId,
             type: 'assistant',
             content: data.response,
             timestamp: new Date(),
             isStreaming: false,
             agent: 'assistant'
           };
-          setChatMessages(prev => [...prev, assistantChatMessage]);
+          latestAssistantContentRef.current[responseMessageId] = data.response;
+          setChatMessages(prev => {
+            const existingIndex = prev.findIndex(msg => msg.id === responseMessageId);
+            if (existingIndex >= 0) {
+              const updated = [...prev];
+              updated[existingIndex] = { ...updated[existingIndex], ...assistantChatMessage };
+              return updated;
+            }
+            return [...prev, assistantChatMessage];
+          });
 
           // Persist assistant message to backend memory
           try {
@@ -1173,666 +2430,8 @@ Objectives:
           }
         }
 
-        // Connect to real-time SSE stream for this job
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
         const streamSessionId = currentSessionId || sessionId || 'new';
-        const streamUrl = `${backendUrl}/api/stream/agent-actions?session_id=${streamSessionId}&job_id=${jobId}`;
-        streamUrl;
-
-        const eventSource = new EventSource(streamUrl);
-
-        eventSource.onopen = () => {
-          // console.log(`✅ SSE stream opened for job: ${jobId}`);
-          setCurrentStatus('✅ Connected - receiving updates...');
-        };
-
-        // Handle connected event
-        eventSource.addEventListener('connected', (e) => {
-          // console.log(`✅ SSE connected event:`, e.data);
-          try {
-            const connData = JSON.parse(e.data);
-            if (connData.job_id === jobId) {
-              setCurrentStatus('✅ Connected to real-time stream');
-            }
-          } catch (err) {
-            console.error('Error parsing connected event:', err);
-          }
-        });
-
-        // Handle real-time events
-        eventSource.addEventListener('log', (e) => {
-          // console.log(`📨 Received log event:`, e.data);
-          try {
-            const eventData = JSON.parse(e.data);
-            const message = eventData.message || '';
-
-            // Update status in real-time (shown in status bar, not timeline)
-            setCurrentStatus(message);
-
-            // FILTER: Only show TRULY important milestones in timeline
-            // Skip generic progress/completed messages that cause spam
-            const skipPatterns = [
-              /^progress$/i,
-              /^completed$/i,
-              /^\d+%/,  // Percentage updates
-              /^step \d/i,  // Step X of Y
-              /^processing/i,
-              /^working/i,
-              /^generating\.{0,3}$/i,  // Just "generating..." without details
-            ];
-
-            const isSpam = skipPatterns.some(pattern => pattern.test(message.trim()));
-            if (isSpam || message.length < 10) {
-              return; // Skip spam messages
-            }
-
-            // Only show messages with substantial content and clear meaning
-            const isMilestone =
-              message.includes('✅') ||  // Completion markers
-              message.includes('❌') ||  // Error markers  
-              message.includes('📄') ||  // File operations
-              message.includes('Chapter') ||  // Chapter progress
-              message.includes('generated') ||
-              message.includes('saved') ||
-              message.includes('created') ||
-              message.includes('Starting');  // Phase starts
-
-            if (isMilestone) {
-              const logAction: AgentAction = {
-                id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-                type: 'log' as any,
-                timestamp: new Date(),
-                title: message.substring(0, 60) + (message.length > 60 ? '...' : ''),  // Use message as title, not generic "Progress"
-                content: message.length > 60 ? message : undefined,  // Only show content if long
-                status: 'completed'
-              };
-              setAgentActions(prev => [...prev, logAction]);
-            }
-
-            // Update status display
-            setCurrentStatus(message);
-          } catch (err) {
-            console.error('Error parsing log event:', err);
-          }
-        });
-
-        // Handle agent_activity events (what agents are currently doing)
-        eventSource.addEventListener('agent_activity', (e) => {
-          try {
-            const activityData = JSON.parse(e.data);
-            const agent = activityData.agent || 'agent';
-            const action = activityData.action || 'working';
-            const description = activityData.description || activityData.details || '';
-            const progress = activityData.progress || 0;
-
-            // Update current agent display
-            setCurrentAgent(agent);
-            setCurrentAction(action);
-            setCurrentDescription(description);
-            setCurrentProgress(progress);
-
-            // Add to status updates history
-            setStatusUpdates(prev => [...prev, {
-              timestamp: new Date(),
-              agent: agent,
-              action: action,
-              description: description,
-              status: 'running'
-            }].slice(-10)); // Keep last 10
-
-          } catch (err) {
-            console.error('Error parsing agent_activity event:', err);
-          }
-        });
-
-        eventSource.addEventListener('agent_stream', (e) => {
-          try {
-            const streamData = JSON.parse(e.data);
-            const tabId = streamData.tab_id;
-            const chunk = streamData.chunk || '';
-            const content = streamData.content || '';
-            const isCompleted = streamData.completed === true;
-
-            // Find or create agent tab
-            setTabs(prev => {
-              const existingTab = prev.find(t => t.id === tabId);
-
-              if (existingTab) {
-                // Update existing tab content
-                const updatedTabs = prev.map(tab => {
-                  if (tab.id === tabId) {
-                    return {
-                      ...tab,
-                      data: {
-                        ...tab.data,
-                        content: content || (tab.data?.content || '') + chunk,
-                        isStreaming: !isCompleted,
-                        agent: streamData.agent || 'agent',
-                        metadata: streamData.metadata || {}
-                      }
-                    };
-                  }
-                  return tab;
-                });
-                return updatedTabs;
-              } else {
-                // Create new agent tab
-                const agentName = streamData.agent || 'agent';
-                const agentTab: Tab = {
-                  id: tabId,
-                  type: 'agent',
-                  title: `${agentName.charAt(0).toUpperCase() + agentName.slice(1)} Agent`,
-                  data: {
-                    content: content || chunk,
-                    isStreaming: !isCompleted,
-                    agent: agentName,
-                    type: streamData.type || 'content',
-                    metadata: streamData.metadata || {}
-                  },
-                  workspaceId: streamData.workspace_id || workspaceId,
-                };
-
-                // Auto-open agent tab
-                setActiveTabId(tabId);
-                setIsRightPanelOpen(true);
-
-                return [...prev, agentTab];
-              }
-            });
-          } catch (err) {
-            console.error('Error parsing agent_stream event:', err);
-          }
-        });
-
-        eventSource.addEventListener('file_created', (e) => {
-          try {
-            const eventData = JSON.parse(e.data);
-            const fileAction: AgentAction = {
-              id: `job-${jobId}-file-${Date.now()}`,
-              type: 'file_write',
-              timestamp: new Date(),
-              title: `✅ File Created: ${eventData.path}`,
-              content: `File created: ${eventData.path}`,
-              metadata: { path: eventData.path, type: eventData.type },
-              status: 'completed',
-            };
-            setAgentActions(prev => [...prev, fileAction]);
-
-            // Auto-open file in preview panel
-            // Handle both relative path (filename) and full path
-            const filePath = eventData.full_path || eventData.path || '';
-            const wsId = eventData.workspace_id || workspaceId;
-            const filename = eventData.filename || filePath.split('/').pop() || filePath;
-
-            // Open file tab
-            const fileTab: Tab = {
-              id: `file-${filePath}-${Date.now()}`,
-              type: 'file',
-              title: filename,
-              data: {
-                path: filePath, // Use full_path if available, otherwise path
-                workspaceId: wsId
-              },
-              workspaceId: wsId,
-            };
-
-            setTabs(prev => {
-              const exists = prev.find(t => t.data?.path === filePath);
-              if (exists) {
-                setActiveTabId(exists.id);
-                return prev;
-              }
-              return [...prev, fileTab];
-            });
-            setActiveTabId(fileTab.id);
-            setIsRightPanelOpen(true); // Open right panel if collapsed
-
-            // Refresh workspace
-            window.dispatchEvent(new Event('workspace-refresh'));
-          } catch (err) {
-            console.error('Error parsing file_created event:', err);
-          }
-        });
-
-        // Handle agent_activity events (search, research, etc.)
-        eventSource.addEventListener('agent_activity', (e) => {
-          try {
-            const activityData = JSON.parse(e.data);
-            const agent = activityData.agent || 'agent';
-            const action = activityData.action || 'working';
-            const query = activityData.query || '';
-            const status = activityData.status || 'running';
-
-            // Create or update agent tab for search/research/writing activities
-            // Include chapter generator agents
-            const agentTypes = [
-              'search', 'research', 'researcher', 'image_search', 'image_generator',
-              'research_swarm', 'writer_swarm', 'quality_control', 'chapter_generator',
-              'intro_writer', 'background_writer', 'problem_writer', 'scope_writer', 'justification_writer'
-            ];
-
-            if (agentTypes.includes(agent)) {
-              const tabId = `${agent}-${jobId}`;
-              const icon = activityData.icon || '🤖';
-              const agentName = activityData.agent_name || agent.charAt(0).toUpperCase() + agent.slice(1).replace(/_/g, ' ');
-
-              setTabs(prev => {
-                const existingTab = prev.find(t => t.id === tabId);
-
-                if (existingTab) {
-                  // Update existing tab
-                  return prev.map(tab => {
-                    if (tab.id === tabId) {
-                      return {
-                        ...tab,
-                        title: `${icon} ${agentName}`,
-                        data: {
-                          ...tab.data,
-                          query: query,
-                          action: action,
-                          status: status,
-                          results: activityData.results || tab.data?.results,
-                          content: activityData.content || tab.data?.content || '',
-                          isStreaming: status === 'running'
-                        }
-                      };
-                    }
-                    return tab;
-                  });
-                } else {
-                  // Create new agent tab
-                  const agentTab: Tab = {
-                    id: tabId,
-                    type: 'agent',
-                    title: `${icon} ${agentName}`,
-                    data: {
-                      agent: agent,
-                      query: query,
-                      action: action,
-                      status: status,
-                      results: activityData.results,
-                      content: activityData.content || '',
-                      isStreaming: status === 'running',
-                      type: agent.includes('search') ? 'search' : 'activity',
-                      metadata: activityData
-                    },
-                    workspaceId: workspaceId,
-                  };
-
-                  // Auto-open agent tab for chapter generators and research
-                  if (agent === 'chapter_generator' || agent === 'research_swarm' || agent === 'writer_swarm' || agent === 'research') {
-                    setActiveTabId(tabId);
-                    setIsRightPanelOpen(true);
-
-                    // Also trigger browser tab if it's a research agent performing an action
-                    if (agent === 'research' || agent === 'search') {
-                      window.dispatchEvent(new CustomEvent('open-browser-tab', {
-                        detail: {
-                          title: `🌐 ${agentName}`,
-                          sessionId: sessionId || 'default'
-                        }
-                      }));
-                    }
-                  }
-
-                  return [...prev, agentTab];
-                }
-              });
-            }
-
-            // Update status
-            setCurrentStage(agent);
-            setCurrentStatus(`${agent} ${action}: ${query || ''}`);
-          } catch (err) {
-            console.error('Error parsing agent_activity event:', err);
-          }
-        });
-
-        // Handle tool_started events
-        eventSource.addEventListener('tool_started', (e) => {
-          // console.log(`📨 Received tool_started event:`, e.data);
-          try {
-            const toolData = JSON.parse(e.data);
-            // console.log(`🔧 Tool started: ${toolData.tool}, step ${toolData.step}/${toolData.total}`);
-            setCurrentStage(toolData.tool || '');
-            setCurrentStatus(`Executing ${toolData.tool} (step ${toolData.step}/${toolData.total})...`);
-          } catch (err) {
-            console.error('Error parsing tool_started event:', err);
-          }
-        });
-
-        // Handle tool_completed events
-        eventSource.addEventListener('tool_completed', (e) => {
-          try {
-            const toolData = JSON.parse(e.data);
-            setCurrentStatus(`✓ ${toolData.tool} completed`);
-          } catch (err) {
-            console.error('Error parsing tool_completed event:', err);
-          }
-        });
-
-        // Handle agent_working events - show clickable badges in chat
-        eventSource.addEventListener('agent_working', (e) => {
-          try {
-            const agentData = JSON.parse(e.data);
-            const { agent, agent_name, status, action, icon } = agentData;
-
-            setActiveAgents(prev => {
-              const existing = prev.find(a => a.agent === agent);
-              if (existing) {
-                // Update existing agent
-                return prev.map(a => a.agent === agent
-                  ? { ...a, status, action, icon }
-                  : a
-                );
-              } else {
-                // Add new agent
-                return [...prev, { agent, agent_name, status, action, icon }];
-              }
-            });
-
-            // If completed, focus on the agent tab
-            if (status === 'running') {
-              const tabId = `${agent}-${localStorage.getItem('current_job_id') || 'default'}`;
-              setActiveTabId(tabId);
-              setIsRightPanelOpen(true);
-            }
-          } catch (err) {
-            console.error('Error parsing agent_working event:', err);
-          }
-        });
-
-        // Handle stage_started events
-        eventSource.addEventListener('stage_started', (e) => {
-          // console.log(`📨 Received stage_started event:`, e.data);
-          try {
-            const stageData = JSON.parse(e.data);
-            // console.log(`📋 Stage started: ${stageData.stage}`);
-            setCurrentStage(stageData.stage || '');
-            setCurrentStatus(stageData.message || `Starting ${stageData.stage}...`);
-
-            // Open browser tab for web search or browse stages
-            if (stageData.stage === 'web_search' || stageData.stage === 'browse' || stageData.stage === 'browser') {
-              window.dispatchEvent(new CustomEvent('open-browser-tab', {
-                detail: {
-                  title: stageData.message || '🌐 Live Browser',
-                  sessionId: sessionId || 'default'
-                }
-              }));
-            }
-
-            // Add dynamic progress step from real-time event
-            const newStep = {
-              id: `stage-${stageData.stage}-${Date.now()}`,
-              label: stageData.message || `Starting ${stageData.stage}...`,
-              status: 'running' as const,
-              timestamp: new Date()
-            };
-            setProgressSteps(prev => [...prev, newStep]);
-          } catch (err) {
-            console.error('Error parsing stage_started event:', err);
-          }
-        });
-
-        // Handle reasoning_chunk events (streaming AI thinking)
-        eventSource.addEventListener('reasoning_chunk', (e) => {
-          // console.log(`📨 Received reasoning_chunk event:`, e.data);
-          try {
-            const chunkData = JSON.parse(e.data);
-            const accumulated = chunkData.accumulated || '';
-
-            // Update or create reasoning action
-            setAgentActions(prev => {
-              const existingIndex = prev.findIndex(
-                action => action.type === 'thinking' && action.id?.startsWith(`job-${jobId}-reasoning`)
-              );
-
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                updated[existingIndex] = {
-                  ...updated[existingIndex],
-                  content: accumulated,
-                  isStreaming: true,
-                  status: 'running'
-                };
-                return updated;
-              } else {
-                const reasoningAction: AgentAction = {
-                  id: `job-${jobId}-reasoning-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                  type: 'thinking',
-                  timestamp: new Date(),
-                  title: '', // No hardcoded title - show real content only
-                  content: accumulated,
-                  metadata: {},
-                  status: 'running',
-                  isStreaming: true
-                };
-                return [...prev, reasoningAction];
-              }
-            });
-          } catch (err) {
-            console.error('Error parsing reasoning_chunk event:', err);
-          }
-        });
-
-        // Handle response_chunk events (streaming AI response)
-        eventSource.addEventListener('response_chunk', (e) => {
-          // console.log(`📨 Received response_chunk event:`, e.data);
-          try {
-            const chunkData = JSON.parse(e.data);
-            const accumulated = chunkData.accumulated || '';
-
-            // Update or create chat message for this response
-            setChatMessages(prev => {
-              const existingIndex = prev.findIndex(
-                msg => msg.id === `chat-${jobId}-response`
-              );
-
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                updated[existingIndex] = {
-                  ...updated[existingIndex],
-                  content: accumulated,
-                  isStreaming: true,
-                  agent: 'assistant',
-                  metadata: {
-                    ...updated[existingIndex].metadata,
-                    progress: currentProgress
-                  }
-                };
-                return updated;
-              } else {
-                // Create new chat message
-                const chatMessage: ChatMessage = {
-                  id: `chat-${jobId}-response`,
-                  type: 'assistant',
-                  content: accumulated,
-                  timestamp: new Date(),
-                  isStreaming: true,
-                  agent: 'assistant',
-                  metadata: {
-                    progress: currentProgress
-                  }
-                };
-                return [...prev, chatMessage];
-              }
-            });
-
-            // Update or create response action
-            setAgentActions(prev => {
-              // Always look for the main response action first
-              const existingIndex = prev.findIndex(
-                action => action.type === 'stream' && action.id.startsWith(`job-${jobId}-response`)
-              );
-
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                // Only update if content length increased (avoid out-of-order updates)
-                if (accumulated.length >= (updated[existingIndex].content?.length || 0)) {
-                  updated[existingIndex] = {
-                    ...updated[existingIndex],
-                    content: accumulated,
-                    isStreaming: true,
-                    status: 'running'
-                  };
-                }
-                return updated;
-              } else {
-                // Create new only if it doesn't exist
-                const streamAction: AgentAction = {
-                  id: `job-${jobId}-response-main`, // FIXED: Stable ID
-                  type: 'stream',
-                  timestamp: new Date(),
-                  title: '✨ Response',
-                  content: accumulated,
-                  metadata: {},
-                  status: 'running',
-                  isStreaming: true
-                };
-                return [...prev, streamAction];
-              }
-            });
-          } catch (err) {
-            console.error('Error parsing response_chunk event:', err);
-          }
-        });
-
-        // Fallback for 'content' events (some routes might still use this)
-        eventSource.addEventListener('content', (e: any) => {
-          try {
-            const contentData = JSON.parse(e.data);
-            const chunk = contentData.text || contentData.chunk || '';
-
-            // Update chat messages
-            setChatMessages(prev => {
-              const existingIndex = prev.findIndex(msg => msg.id === `chat-${jobId}-response`);
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                updated[existingIndex] = {
-                  ...updated[existingIndex],
-                  content: updated[existingIndex].content + chunk,
-                  isStreaming: true
-                };
-                return updated;
-              }
-              return [...prev, {
-                id: `chat-${jobId}-response`,
-                type: 'assistant',
-                content: chunk,
-                timestamp: new Date(),
-                isStreaming: true
-              }];
-            });
-          } catch (err) {
-            console.error('Error parsing content event:', err);
-          }
-        });
-
-        // Handle explicit 'error' events from backend
-        eventSource.addEventListener('error', (e: any) => {
-          try {
-            const errorData = JSON.parse(e.data);
-            const errorMessage = errorData.message || 'An unknown error occurred';
-
-            // Add error to chat
-            const errorMsg: ChatMessage = {
-              id: `error-${Date.now()}`,
-              type: 'assistant',
-              content: `❌ **Error**: ${errorMessage}`,
-              timestamp: new Date(),
-              isStreaming: false
-            };
-            setChatMessages(prev => [...prev, errorMsg]);
-            setIsProcessing(false);
-          } catch (err) {
-            // This might be a generic EventSource error (not JSON)
-            console.error('SSE Error event:', e);
-          }
-        });
-
-        eventSource.addEventListener('stage_completed', (e) => {
-          try {
-            const eventData = JSON.parse(e.data);
-            const stage = eventData.stage || '';
-
-            // Mark streaming actions as completed silently (no UI message)
-            if (stage === 'response' || stage === 'complete' || stage === 'completed') {
-              setAgentActions(prev => prev.map(action => {
-                if (action.isStreaming && action.status === 'running') {
-                  return { ...action, status: 'completed', isStreaming: false };
-                }
-                return action;
-              }));
-            }
-
-            // If the "complete" stage is completed, stop processing silently
-            if (stage === 'complete' || stage === 'completed') {
-              setIsProcessing(false);
-              setCurrentStatus('');
-              setCurrentStage('');
-            }
-
-            // Mark progress step as completed
-            setProgressSteps(prev => prev.map(step =>
-              step.id.includes(`stage-${stage}`) ? { ...step, status: 'completed' } : step
-            ));
-
-            // Don't show stage completion messages - they're generic progress updates
-            // Only real content (reasoning_chunk, response_chunk) should be visible
-          } catch (err) {
-            console.error('Error parsing stage_completed event:', err);
-          }
-        });
-
-        eventSource.addEventListener('done', async (e) => {
-          // console.log(`🏁 Received done event for job: ${jobId}`);
-
-          // Persist the final response when the job is done
-          try {
-            // Get the final content from the current state (need to be careful with closures here)
-            // In React, we'd ideally use a ref or the updater function.
-            // Since this is an event listener added once, it might have stale sessionId.
-            setChatMessages(prev => {
-              const finalMsg = prev.find(m => m.id === `chat-${jobId}-response`);
-              if (finalMsg && finalMsg.content) {
-                const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-                fetch(`${backendUrl}/api/workspace/${workspaceId}/conversations/${sessionId || 'default'}/messages`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    role: 'assistant',
-                    content: finalMsg.content,
-                    job_id: jobId
-                  })
-                }).catch(err => console.error('Failed to persist final streaming message:', err));
-              }
-              return prev;
-            });
-          } catch (err) {
-            console.error('Error during final message persistence:', err);
-          }
-
-          setIsProcessing(false);
-          setCurrentStatus('');
-          setCurrentStage('');
-          if (eventSourceRef.current === eventSource) {
-            eventSource.close();
-            eventSourceRef.current = null;
-          }
-        });
-
-        eventSource.onerror = (error) => {
-          console.error('SSE stream error for job:', jobId, error);
-          // Don't close on error - EventSource will auto-reconnect
-          if (eventSource.readyState === EventSource.CLOSED) {
-            console.error('SSE stream closed permanently for job:', jobId);
-            setCurrentStatus('❌ Stream connection lost');
-            setIsProcessing(false);
-          }
-        };
-
-        // Store eventSource reference for cleanup
-        eventSourceRef.current = eventSource;
+        startJobStream({ jobId, streamSessionId, responseMessageId, type: 'general' });
       }
 
       // Handle image generation directly - skip planning steps
@@ -1887,7 +2486,7 @@ Objectives:
 
           // Don't show progress panel or reasoning - just show the image directly
           setReasoning(''); // Clear reasoning - don't show it
-          setIsProcessing(false);
+          syncProcessingState();
           setCurrentStatus('');
           setCurrentStage('');
           return; // Exit early - no planning steps, no progress panel, no reasoning
@@ -1902,7 +2501,7 @@ Objectives:
             status: 'completed',
           };
           setAgentActions(prev => [...prev, errorAction]);
-          setIsProcessing(false);
+          syncProcessingState();
           setCurrentStatus('');
           setCurrentStage('');
           return;
@@ -1915,16 +2514,28 @@ Objectives:
       if (!data.job_id) {
         // Add response to chat messages so it displays in the chat UI
         const assistantChatMessage: ChatMessage = {
-          id: `chat-response-${Date.now()}`,
+          id: replaceAssistantMessageId || `chat-response-${Date.now()}`,
           type: 'assistant',
           content: responseText,
           timestamp: new Date(),
           isStreaming: false,
           agent: 'assistant'
         };
-        setChatMessages(prev => [...prev, assistantChatMessage]);
+        latestAssistantContentRef.current[assistantChatMessage.id] = responseText;
+        setChatMessages(prev => {
+          const existingIndex = prev.findIndex(msg => msg.id === assistantChatMessage.id);
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = { ...updated[existingIndex], ...assistantChatMessage };
+            return updated;
+          }
+          return [...prev, assistantChatMessage];
+        });
+        if (replaceAssistantMessageId) {
+          appendAssistantVariant(replaceAssistantMessageId, responseText);
+        }
 
-        setIsProcessing(false);
+        syncProcessingState();
         setCurrentStatus('');
         setCurrentStage('');
       }
@@ -2036,23 +2647,26 @@ Objectives:
 
       // Auto-open file if one was created
       if (data.file_created && data.file_created.path) {
-        const filePath = data.file_created.path;
-        const wsId = data.file_created.workspace_id || workspaceId;
+        const rawPath = data.file_created.path;
+        const wsId = data.file_created.workspace_id || deriveWorkspaceId(rawPath) || workspaceId;
+        const normalizedPath = normalizeWorkspacePath(rawPath, wsId);
 
         // Open file in preview panel
         const fileTab: Tab = {
-          id: `file-${filePath}-${Date.now()}`,
+          id: `file-${normalizedPath}-${Date.now()}`,
           type: 'file',
-          title: filePath.split('/').pop() || filePath,
+          title: normalizedPath.split('/').pop() || normalizedPath,
           data: {
-            path: filePath,
+            name: normalizedPath.split('/').pop() || normalizedPath,
+            path: normalizedPath,
+            type: normalizedPath.includes('.') ? 'file' : 'folder',
             workspaceId: wsId
           },
           workspaceId: wsId,
         };
 
         setTabs(prev => {
-          const exists = prev.find(t => t.data?.path === filePath);
+          const exists = prev.find(t => t.data?.path === normalizedPath);
           if (exists) {
             setActiveTabId(exists.id);
             return prev;
@@ -2093,7 +2707,7 @@ I'm having trouble connecting to the backend server. Please check:
       };
       setChatMessages(prev => [...prev, errorMessage]);
 
-      setIsProcessing(false);
+      syncProcessingState();
       setCurrentStatus('');
       setCurrentStage('');
     } finally {
@@ -2110,14 +2724,14 @@ I'm having trouble connecting to the backend server. Please check:
           setMessageQueue([]);
         }
       }
-      setIsProcessing(false);
+      syncProcessingState();
       setCurrentStatus('');
       setCurrentStage('');
     }
   };
 
   const handleProcessingComplete = () => {
-    setIsProcessing(false);
+    syncProcessingState();
     setCurrentStatus('');
     setCurrentStage('');
   };
@@ -2246,6 +2860,7 @@ I'm having trouble connecting to the backend server. Please check:
       setCurrentJobId(null);
       setLiveResponse('');
       setProgressSteps([]);
+      setPlannerSteps([]);
       setAgentActions([]);
       setReasoning('');
       setCurrentStatus('');
@@ -2254,6 +2869,8 @@ I'm having trouble connecting to the backend server. Please check:
 
       // Crucial: Clear messages and localStorage for the old workspace
       setChatMessages([]);
+      setAssistantVariants({});
+      setAssistantVariantIndex({});
       setWorkspaceFiles([]);
       setStreamingMessageId(null);
       setActiveAgents([]);
@@ -2288,6 +2905,8 @@ I'm having trouble connecting to the backend server. Please check:
       setCurrentStage('');
       setIsProcessing(false);
       setChatMessages([]);
+      setAssistantVariants({});
+      setAssistantVariantIndex({});
     }
   }, []);
 
@@ -2515,7 +3134,12 @@ I'm having trouble connecting to the backend server. Please check:
           </div>
         }
         middlePanel={
-          <div className="flex flex-col h-full overflow-hidden bg-white" style={{ backgroundColor: 'var(--color-panel, #FFFFFF)' }}>
+          <div className="flex flex-col h-full overflow-hidden" style={{ backgroundColor: 'var(--chat-panel, #fff6ec)' }}>
+            {activeAgents.length > 0 && (
+              <div className="border-b" style={{ borderColor: 'rgba(31, 122, 140, 0.12)' }}>
+                <AgentActivityTracker activities={activeAgents} />
+              </div>
+            )}
             {/* Enhanced Chat Display - Shows messages with real streaming */}
             <EnhancedChatDisplay
               messages={chatMessages}
@@ -2524,7 +3148,66 @@ I'm having trouble connecting to the backend server. Please check:
               currentAction={currentAction}
               currentDescription={currentDescription}
               currentProgress={currentProgress}
-              processSteps={progressSteps}
+              processSteps={plannerSteps.length > 0 ? plannerSteps : progressSteps}
+              agentActions={agentActions}
+              assistantVariants={assistantVariants}
+              activeVariantIndex={assistantVariantIndex}
+              onVariantSelect={(messageId, index) => {
+                setAssistantVariantIndex(prev => ({ ...prev, [messageId]: index }));
+              }}
+              onSuggestionClick={(suggestion) => handleChatStart(suggestion)}
+              onEditMessage={(messageId, content, options) => {
+                const messageIndex = chatMessages.findIndex(msg => msg.id === messageId);
+                if (messageIndex < 0) return;
+                const trimmedMessages = chatMessages
+                  .slice(0, messageIndex + 1)
+                  .map(msg => (msg.id === messageId ? { ...msg, content } : msg));
+                setChatMessages(trimmedMessages);
+                pruneAssistantVariants(new Set(trimmedMessages.map(msg => msg.id)));
+                setPlannerSteps([]);
+                setProgressSteps([]);
+                setActiveAgents([]);
+                setCurrentStatus('');
+                setCurrentStage('');
+                setCurrentJobId(null);
+                setLiveResponse('');
+                setIsProcessing(Object.keys(activeJobsRef.current).length > 0);
+                if (options?.redo) {
+                  handleChatStart(content, undefined, undefined, {
+                    skipUserMessage: true,
+                    historyOverride: trimmedMessages
+                  });
+                }
+              }}
+              onRegenerate={(messageId) => {
+                const index = chatMessages.findIndex(msg => msg.id === messageId);
+                let userText = '';
+                if (index >= 0) {
+                  for (let i = index - 1; i >= 0; i -= 1) {
+                    if (chatMessages[i].type === 'user') {
+                      userText = chatMessages[i].content;
+                      break;
+                    }
+                  }
+                }
+                if (!userText) {
+                  const lastUser = [...chatMessages].reverse().find(msg => msg.type === 'user');
+                  userText = lastUser?.content || '';
+                }
+                const targetMessage = chatMessages.find(msg => msg.id === messageId);
+                if (targetMessage?.content) {
+                  ensureAssistantVariantBase(messageId, targetMessage.content);
+                }
+                setChatMessages(prev => prev.map(msg =>
+                  msg.id === messageId ? { ...msg, isStreaming: true } : msg
+                ));
+                if (userText) {
+                  handleChatStart(userText, undefined, undefined, {
+                    skipUserMessage: true,
+                    replaceAssistantMessageId: messageId
+                  });
+                }
+              }}
             />
 
             {/* Chat Bar at Bottom - Always Visible - Fixed Position */}
@@ -2562,6 +3245,7 @@ I'm having trouble connecting to the backend server. Please check:
                 onTabChange={setActiveTabId}
                 onTabClose={closeTab}
                 onTabsChange={setTabs}
+                sourcesRefreshKey={sourcesRefreshKey}
               />
             </div>
           ) : null

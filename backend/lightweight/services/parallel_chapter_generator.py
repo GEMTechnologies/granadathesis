@@ -27,13 +27,84 @@ from services.chapter4_generator import generate_chapter4
 from services.chapter5_generator import generate_chapter5
 from services.chapter6_generator import generate_chapter6
 from services.data_collection_worker import generate_study_tools, generate_research_dataset
+from services.document_upload_service import search_user_documents
 import re
 import os
 from services.thesis_session_db import ThesisSessionDB
-from services.objective_generator import generate_smart_objectives
+from services.objective_generator import generate_smart_objectives, normalize_objectives
 from services.uoj_chapter_one_generator import generate_chapter_one_uoj
 from services.uoj_preliminary_generator import generate_preliminary_pages_uoj
 from services.uoj_appendix_generator import generate_appendices_uoj
+
+
+class AdaptiveLimiter:
+    """Adaptive concurrency limiter with simple backoff/scale-up rules."""
+
+    def __init__(self, max_concurrency: int, min_concurrency: int = 1):
+        self._hard_max = max(1, max_concurrency)
+        self._min = max(1, min_concurrency)
+        self._max = self._hard_max
+        self._in_flight = 0
+        self._cond = asyncio.Condition()
+        self._error_streak = 0
+        self._success_streak = 0
+        self._increase_after = 5
+        self._decrease_after = 2
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._in_flight >= self._max:
+                await self._cond.wait()
+            self._in_flight += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._cond.notify_all()
+
+    def record_success(self) -> None:
+        self._success_streak += 1
+        self._error_streak = 0
+        if self._success_streak >= self._increase_after and self._max < self._hard_max:
+            self._max += 1
+            self._success_streak = 0
+
+    def record_failure(self) -> None:
+        self._error_streak += 1
+        self._success_streak = 0
+        if self._error_streak >= self._decrease_after and self._max > self._min:
+            self._max -= 1
+            self._error_streak = 0
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.release()
+
+
+def resolve_thesis_db(session_id: str, workspace_id: Optional[str] = None) -> ThesisSessionDB:
+    """Prefer the DB that actually contains the session/workspace context."""
+    db = ThesisSessionDB(session_id)
+    if workspace_id and workspace_id != session_id:
+        try:
+            has_topic = bool(db.get_topic())
+            has_objectives = bool(db.get_objectives().get("specific"))
+        except Exception:
+            has_topic = False
+            has_objectives = False
+        if not has_topic and not has_objectives:
+            ws_db = ThesisSessionDB(workspace_id)
+            try:
+                ws_has_topic = bool(ws_db.get_topic())
+                ws_has_objectives = bool(ws_db.get_objectives().get("specific"))
+            except Exception:
+                ws_has_topic = False
+                ws_has_objectives = False
+            if ws_has_topic or ws_has_objectives:
+                return ws_db
+    return db
 
 
 def add_source_after_diagrams(content: str, section_title: str = "") -> str:
@@ -197,7 +268,7 @@ class ResearchResult:
         venue_str = f" *{self.venue}*." if self.venue else ""
         if url:
             return f"{author_str} ({self.year}). {self.title}.{venue_str} {url}"
-from services.chapter_state import ChapterState, ResearchResult, SectionContent, AgentStatus
+from services.chapter_state import ChapterState, SectionContent, AgentStatus
 
 
 # Available background writing styles
@@ -279,6 +350,34 @@ class ResearchSwarm:
     
     def __init__(self, state: ChapterState):
         self.state = state
+        try:
+            max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
+        except ValueError:
+            max_concurrency = 4
+        existing_limiter = self.state.parameters.get("llm_limiter")
+        if existing_limiter:
+            self._llm_limiter = existing_limiter
+        else:
+            self._llm_limiter = AdaptiveLimiter(max_concurrency=max_concurrency, min_concurrency=1)
+            self.state.parameters["llm_limiter"] = self._llm_limiter
+        try:
+            self._section_stagger_seconds = float(os.getenv("LLM_SECTION_STAGGER_SECONDS", "0.2"))
+        except ValueError:
+            self._section_stagger_seconds = 0.2
+        try:
+            self._per_agent_section_concurrency = int(os.getenv("LLM_AGENT_SECTION_CONCURRENCY", "2"))
+        except ValueError:
+            self._per_agent_section_concurrency = 2
+        existing_lock = self.state.parameters.get("citation_lock")
+        if existing_lock:
+            self._citation_lock = existing_lock
+        else:
+            self._citation_lock = asyncio.Lock()
+            self.state.parameters["citation_lock"] = self._citation_lock
+        try:
+            self._section_stagger_seconds = float(os.getenv("LLM_SECTION_STAGGER_SECONDS", "0.2"))
+        except ValueError:
+            self._section_stagger_seconds = 0.2
     
     async def search_all(self) -> Dict[str, List[ResearchResult]]:
         """Run all search agents in parallel."""
@@ -392,7 +491,49 @@ class ResearchSwarm:
             if identifier and identifier not in seen_identifiers:
                 seen_identifiers.add(identifier)
                 unique_results.append(result)
+
+        # If we are still below target, expand search using objectives
+        target_min = 70
+        if len(unique_results) < target_min:
+            objectives = []
+            if isinstance(self.state.objectives, dict):
+                objectives = self.state.objectives.get("specific", []) or []
+            elif isinstance(self.state.objectives, list):
+                objectives = self.state.objectives
+
+            extra_queries = []
+            for obj in objectives[:6]:
+                clean_obj = re.sub(r'^to\s+', '', str(obj).strip(), flags=re.IGNORECASE)
+                if clean_obj:
+                    extra_queries.append(f"{clean_obj} {self.state.topic}")
+
+            for idx, query in enumerate(extra_queries, 1):
+                try:
+                    await events.publish(
+                        self.state.job_id,
+                        "log",
+                        {
+                            "message": f"🔎 Expanded objective search {idx}/{len(extra_queries)}: {query[:60]}..."
+                        },
+                        session_id=self.state.session_id
+                    )
+                    extra_results = await self._search_agent(
+                        agent_id=f"objective_expand_{idx}",
+                        scope=query,
+                        quota=15
+                    )
+                    for result in extra_results:
+                        identifier = result.doi if result.doi else result.title
+                        if identifier and identifier not in seen_identifiers:
+                            seen_identifiers.add(identifier)
+                            unique_results.append(result)
+                    if len(unique_results) >= target_min:
+                        break
+                except Exception as extra_err:
+                    print(f"Objective expansion failed: {extra_err}")
         
+        await self._include_uploaded_sources(unique_results, seen_identifiers)
+
         # Store in state for citation tracking
         self.state.chapter2_citation_pool = unique_results
         
@@ -435,7 +576,9 @@ class ResearchSwarm:
         await events.connect()
         
         # Build query
-        if agent_id == "local":
+        if agent_id.startswith("expanded_search_"):
+            query = scope
+        elif agent_id == "local":
             query = f"{self.state.topic} {self.state.case_study}"
         else:
             query = f"{self.state.topic} {scope}"
@@ -450,7 +593,11 @@ class ResearchSwarm:
         
         try:
             # Call academic search (correct method name)
-            raw_results = await academic_search_service.search_academic_papers(query, max_results=quota)
+            raw_results = await academic_search_service.search_academic_papers(
+                query,
+                max_results=quota,
+                workspace_id=self.state.workspace_id
+            )
             
             # Convert to ResearchResult objects and save to sources library
             papers = []
@@ -470,11 +617,21 @@ class ResearchSwarm:
                     
                     # Save to sources library (async)
                     try:
+                        normalized_authors = []
+                        for author in research.authors or []:
+                            if isinstance(author, dict):
+                                name = author.get("name") or author.get("family") or author.get("given") or ""
+                                if name:
+                                    normalized_authors.append(str(name))
+                            else:
+                                name = str(author).strip()
+                                if name:
+                                    normalized_authors.append(name)
                         await sources_service.add_source(
                             workspace_id=self.state.workspace_id,
                             source_data={
                                 "title": research.title,
-                                "authors": research.authors,
+                                "authors": normalized_authors,
                                 "year": research.year,
                                 "doi": research.doi,
                                 "url": research.url or (f"https://doi.org/{research.doi}" if research.doi else ""),
@@ -509,15 +666,69 @@ class ResearchSwarm:
             )
             
             return papers
-            
+        
         except Exception as e:
             print(f"Search agent {agent_id} error: {e}")
             return []
 
+    async def _include_uploaded_sources(self, unique_results: List[ResearchResult], seen_identifiers: set):
+        """Fetch retrieval results for uploaded PDFs/data and add them to the research pool."""
+        try:
+            user_results = await search_user_documents(
+                workspace_id=self.state.workspace_id,
+                query=self.state.topic,
+                n_results=8
+            )
+        except Exception as upload_err:
+            print(f"⚠️ Uploaded sources search failed: {upload_err}")
+            return
+
+        added = 0
+        for entry in user_results.get("results", []):
+            metadata = entry.get("metadata", {}) or {}
+            doc_id = metadata.get("document_id") or metadata.get("filename")
+            identifier = f"user_upload:{doc_id or entry.get('id')}"
+            if not doc_id or identifier in seen_identifiers:
+                continue
+
+            title = metadata.get("title") or metadata.get("filename") or "User Uploaded Document"
+            author = metadata.get("author")
+            authors = [author] if author else ["User Upload"]
+            year_val = metadata.get("year")
+            try:
+                year = int(year_val)
+            except (TypeError, ValueError):
+                year = datetime.now().year
+
+            research = ResearchResult(
+                title=title,
+                authors=authors,
+                year=year,
+                doi="",
+                url=metadata.get("file_path") or metadata.get("filename") or "",
+                abstract=(entry.get("text") or "")[:500],
+                source="user_upload",
+                venue=metadata.get("filename", "")
+            )
+
+            unique_results.append(research)
+            seen_identifiers.add(identifier)
+            added += 1
+
+        if added:
+            await events.publish(
+                self.state.job_id,
+                "log",
+                {"message": f"📄 Added {added} user-uploaded source{'s' if added != 1 else ''} to the research pool"},
+                session_id=self.state.session_id
+            )
+
 
 class WriterSwarm:
     """Parallel writer agents that generate sections."""
-    
+
+    _per_agent_section_concurrency: int = 2
+
     # University of Juba Graduate Format - 6 Chapter Structure (Chapter One focus)
     # needs_citations: True = heavy citation with synthesis, False = minimal/no citations needed
     SECTION_CONFIGS = [
@@ -566,6 +777,33 @@ class WriterSwarm:
             ]
         },
     ]
+
+    def __init__(self, state: ChapterState):
+        self.state = state
+        try:
+            max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
+        except ValueError:
+            max_concurrency = 4
+        existing_limiter = self.state.parameters.get("llm_limiter")
+        if existing_limiter:
+            self._llm_limiter = existing_limiter
+        else:
+            self._llm_limiter = AdaptiveLimiter(max_concurrency=max_concurrency, min_concurrency=1)
+            self.state.parameters["llm_limiter"] = self._llm_limiter
+        try:
+            self._section_stagger_seconds = float(os.getenv("LLM_SECTION_STAGGER_SECONDS", "0.2"))
+        except ValueError:
+            self._section_stagger_seconds = 0.2
+        try:
+            self._per_agent_section_concurrency = int(os.getenv("LLM_AGENT_SECTION_CONCURRENCY", "2"))
+        except ValueError:
+            self._per_agent_section_concurrency = 2
+        existing_lock = self.state.parameters.get("citation_lock")
+        if existing_lock:
+            self._citation_lock = existing_lock
+        else:
+            self._citation_lock = asyncio.Lock()
+            self.state.parameters["citation_lock"] = self._citation_lock
     
     # -------------------------------------------------------------------------
     # GENERAL THESIS (5-CHAPTER) FORMAT CONFIGURATIONS
@@ -705,8 +943,20 @@ class WriterSwarm:
     
     
 
-    def __init__(self, state: ChapterState):
-        self.state = state
+    def _get_objective_list(self, max_items: int = 5) -> List[str]:
+        """Return a safe list of objectives regardless of stored structure."""
+        objectives = getattr(self.state, "objectives", None)
+        if not objectives:
+            return []
+        if isinstance(objectives, dict):
+            candidates = objectives.get("specific") or objectives.get("general") or []
+        else:
+            candidates = objectives
+        if isinstance(candidates, str):
+            candidates = [candidates]
+        if not isinstance(candidates, list):
+            return []
+        return [o for o in candidates if isinstance(o, str) and o.strip()][:max_items]
     
     async def write_all(self) -> Dict[str, SectionContent]:
         """Run all writer agents in parallel."""
@@ -853,48 +1103,48 @@ class WriterSwarm:
         )
         
         results = {}
-        
-        for section_config in sections:
+        per_agent_limit = getattr(self, "_per_agent_section_concurrency", 2)
+        per_agent_sem = asyncio.Semaphore(max(1, per_agent_limit))
+
+        async def run_section(section_config: Dict[str, Any], section_index: int) -> None:
             section_id = section_config["id"]
             title = section_config["title"]
             paragraphs = section_config.get("paragraphs", 2)
             source_scopes = section_config.get("sources", [])
             structure = section_config.get("structure", "standard")
-            
+
             # Update: Now writing this specific section
             await events.publish(
                 self.state.job_id,
                 "agent_activity",
                 {
-                    "agent": agent_id, 
-                    "agent_name": f"Writer: {agent_id.replace('_', ' ').title()}", 
-                    "status": "running", 
-                    "action": f"Writing §{section_id}: {title[:40]}...", 
+                    "agent": agent_id,
+                    "agent_name": f"Writer: {agent_id.replace('_', ' ').title()}",
+                    "status": "running",
+                    "action": f"Writing §{section_id}: {title[:40]}...",
                     "icon": "✍️",
                     "type": "chapter_generator"
                 },
                 session_id=self.state.session_id
             )
-            
+
             await events.publish(
                 self.state.job_id,
                 "log",
                 {"message": f"✍️ [{agent_id}] Writing section {section_id}: {title}..."},
                 session_id=self.state.session_id
             )
-            
+
             # Gather relevant papers for this section
             relevant_papers = []
-            
+
             # For Chapter 2, use fresh citations from pool
             if section_id.startswith("2.") and hasattr(self.state, 'chapter2_citation_pool'):
-                # Calculate citations needed (4 per paragraph)
                 citations_needed = paragraphs * 4
-                
-                # Get fresh, unused citations
-                fresh_citations = self.state.get_fresh_citations(citations_needed)
+                async with self._citation_lock:
+                    fresh_citations = self.state.get_fresh_citations(citations_needed)
                 relevant_papers = fresh_citations
-                
+
                 remaining = self.state.get_remaining_count()
                 await events.publish(
                     self.state.job_id,
@@ -903,21 +1153,18 @@ class WriterSwarm:
                     session_id=self.state.session_id
                 )
             else:
-                # For other chapters, use traditional scope-based approach
                 for scope in source_scopes:
                     relevant_papers.extend(self.state.research.get(scope, []))
-            
-            # Build citation context (only if section needs citations)
+
             needs_citations = section_config.get("needs_citations", True)
             style = section_config.get("style", "synthesis")
-            
+
             if needs_citations and relevant_papers:
                 citation_context = self._build_citation_context(relevant_papers)
             else:
                 citation_context = ""
-            
+
             # Build prompt based on style
-            structure = section_config.get("structure", "standard")
             if structure == "inverted_pyramid":
                 prompt = self._build_pyramid_prompt(section_id, title, paragraphs, citation_context)
             elif style == "synthesis":
@@ -930,7 +1177,6 @@ class WriterSwarm:
                 prompt = self._build_scope_prompt(section_id, title, style)
             elif style == "definitions":
                 prompt = self._build_definitions_prompt(section_id, title, citation_context)
-            # General Thesis Styles (User Custom)
             elif style == "general_intro":
                 prompt = self._build_general_intro_prompt(section_id, title, citation_context)
             elif style == "general_background":
@@ -959,24 +1205,18 @@ class WriterSwarm:
                 prompt = self._build_definitions_gen_prompt(section_id, title, citation_context)
             elif style == "organization_5chapter":
                 prompt = self._build_organization_5chapter_prompt(section_id, title)
-            
-            # General Chapter 2 Styles (User Custom)
             elif style == "general_chapter2_intro":
                 prompt = self._build_general_lit_intro_prompt(section_id, title)
             elif style == "general_theory_main":
                 prompt = self._build_general_theory_main_prompt(section_id, title, citation_context)
             elif style == "general_theory_obj":
-                # Extract objective text from config if possible, else generic
                 obj_text = section_config.get("objective_text", "study objectives")
                 prompt = self._build_general_theory_obj_prompt(section_id, title, obj_text, citation_context)
             elif style == "general_empirical":
-                # Extract objective from config
                 obj_text = section_config.get("objective_text", "")
                 prompt = self._build_general_empirical_prompt(section_id, title, obj_text, citation_context)
             elif style == "general_lit_summary":
                 prompt = self._build_general_lit_summary_prompt(section_id, title)
-
-            # Chapter Two styles (PhD Standard)
             elif style == "lit_intro":
                 prompt = self._build_lit_intro_prompt(section_id, title)
             elif style == "framework_intro":
@@ -993,7 +1233,6 @@ class WriterSwarm:
                 prompt = self._build_literature_gap_prompt(section_id, title, citation_context)
             elif style == "conceptual_framework":
                 prompt = self._build_conceptual_framework_prompt(section_id, title, citation_context)
-            # Chapter Three styles - Methodology
             elif style == "methodology_intro":
                 prompt = self._build_methodology_intro_prompt(section_id, title)
             elif style == "research_philosophy":
@@ -1002,7 +1241,7 @@ class WriterSwarm:
                 prompt = self._build_research_design_prompt(section_id, title, citation_context)
             elif style == "target_population":
                 prompt = self._build_target_population_prompt(section_id, title, citation_context)
-            elif style == "sampling_procedures":
+            elif style in ["sampling_procedures", "sampling_design"]:
                 prompt = self._build_sampling_procedures_prompt(section_id, title, citation_context)
             elif style == "sample_size":
                 prompt = self._build_sample_size_prompt(section_id, title, citation_context)
@@ -1018,10 +1257,7 @@ class WriterSwarm:
                 prompt = self._build_ethical_considerations_prompt(section_id, title, citation_context)
             else:
                 prompt = self._build_standard_prompt(section_id, title, paragraphs, citation_context)
-            
-            # CRITICAL CHECK: Inject Methodology Context for Chapter 3
-            # This ensures the LLM adheres to the consistency manager's calculated values (n, population, etc.)
-            # and prevents hallucinated calculations (like Yamane deriving n=382 when user said n=120).
+
             if self.state.chapter_number == 3:
                 meth_ctx = self.state.parameters.get('methodology_context')
                 if meth_ctx:
@@ -1032,54 +1268,52 @@ class WriterSwarm:
                     context_injection += f"RESEARCH DESIGN: {meth_ctx.get('research_design', 'survey')}\n"
                     context_injection += f"SAMPLING TECHNIQUE: {meth_ctx.get('sampling', {}).get('technique', '')}\n"
                     context_injection += f"JUSTIFICATION: {meth_ctx.get('sampling', {}).get('justification', '')}\n"
-                    
                     preferred = meth_ctx.get('preferred_analyses', [])
                     if preferred:
                         context_injection += f"PREFERRED ANALYSES: {', '.join(preferred)}\n"
-                    
                     context_injection += "========================================================\n"
-                    
                     prompt += context_injection
 
-            # Inject Custom Instructions again for specific emphasis if for this section
             custom_instr = self.state.parameters.get('custom_instructions', '')
             if custom_instr:
                 prompt = f"=== USER DIRECTION ===\n{custom_instr}\n====================\n\n" + prompt
-            
+
             try:
-                # Add small delay to avoid rate limiting (stagger parallel calls)
-                await asyncio.sleep(0.5 * sections.index(section_config) if section_config in sections else 0)
-                
-                # Generate content with retry
+                stagger = self._section_stagger_seconds * section_index
+                if stagger:
+                    await asyncio.sleep(stagger)
+
                 content = None
-                for attempt in range(3):  # 3 attempts
+                for attempt in range(3):
                     try:
-                        content = await deepseek_direct_service.generate_content(
-                            prompt=prompt,
-                            system_prompt=self._get_system_prompt(),
-                            temperature=0.7,
-                            max_tokens=4000  # Limit for section
-                        )
+                        async with self._llm_limiter:
+                            content = await deepseek_direct_service.generate_content(
+                                prompt=prompt,
+                                system_prompt=self._get_system_prompt(),
+                                temperature=0.7,
+                                max_tokens=4000
+                            )
                         if content:
+                            self._llm_limiter.record_success()
                             break
+                        self._llm_limiter.record_failure()
                     except Exception as retry_e:
+                        self._llm_limiter.record_failure()
                         print(f"Attempt {attempt+1} failed for {section_id}: {retry_e}")
-                        await asyncio.sleep(2 * (attempt + 1))  # Exponential backoff
-                
+                        await asyncio.sleep(2 * (attempt + 1))
+
                 if not content:
                     content = f"[Section {section_id} generation pending - will be completed in revision]"
-                
-                # CLEAN THE CONTENT
+
                 content = self._clean_generated_content(content)
-                
-                # Post-process: Add Source after ASCII diagrams
+                if relevant_papers:
+                    content = self._link_citations_to_sources(content, relevant_papers)
+
                 if '```' in content:
                     content = add_source_after_diagrams(content, title)
-                
-                # Count words
+
                 word_count = len(content.split())
-                
-                # Store result
+
                 results[section_id] = SectionContent(
                     title=title,
                     content=content,
@@ -1087,15 +1321,11 @@ class WriterSwarm:
                     word_count=word_count,
                     status="completed"
                 )
-                
-                
-                # UNIVERSAL IMAGE GENERATION for ALL diagrams (theories, Research Onion, frameworks)
-                # Enhanced image generation detection
+
                 if '```' in content:
-                    # Check for any code block - could contain ASCII diagram
                     diagram_type = None
                     content_upper = content.upper()
-                    
+
                     if style == "theory_detailed":
                         diagram_type = "theory_framework"
                     elif "RESEARCH ONION" in content_upper or "SAUNDERS" in content_upper or "CONCENTRIC" in content_upper:
@@ -1107,15 +1337,13 @@ class WriterSwarm:
                     elif "framework" in title.lower() or "conceptual" in content.lower():
                         diagram_type = "conceptual_framework"
                     else:
-                        # Generic diagram - check if code block has ASCII art patterns
                         code_blocks = content.split('```')
-                        for block in code_blocks[1::2]:  # Every other element is code block content
+                        for block in code_blocks[1::2]:
                             if any(char in block for char in ['|', '+', '-', '=', '/', '\\', '[', ']']) and len(block.split('\n')) > 3:
                                 diagram_type = "generic_diagram"
                                 break
-                    
+
                     if diagram_type:
-                        # Generate high-quality diagram image
                         print(f"🖼️ Generating {diagram_type} image for {section_id}")
                         try:
                             await self._generate_diagram_image(section_id, title, content, results, diagram_type)
@@ -1124,47 +1352,48 @@ class WriterSwarm:
                             print(f"❌ Image generation failed for {section_id}: {img_e}")
                             import traceback
                             traceback.print_exc()
-                
-                
-                
-                # Stream to frontend
+
                 await events.publish(
                     self.state.job_id,
                     "response_chunk",
                     {"chunk": f"\n\n## {section_id} {title}\n\n{results[section_id].content}\n", "accumulated": results[section_id].content},
                     session_id=self.state.session_id
                 )
-                
-                
-                # Update: Section completed - removed agent_activity to stop UI spam
-                # Only keep essential log message
-                
+
                 await events.publish(
                     self.state.job_id,
                     "log",
                     {"message": f"✅ [{agent_id}] Completed {section_id} ({word_count} words)"},
                     session_id=self.state.session_id
                 )
-                
-                # Report progress if callback available
+
                 if hasattr(self.state, 'progress_callback') and self.state.progress_callback:
                     try:
                         await self.state.progress_callback(section_id, word_count)
                     except Exception as e:
                         print(f"Progress callback error: {e}")
-            
+
             except Exception as e:
                 print(f"❌ Error writing section {section_id}: {e}")
                 import traceback
                 traceback.print_exc()
-                
-                # Add failed section placeholder
+
                 results[section_id] = SectionContent(
                     title=title,
                     content=f"Error generating content: {str(e)}",
                     citations=[],
                     status="failed"
                 )
+
+        async def run_with_gate(section_config: Dict[str, Any], section_index: int) -> None:
+            async with per_agent_sem:
+                await run_section(section_config, section_index)
+
+        tasks = [
+            run_with_gate(section_config, idx)
+            for idx, section_config in enumerate(sections)
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
         
         # Announce completion
         await events.publish(
@@ -1235,6 +1464,79 @@ class WriterSwarm:
                 cleaned_lines.append(line)
         
         return "\n".join(cleaned_lines).strip()
+
+    def _link_citations_to_sources(self, content: str, papers: List[ResearchResult]) -> str:
+        """Attach source URLs to in-text citations when possible."""
+        if not content or not papers:
+            return content
+
+        import re
+
+        url_map = {}
+        for paper in papers:
+            if not paper.authors:
+                continue
+            if paper.url and paper.url.startswith("http"):
+                url = paper.url
+            elif paper.doi:
+                url = f"https://doi.org/{paper.doi}"
+            else:
+                continue
+
+            first_author = paper.authors[0]
+            if isinstance(first_author, dict):
+                name = first_author.get("name", first_author.get("family", ""))
+            else:
+                name = str(first_author)
+            if not name:
+                continue
+
+            last_name = name.split(",")[0].strip() if "," in name else name.split()[-1]
+            year = str(paper.year)
+            if last_name and year:
+                url_map[f"{last_name.lower()}:{year}"] = url
+
+        if not url_map:
+            return content
+
+        def link_part(part: str) -> str:
+            if "](" in part:
+                return part
+            match = re.search(r"([A-Za-z][A-Za-z-']+)(?:\s+et al\.)?(?:\s*&\s+[A-Za-z][A-Za-z-']+)?\s*,\s*(\d{4})", part)
+            if not match:
+                return part
+            last = match.group(1)
+            year = match.group(2)
+            url = url_map.get(f"{last.lower()}:{year}")
+            if not url:
+                return part
+            return part.replace(match.group(0), f"[{match.group(0)}]({url})", 1)
+
+        def replace_group(match: re.Match) -> str:
+            inner = match.group(1)
+            if "](" in inner:
+                return match.group(0)
+            parts = [p.strip() for p in inner.split(";")]
+            linked_parts = [link_part(p) for p in parts]
+            return "(" + "; ".join(linked_parts) + ")"
+
+        content = re.sub(r"\(([^()]*\d{4}[^()]*)\)", replace_group, content)
+
+        def replace_narrative(match: re.Match) -> str:
+            name = match.group(1)
+            year = match.group(2)
+            key_match = re.search(r"([A-Za-z][A-Za-z-']+)", name)
+            if not key_match:
+                return match.group(0)
+            last = key_match.group(1)
+            url = url_map.get(f"{last.lower()}:{year}")
+            if not url:
+                return match.group(0)
+            return f"[{name} ({year})]({url})"
+
+        content = re.sub(r"(?<!\[)(\b[A-Z][A-Za-z-']+(?:\s+(?:&|and)\s+[A-Z][A-Za-z-']+|\s+et al\.)?)\s*\((\d{4})\)", replace_narrative, content)
+
+        return content
 
 
 
@@ -1483,7 +1785,7 @@ Style: Horizontal layout with boxes and arrows, left to right flow, clean profes
     def _build_citation_context(self, papers: List[ResearchResult]) -> str:
         """Build citation context for LLM with actual URLs."""
         if not papers and not getattr(self.state, 'uploaded_sources_context', None):
-            return "No approved sources provided. Write from general knowledge but state this limitation."
+            return "No approved sources provided. Do not add citations; explicitly state that evidence is limited."
         
         
         context = ""
@@ -1506,6 +1808,7 @@ APPROVED SOURCE LIST (cite ONLY from this list or uploaded docs):
 """
         # Filter clean papers
         clean_papers = []
+        seen_keys = set()
         for p in papers:
             # Check for valid authors
             if not p.authors:
@@ -1514,10 +1817,16 @@ APPROVED SOURCE LIST (cite ONLY from this list or uploaded docs):
             first_author = str(p.authors[0])
             if any(bad in first_author.lower() for bad in ["unknown", "anonymous", "n/a", "undefined"]):
                 continue
-                
+            identifier = p.doi or p.title
+            if not identifier:
+                continue
+            key = str(identifier).strip().lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             clean_papers.append(p)
             
-        for i, paper in enumerate(clean_papers[:15]):  # Limit to 15 papers
+        for i, paper in enumerate(clean_papers[:30]):  # Limit to 30 papers for broader coverage
             # Get the actual URL for this paper
             if paper.url and paper.url.startswith("http"):
                 url = paper.url
@@ -1528,11 +1837,14 @@ APPROVED SOURCE LIST (cite ONLY from this list or uploaded docs):
             
             context += f"{i+1}. {paper.to_apa()} - \"{paper.title}\"\n"
             # Increased truncation from 200 to 1200 for deeper grounding
-            context += f"   Abstract: {paper.abstract[:1200]}...\n"
+            if paper.abstract:
+                context += f"   Abstract: {paper.abstract[:1200]}...\n"
+            else:
+                context += "   Abstract: [Not available]\n"
             if url:
                 context += f"   URL for citation: {url}\n\n"
             else:
-                context += f"   (No URL available - cite as plain text)\n\n"
+                context += f"   (No URL available - cite as plain text, do not invent a link)\n\n"
         
         context += "\n⚠️ END OF APPROVED SOURCES. Any citation not from this list is PROHIBITED.\n"
         return context
@@ -1625,6 +1937,15 @@ APPROVED SOURCE LIST (cite ONLY from this list or uploaded docs):
 4. NATIONAL CONTEXT (2 paragraphs): Uganda-specific context
 5. LOCAL CONTEXT (1-2 paragraphs): Specific to {self.state.case_study}"""
 
+        sentence_level_citations = ""
+        if section_id == "1.2":
+            sentence_level_citations = """
+SENTENCE-LEVEL CITATION REQUIREMENT (MANDATORY FOR THIS SECTION):
+- Each sentence MUST end with its own in-text citation.
+- Do NOT place citations only at paragraph end.
+- Use 1–2 citations per sentence from the approved list; vary sources across sentences.
+"""
+
         return f"""Write section "{section_id} {title}" for a thesis chapter.
 
 TOPIC: {self.state.topic}
@@ -1634,6 +1955,7 @@ BACKGROUND STYLE: {style_config['name']}
 {structure}
 
 {citation_context}
+{sentence_level_citations}
 
 5-STEP SYNTHESIS PROCESS FOR EACH PARAGRAPH:
 1. Start with a THEMATIC SENTENCE stating the specific finding
@@ -1645,6 +1967,8 @@ BACKGROUND STYLE: {style_config['name']}
 CRITICAL REQUIREMENTS:
 - Write {paragraphs} detailed paragraphs (7-10 sentences each) following 5-step synthesis
 - MANDATORY: Minimum 3-5 citations per paragraph - high density required
+- Do NOT reuse the same study in adjacent sentences; rotate sources within each paragraph
+- Avoid citing the same author-year pair more than once in a paragraph unless absolutely necessary
 - Include methodology and statistics when available from abstracts
 - APA 7 STRICT: In-text (Author, Year), grouped at end [(Author1, Year; Author2, Year)](URL)
 - Do NOT include the section heading
@@ -1722,12 +2046,21 @@ Write the section content now (without any heading):"""
 
     def _build_synthesis_prompt(self, section_id: str, title: str, paragraphs: int, citation_context: str) -> str:
         """Build prompt for 5-step research synthesis with methodology and statistics."""
+        sentence_level_citations = ""
+        if section_id in {"1.2", "1.3"}:
+            sentence_level_citations = """
+SENTENCE-LEVEL CITATION REQUIREMENT (MANDATORY FOR THIS SECTION):
+- Each sentence MUST end with its own in-text citation.
+- Do NOT place citations only at paragraph end.
+- Use 1–2 citations per sentence from the approved list; vary sources across sentences.
+"""
         return f"""Write section "{section_id} {title}" for a thesis chapter using the 5-STEP SYNTHESIS format.
 
 TOPIC: {self.state.topic}
 CASE STUDY: {self.state.case_study}
 
 {citation_context}
+{sentence_level_citations}
 
 FOR EACH PARAGRAPH, FOLLOW THIS 5-STEP PROCESS:
 
@@ -1747,11 +2080,15 @@ FOR EACH PARAGRAPH, FOLLOW THIS 5-STEP PROCESS:
    - "Similarly, Author3 (Year) reported..."
    - "In contrast, Author4 (Year) suggested..."
 
-5. **GROUPED CITATION (APA 7)**: End paragraph with all cited sources grouped: [(Author1, Year; Author2, Year; Author3, Year; Author4, Year)](URL)
+5. **CITATIONS (APA 7)**:
+   - Default: End paragraph with grouped citations: [(Author1, Year; Author2, Year; Author3, Year; Author4, Year)](URL)
+   - If the sentence-level requirement is active, each sentence MUST carry its own citation instead of a single grouped paragraph-end citation.
 
 CRITICAL REQUIREMENTS:
 - Write {paragraphs} detailed paragraphs (8-10 sentences each)
 - MANDATORY: Minimum 4-5 citations per paragraph for high density
+- Do NOT reuse the same study in adjacent sentences; rotate sources within each paragraph
+- Avoid citing the same author-year pair more than once in a paragraph unless absolutely necessary
 - Include methodology details (sample size, method type) when available from abstracts
 - Include statistical findings if mentioned in abstracts
 - APA 7 STRICT: (Author, Year) in-text, grouped [(Author1, Year; Author2, Year)](URL) at end
@@ -1769,10 +2106,9 @@ Write the section content now (without any heading):"""
     def _build_general_intro_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         return f"""Write a brief Introduction about {self.state.topic} in {self.state.parameters.get('country', 'South Sudan')} and specifically in {self.state.case_study} with enough in-text citations. Make about three paragraphs for this Introduction and conclude the fourth paragraph outlining the outline of chapter one ie saying due to the above introduction, chapter one of this study will focus on historical background, problem statement, purpose of the study, objectives of the study outlining the general and specific objectives, research questions and hypothesis, significance of the study, scope of the study, brief methodology of the study, anticipated limitations and delimitation, assumptions of the study, definition of key terms, and summary of chapter one ... NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style.
         
-        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        Use ONLY sources from the CITATION CONTEXT below. If the approved sources do not cover a sub-topic, explicitly state that evidence is limited and do not invent citations.
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
 
-        Citations for local content use local names of that area
         Annd be brief.
         
         CITATION CONTEXT:
@@ -1781,20 +2117,19 @@ Write the section content now (without any heading):"""
 
     def _build_general_background_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
-        return f"""Sumarise in one paragraph and In one summarized and precise paragraph, Write historical Background of the study about {self.state.topic} looking at it on a global perspective with enough in text citations at the end of each line or sentence. Write the first big paragraph outlining a global perspective, then write the historical background about {self.state.topic} in sample countries or states in America, another paragraph write the historical background about {self.state.topic} in sample countries or states in Asia, another paragraph write the historical background about {self.state.topic} in sample countries or states in Australia, also another write the historical background about {self.state.topic} in sample countries or states in Europe. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style (Author, Year). use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        return f"""Sumarise in one paragraph and In one summarized and precise paragraph, Write historical Background of the study about {self.state.topic} looking at it on a global perspective with enough in text citations at the end of each line or sentence. Write the first big paragraph outlining a global perspective, then write the historical background about {self.state.topic} in sample countries or states in America, another paragraph write the historical background about {self.state.topic} in sample countries or states in Asia, another paragraph write the historical background about {self.state.topic} in sample countries or states in Australia, also another write the historical background about {self.state.topic} in sample countries or states in Europe. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style (Author, Year). Use ONLY sources from the CITATION CONTEXT below. If a region is not covered by approved sources, say evidence is limited and avoid new citations.
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
         Please sumarise and present in one small paragraph
-        Citations for local content use local names of that area
         Specifically one paragraph mentioning all country names and or places in those countries
 
         THEN:
-        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on an African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining African perspective, then write the historical background about {self.state.topic} in sample countries or states in North Africa/Arabic African Countries any of Egypt, Libya, Tunisia, Morocco, Sudan, etc, another paragraph write the historical background about {self.state.topic} in sample countries or states in South African Counties/States, another paragraph write the historical background about {self.state.topic} in sample countries or states in Central Africa, also another write the historical background about {self.state.topic} in sample countries or states in West Africa. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025. use hypothetical citations.
+        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on an African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining African perspective, then write the historical background about {self.state.topic} in sample countries or states in North Africa/Arabic African Countries any of Egypt, Libya, Tunisia, Morocco, Sudan, etc, another paragraph write the historical background about {self.state.topic} in sample countries or states in South African Counties/States, another paragraph write the historical background about {self.state.topic} in sample countries or states in Central Africa, also another write the historical background about {self.state.topic} in sample countries or states in West Africa. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025. Use ONLY sources from the CITATION CONTEXT below.
         
         THEN:
         Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on a East African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining East African perspective,, then write the historical background about {self.state.topic} in sample Districts/Villages/Places in sample countries of East Africa. In all make as much citations as possible.
         
         THEN:
-        Write historical Background of the study about {self.state.topic} looking at it on {country} perspective with in text citations. Write the first big paragraph outlining {country} perspective,, then write the historical background about {self.state.topic} in sample States, Payams, Bomas, Villages/Places in {country}. In all make as much citations as possible. Then Write A very detailed past then current situation of {self.state.topic} in {self.state.case_study}. Conclude saying it is upon the above background that this study aims to ... {self.state.topic} in {self.state.case_study}, {country}. use hypothetical citations.
+        Write historical Background of the study about {self.state.topic} looking at it on {country} perspective with in text citations. Write the first big paragraph outlining {country} perspective,, then write the historical background about {self.state.topic} in sample States, Payams, Bomas, Villages/Places in {country}. In all make as much citations as possible. Then Write A very detailed past then current situation of {self.state.topic} in {self.state.case_study}. Conclude saying it is upon the above background that this study aims to ... {self.state.topic} in {self.state.case_study}, {country}. Use ONLY sources from the CITATION CONTEXT below.
         
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
         
@@ -1814,7 +2149,7 @@ Write the section content now (without any heading):"""
         6. Attempts taken to solve this problem inside be including studies, the prblesms and gaps
         7. where information is missing put
         
-        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        Use ONLY sources from the CITATION CONTEXT below. If no approved source supports a claim, explicitly state evidence is limited and avoid inventing citations.
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
         
         CITATION CONTEXT:
@@ -1860,7 +2195,7 @@ Write the section content now (without any heading):"""
         return f"""Generate one theory by a scholar or scholars for a study about {self.state.topic}. It should be like this; The study will be guided by the theory of ... by Author(year). state what the theory says with precise in-text citations, state two authors who oppose the theory and what they say, also two authors who agree with the theory and what they say each on a specific paragraph.
         State the importance of the theory in the context of {self.state.topic}. in a new paragraph, state the importance of the theory in {self.state.case_study}. Key gaps.
         
-        use hypothetical citations, don’t include smith, Johnson, lee and other hallucinated auther details
+        Use ONLY sources from the CITATION CONTEXT below. Do not invent or guess citations.
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
         be very very detailed
         
@@ -1885,7 +2220,7 @@ Write the section content now (without any heading):"""
 
     def _build_definitions_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         return f"""Write definition of key terms on the study about {self.state.topic} in {self.state.case_study}. Present with citations.
-        use hypothetical citations.
+        Use ONLY sources from the CITATION CONTEXT below. If a definition source is not provided, explicitly state evidence is limited.
         dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher.
         """
 
@@ -1918,8 +2253,8 @@ Write the section content now (without any heading):"""
 
     def _build_general_empirical_prompt(self, section_id: str, title: str, objective: str, citation_context: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
-        return f"""Cite six hypothetical studies about the objective: "{objective}".
-        For each, make sure they are not more than five years old (2020-2025).
+        return f"""Select up to six real studies about the objective: "{objective}" from the approved source list below.
+        For each, make sure they are not more than five years old (2020-2025). If fewer than six approved sources exist, cite fewer and state evidence is limited.
         Write like this: Author (year) conducted a study about ... where the main objective was to... in ... the methodology was ..., the study found out that (with statistical results)... The study concluded that ... The study recommended that ... However, the study gap is ... Write more of the gaps. (Then cite at the end ie Author, year).
         
         Let it be from different countries in this order:
@@ -1930,7 +2265,7 @@ Write the section content now (without any heading):"""
         5. Any East African country
         6. Lastly {country}
         
-        Kindly be stating the countries. Make real citations of real studies, authors, years, studies, methodology, findings, conclusion, recommendations etc. ranges from 2019 to 2025.
+        Kindly be stating the countries only when the approved source list provides that information. Make real citations of real studies, authors, years, studies, methodology, findings, conclusion, recommendations etc. ranges from 2019 to 2025.
         
         CITATION CONTEXT:
         {citation_context}"""
@@ -2464,9 +2799,9 @@ The user has provided these specific guidelines for this thesis. You MUST priori
         """
         # Get objectives and topic for analysis
         objectives_text = ""
-        if hasattr(self.state, 'objectives') and self.state.objectives:
-            specific_objs = self.state.objectives.get("specific", [])
-            objectives_text = " ".join(specific_objs) if specific_objs else ""
+        objective_list = self._get_objective_list()
+        if objective_list:
+            objectives_text = " ".join(objective_list)
         
         topic = self.state.topic.lower()
         combined_text = (objectives_text + " " + topic).lower()
@@ -2571,10 +2906,9 @@ The user has provided these specific guidelines for this thesis. You MUST priori
         """Build prompt for methodology chapter introduction."""
         # Get objectives from state if available
         objectives_text = ""
-        if hasattr(self.state, 'objectives') and self.state.objectives:
-            specific_objs = self.state.objectives.get("specific", [])
-            if specific_objs:
-                objectives_text = f"\n\nREFERENCE OBJECTIVES (from Chapter 1):\n" + "\n".join([f"- {obj}" for obj in specific_objs[:4]])
+        objective_list = self._get_objective_list(4)
+        if objective_list:
+            objectives_text = f"\n\nREFERENCE OBJECTIVES (from Chapter 1):\n" + "\n".join([f"- {obj}" for obj in objective_list])
         
         return f"""Write section "{section_id} {title}" for Chapter Three: Research Methodology.
 
@@ -2605,8 +2939,9 @@ Write the content now:"""
     def _build_research_philosophy_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         """Build adaptive prompt for research philosophy with natural narrative flow."""
         objectives_context = ""
-        if hasattr(self.state, 'objectives') and self.state.objectives:
-            obj_text = "\n".join([f"- {obj}" for obj in self.state.objectives[:5]])
+        objective_list = self._get_objective_list()
+        if objective_list:
+            obj_text = "\n".join([f"- {obj}" for obj in objective_list])
             objectives_context = f"\n\nSTUDY OBJECTIVES (analyze to decide philosophy):\n{obj_text}\n"
         
         return f"""Write section "{section_id} {title}" - adaptive research philosophy with natural flow.
@@ -2677,7 +3012,7 @@ Source: Adapted from Saunders, Lewis & Thornhill (2019)
 - State your stance and justify with citations
 
 **5. Research Approach: Deductive vs. Inductive (1 paragraph)**
-- Compare Deductive (theory -> data, testing hypotheses) vs. Inductive (\data -> theory, building theory)
+- Compare Deductive (theory -> data, testing hypotheses) vs. Inductive (data -> theory, building theory)
 - **JUSTIFY YOUR CHOICE** based on the philosophy selected above
 - Cite methodology texts [(Sekaran & Bougie, 2016)](URL)
 
@@ -2899,8 +3234,9 @@ Write the content now:"""
         prompt_instruction = justification_data['prompt_text']
         
         objectives_context = ""
-        if hasattr(self.state, 'objectives') and self.state.objectives:
-            obj_text = "\\n".join([f"- {obj}" for obj in self.state.objectives[:5]])
+        objective_list = self._get_objective_list()
+        if objective_list:
+            obj_text = "\\n".join([f"- {obj}" for obj in objective_list])
             objectives_context = f"\\n\\nSTUDY OBJECTIVES:\\n{obj_text}\\n"
 
         return f"""Write content for sample size determination section.
@@ -2926,10 +3262,19 @@ Paragraph 1: Define sample size with scholarly citations, explain importance.
 
 Paragraph 2: Justify sampling strategy selection (e.g., Stratified Random or Purposive).
 
-**Paragraph 3 & 4 (CRITICAL JUSTIFICATION):**
-Use the **{method_name}** method as it is best suited for this study's parameters (n={config['sample_size']}, Design={config['research_design']}).
+        **Paragraph 3 & 4 (CRITICAL JUSTIFICATION):**
+        Use the **{method_name}** method as it is best suited for this study's parameters (n={config['sample_size']}, Design={config['research_design']}).
 
-{prompt_instruction}
+        {prompt_instruction}
+
+        **MANDATORY CALCULATION BLOCK (NO HEADING, USE BOLD LABEL ONLY):**
+        After paragraph 4, add:
+        **Sample Size Calculation (Step-by-Step):**
+        - Provide a numbered list with each step on its own line.
+        - Always show the values used (N, e, Z/χ², P) where applicable.
+        - Include the formula on its own line using $$...$$.
+        - Show substitution, simplification, and final result ≈ n={config['sample_size']}.
+        - If the method is non-formula (e.g., saturation or rule-of-thumb), show the decision steps and numeric justification (range/threshold → selected n).
 
 Paragraph 5: Justify adequacy, mention power analysis if applicable.
 
@@ -2947,11 +3292,12 @@ Paragraph 6: Present distribution table (if applicable for n={config['sample_siz
 
 Paragraph 7: Interpret table.
 
-**FORMATTING RULES:**
-- NO section heading
-- UK English spelling
-- Past tense throughout
-- $$formula$$ for LaTeX
+        **FORMATTING RULES:**
+        - NO section heading
+        - UK English spelling
+        - Past tense throughout
+        - Display equations on their own line using $$...$$ (no inline formulas)
+        - If any formula is used, include a numbered, step-by-step calculation list
 - Markdown tables with | pipes
 - **Bold** for totals row
 - NO PLACEHOLDERS - use realistic {self.state.case_study} context
@@ -2961,8 +3307,9 @@ Write the content now:"""
     def _build_data_instruments_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         """Build data instruments prompt with intelligent tool selection."""
         objectives_context = ""
-        if hasattr(self.state, 'objectives') and self.state.objectives:
-            obj_text = "\n".join([f"- {obj}" for obj in self.state.objectives[:5]])
+        objective_list = self._get_objective_list()
+        if objective_list:
+            obj_text = "\n".join([f"- {obj}" for obj in objective_list])
             objectives_context = f"\n\nSTUDY OBJECTIVES (analyze to decide tools):\n{obj_text}\n"
         
         return f"""Write content for data collection instruments section.
@@ -3099,6 +3446,7 @@ Where:
 - K = number of items in the scale
 - σ²(yi) = variance of individual item i
 - σ²(x) = variance of total scores
+Then provide a numbered, step-by-step calculation list on separate lines. If no numeric values are provided, keep the steps symbolic (do NOT invent numbers).
 
 Paragraph 3: Explain interpretation thresholds:
 - α > 0.9 = Excellent
@@ -3116,6 +3464,7 @@ $$CVI = \\frac{{\\text{{Experts rating relevant}}}}{{\\text{{Total experts}}}}$$
 
 - Construct validity: Factor analysis (EFA/CFA)
 - Cite (Polit & Beck, 2006; Hair et al., 2019)
+After the CVI formula, include a short numbered list of calculation steps (symbolic only if data are not provided).
 
 Paragraph 5: Describe pilot study (n=30, location, date, purpose)
 NO PLACEHOLDERS like "University of X"
@@ -3140,7 +3489,8 @@ Paragraph 7: Interpret results - all scales exceeded α > 0.70, no items {self._
 - NO section heading
 - UK English spelling (whilst, amongst, analyse)
 - Past tense throughout (was, were)
-- $$formula$$ for LaTeX (NOT \\( \\))
+- Display equations on their own line using $$...$$ (no inline formulas)
+- If any formula is used, include a numbered, step-by-step calculation list on separate lines
 - Markdown tables with | pipes
 - **Bold** for totals row
 - *Italics* for source line
@@ -3242,6 +3592,7 @@ Write 6 paragraphs:
 - Introduce **Pearson Correlation Coefficient (r)** for examining relationships
 - Formula:
 $$r = \\frac{{\\sum(x_i - \\bar{{x}})(y_i - \\bar{{y}})}}{{\\sqrt{{\\sum(x_i - \\bar{{x}})^2 \\sum(y_i - \\bar{{y}})^2}}}}$$
+- After the formula, add a numbered list of calculation steps on separate lines (symbolic steps only; do NOT invent data).
 - Interpret r values: -1 to +1 (strength and direction)
 - Purpose: Test associations between independent and dependent variables
 - Cite [(Cohen, 1988)](URL)
@@ -3260,6 +3611,7 @@ Where:
 - β₀ = Intercept
 - β₁, β₂, β₃ = Regression coefficients
 - ε = Error term
+Then provide a numbered, step-by-step list describing how the model was estimated (no numeric values unless provided).
 
 **Paragraph 2: Regression Assumptions and Tests**
 - Mention assumptions: Linearity, Normality, Homoscedasticity, No Multicollinearity
@@ -3275,6 +3627,8 @@ CRITICAL REQUIREMENTS:
 - **CITATION DISTRIBUTION**: Distribute citations naturally.
 - APA 7 format
 - Do NOT include section heading
+- Display equations on their own line using $$...$$ (no inline formulas)
+- If any formula is used, include a numbered, step-by-step calculation list on separate lines
 
 Write the content now:"""
 
@@ -3542,26 +3896,38 @@ class QualitySwarm:
             session_id=self.state.session_id
         )
         
-        # Check section completeness
-        expected_sections = ["1.1", "1.2", "1.3", "1.4", "1.4.1", "1.4.2", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"]
+        chapter_num = getattr(self.state, "chapter_number", 1)
+        expected_map = {
+            1: ["1.1", "1.2", "1.3", "1.4", "1.4.1", "1.4.2", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"],
+            3: ["3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12"]
+        }
+        expected_sections = expected_map.get(
+            chapter_num,
+            [sec for sec in self.state.sections.keys() if sec.startswith(f"{chapter_num}.")]
+        )
         present_sections = list(self.state.sections.keys())
-        missing = set(expected_sections) - set(present_sections)
-        
-        # Check alignment between objectives and research questions
-        objectives_content = self.state.sections.get("1.4.2", self.state.sections.get("1.4", SectionContent("", "", [], "pending", 0))).content
-        questions_content = self.state.sections.get("1.5", SectionContent("", "", [], "pending", 0)).content
-        
-        # Simple alignment check - count numbered items
-        obj_count = len([line for line in objectives_content.split('\n') if line.strip().startswith(('i.', 'ii.', 'iii.', 'iv.', '1.', '2.', '3.', '4.'))])
-        q_count = len([line for line in questions_content.split('\n') if line.strip().startswith(('i.', 'ii.', 'iii.', 'iv.', '1.', '2.', '3.', '4.'))])
-        
-        coherence_score = len(set(present_sections) & set(expected_sections)) / len(expected_sections)
-        
+
+        objectives_content = ""
+        questions_content = ""
+        obj_count = 0
+        q_count = 0
+        if chapter_num == 1:
+            objectives_content = self.state.sections.get("1.4.2", self.state.sections.get("1.4", SectionContent("", "", [], "pending", 0))).content
+            questions_content = self.state.sections.get("1.5", SectionContent("", "", [], "pending", 0)).content
+            obj_count = len([line for line in objectives_content.split('\n') if line.strip().startswith(('i.', 'ii.', 'iii.', 'iv.', '1.', '2.', '3.', '4.'))])
+            q_count = len([line for line in questions_content.split('\n') if line.strip().startswith(('i.', 'ii.', 'iii.', 'iv.', '1.', '2.', '3.', '4.'))])
+
+        coherence_score = 0
+        if expected_sections:
+            coherence_score = len(set(present_sections) & set(expected_sections)) / len(expected_sections)
+
         status = "✅" if coherence_score >= 0.8 else "⚠️"
+        objectives_label = str(obj_count) if chapter_num == 1 else "n/a"
+        questions_label = str(q_count) if chapter_num == 1 else "n/a"
         await events.publish(
             self.state.job_id,
             "log",
-            {"message": f"{status} Coherence Agent: {len(present_sections)}/{len(expected_sections)} sections, {obj_count} objectives, {q_count} questions"},
+            {"message": f"{status} Coherence Agent: {len(present_sections)}/{len(expected_sections)} sections, {objectives_label} objectives, {questions_label} questions"},
             session_id=self.state.session_id
         )
     
@@ -3694,6 +4060,119 @@ class ParallelChapterGenerator:
     
     def __init__(self):
         self.state: Optional[ChapterState] = None
+
+    def _normalize_objectives(self, objectives: Any) -> List[str]:
+        """Normalize objectives to a clean list of strings."""
+        if not objectives:
+            return []
+        if isinstance(objectives, dict):
+            candidates = objectives.get("specific") or objectives.get("general") or []
+            return [o for o in candidates if isinstance(o, str) and o.strip()]
+        if isinstance(objectives, list):
+            return [o for o in objectives if isinstance(o, str) and o.strip()]
+        return []
+
+    def _extract_objective_keywords(self, objective: str) -> List[str]:
+        """Extract key terms for objective coverage checks."""
+        stop_words = {
+            "the", "and", "for", "with", "from", "that", "this", "which", "their", "of", "in",
+            "on", "a", "an", "between", "among", "to", "assess", "examine", "analyze",
+            "evaluate", "investigate", "determine", "study", "explore", "impact", "effect",
+            "influence", "relationship", "role", "factors", "factors", "case", "study"
+        }
+        cleaned = re.sub(r"[^\w\s]", " ", objective.lower())
+        tokens = [t for t in cleaned.split() if len(t) > 3 and t not in stop_words]
+        # Keep first few unique tokens for stable matching
+        seen = set()
+        keywords = []
+        for token in tokens:
+            if token not in seen:
+                seen.add(token)
+                keywords.append(token)
+            if len(keywords) >= 6:
+                break
+        return keywords
+
+    def _audit_objective_coverage(self, content: str, objectives: List[str]) -> List[str]:
+        """Return objectives that are not clearly covered in the content."""
+        if not objectives:
+            return []
+        lower_content = content.lower()
+        missing = []
+        for obj in objectives:
+            obj_clean = obj.strip()
+            if not obj_clean:
+                continue
+            if obj_clean.lower() in lower_content:
+                continue
+            keywords = self._extract_objective_keywords(obj_clean)
+            if not keywords:
+                missing.append(obj_clean)
+                continue
+            hit_count = sum(1 for kw in keywords if kw in lower_content)
+            if hit_count < max(1, min(2, len(keywords))):
+                missing.append(obj_clean)
+        return missing
+
+    async def _enforce_quality_gates(
+        self,
+        content: str,
+        chapter_number: int,
+        job_id: str,
+        session_id: str,
+        sample_size: Optional[int] = None,
+        objectives: Any = None
+    ) -> None:
+        """Enforce PhD quality thresholds and objective coverage."""
+        from services.phd_quality_checker import PhDQualityChecker
+        from core.config import settings
+
+        metadata = {}
+        if sample_size:
+            metadata["sample_size"] = sample_size
+
+        checker = PhDQualityChecker()
+        report = checker.check_chapter(content, chapter_number=chapter_number, metadata=metadata)
+
+        await events.publish(
+            job_id,
+            "log",
+            {"message": f"QUALITY CHECK: score={report['overall_score']:.1f}/{settings.PHD_QUALITY_MIN_SCORE} "
+                        f"level={report['quality_level']} critical={report['critical_issues']} major={report['major_issues']}"},
+            session_id=session_id
+        )
+
+        objectives_list = self._normalize_objectives(objectives)
+        missing_objectives = []
+        if chapter_number in [2, 3, 4, 5] and objectives_list:
+            missing_objectives = self._audit_objective_coverage(content, objectives_list)
+            if missing_objectives:
+                sample_missing = "; ".join(missing_objectives[:3])
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"OBJECTIVE COVERAGE FAIL: {len(missing_objectives)} objectives not clearly covered (e.g., {sample_missing})"},
+                    session_id=session_id
+                )
+
+        # Enforce minimum PhD standards
+        quality_failed = report["overall_score"] < settings.PHD_QUALITY_MIN_SCORE or report["critical_issues"] > 0
+        objectives_failed = bool(missing_objectives) and settings.PHD_OBJECTIVE_COVERAGE_STRICT
+        failed = quality_failed or objectives_failed
+
+        if failed:
+            if settings.PHD_QUALITY_STRICT:
+                raise ValueError(
+                    f"Quality gate failed for Chapter {chapter_number}: "
+                    f"score={report['overall_score']:.1f}, critical={report['critical_issues']}, "
+                    f"missing_objectives={len(missing_objectives)}"
+                )
+            await events.publish(
+                job_id,
+                "log",
+                {"message": f"QUALITY WARNING: Chapter {chapter_number} failed gates but strict mode is OFF (continuing)."},
+                session_id=session_id
+            )
     
     async def generate(
         self,
@@ -3705,7 +4184,8 @@ class ParallelChapterGenerator:
         background_style: str = "inverted_pyramid",
         thesis_type: str = "phd",
         sample_size: int = None,
-        objectives: List[str] = None
+        objectives: List[str] = None,
+        allow_quality_failure: bool = False
     ) -> str:
         """Generate full chapter using parallel agents."""
         
@@ -3759,7 +4239,7 @@ class ParallelChapterGenerator:
         # PhD theses use standard structure with "Setting the Scene" etc.
         if thesis_type == "general":
              # Retrieve country from entities or default
-             db = ThesisSessionDB(session_id)
+             db = resolve_thesis_db(session_id, workspace_id)
              country = "South Sudan"  # Default country for UoJ theses
              
              # Need objectives for UoJ Chapter 1
@@ -3835,11 +4315,21 @@ class ParallelChapterGenerator:
                                     self.state.research["continuous"].append(research)
                                     
                                     # Save to sources
+                                    normalized_authors = []
+                                    for author in research.authors or []:
+                                        if isinstance(author, dict):
+                                            name = author.get("name") or author.get("family") or author.get("given") or ""
+                                            if name:
+                                                normalized_authors.append(str(name))
+                                        else:
+                                            name = str(author).strip()
+                                            if name:
+                                                normalized_authors.append(name)
                                     await sources_service.add_source(
                                         workspace_id=self.state.workspace_id,
                                         source_data={
                                             "title": research.title,
-                                            "authors": research.authors,
+                                            "authors": normalized_authors,
                                             "year": research.year,
                                             "doi": research.doi,
                                             "url": research.url,
@@ -3874,6 +4364,27 @@ class ParallelChapterGenerator:
         
         quality_swarm = QualitySwarm(self.state)
         final_content = await quality_swarm.validate_and_combine()
+
+        # Enforce PhD-quality gates before saving
+        if thesis_type != "general":
+            try:
+                await self._enforce_quality_gates(
+                    final_content,
+                    chapter_number=self.state.chapter_number,
+                    job_id=job_id,
+                    session_id=session_id,
+                    sample_size=sample_size,
+                    objectives=None
+                )
+            except ValueError as quality_error:
+                if not allow_quality_failure:
+                    raise
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 1 quality gate failed (continuing): {quality_error}"},
+                    session_id=session_id
+                )
         
         # Stop background search
         background_search.cancel()
@@ -4057,7 +4568,8 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         objectives: Dict[str, Any] = None,  # Can pass directly or load from DB
         research_questions: List[str] = None,
         thesis_type: str = "phd",
-        sample_size: int = None
+        sample_size: int = None,
+        allow_quality_failure: bool = False
     ) -> str:
         """Generate Chapter Two - Literature Review with massive parallelization.
         
@@ -4091,12 +4603,12 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         
         try:
             from services.thesis_session_db import ThesisSessionDB
-            db = ThesisSessionDB(session_id)
+            db = resolve_thesis_db(session_id, workspace_id)
             db.create_session(topic, case_study)
             
             # Load or use provided objectives
             if objectives:
-                saved_objectives = objectives
+                saved_objectives = normalize_objectives(objectives, topic, case_study)
             else:
                 saved_objectives = db.get_objectives()
             
@@ -4108,7 +4620,7 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         except Exception as db_error:
             print(f"⚠️ Database unavailable for Chapter 2, using defaults: {db_error}")
             # Continue without database - will use defaults below
-            saved_objectives = objectives  # Use provided objectives if any
+            saved_objectives = normalize_objectives(objectives, topic, case_study) if objectives else None  # Use provided objectives if any
             questions = research_questions  # Use provided questions if any
         
         # Generate default objectives if not loaded from DB
@@ -4200,8 +4712,14 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
             {"chunk": f"# 📚 Generating Chapter Two - Literature Review\n\n**Topic:** {topic}\n**Objectives loaded:** {len(saved_objectives.get('specific', []))}\n**Themes:** {len(themes)}\n\n---\n\n", "accumulated": "Starting..."},
             session_id=session_id
         )
-        
+
         # ============ PHASE 1: MASSIVE PARALLEL RESEARCH ============
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "research_swarm", "agent_name": "Research Swarm", "status": "running", "action": "Launching literature search for Chapter 2...", "icon": "🔍"},
+            session_id=session_id
+        )
         await events.publish(job_id, "log", {"message": "🔍 PHASE 1: Launching 10+ parallel research agents..."}, session_id=session_id)
         
         # Search for theories
@@ -4278,7 +4796,13 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         
         total_papers = sum(len(p) for p in self.state.research.values())
         await events.publish(job_id, "log", {"message": f"✅ Research complete: {total_papers} papers found across {len(themes) + 1} categories"}, session_id=session_id)
-        
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "research_swarm", "agent_name": "Research Swarm", "status": "completed", "action": f"Found {total_papers} papers across {len(themes) + 1} categories", "icon": "✅"},
+            session_id=session_id
+        )
+
         # ============ PHASE 2: MASSIVE PARALLEL WRITING (20+ agents) ============
         await events.publish(job_id, "log", {"message": "✍️ PHASE 2: Launching parallel writer agents..."}, session_id=session_id)
         
@@ -4343,7 +4867,7 @@ Example format:
             obj_vars = {}
             for i, obj in enumerate(specific_objectives):
                 # Call helper method to get 4 distinct headings
-                headings = await self._generate_creative_headings(obj, topic)
+                headings = await self.generate_creative_headings(obj, topic)
                 obj_vars[str(i+1)] = headings
                 # Small delay to keep API happy
                 if i < len(specific_objectives) - 1:
@@ -4559,11 +5083,60 @@ Example format:
             SECTION_CONFIGS = chapter_two_configs
         
         writer_swarm = ChapterTwoWriterSwarm(self.state)
-        
+
         # Override to use Chapter 2 configs
         writer_swarm.SECTION_CONFIGS = chapter_two_configs
-        
+
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "writer_swarm", "agent_name": "Writer Swarm", "status": "running", "action": "Writing Chapter 2 sections in parallel...", "icon": "✍️"},
+            session_id=session_id
+        )
+
         await writer_swarm.write_all()
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "writer_swarm", "agent_name": "Writer Swarm", "status": "completed", "action": f"Wrote {len(self.state.sections)} sections", "icon": "✅"},
+            session_id=session_id
+        )
+
+        expected_sections = [sec["id"] for cfg in chapter_two_configs for sec in cfg.get("sections", [])]
+        missing_sections = [sec_id for sec_id in expected_sections if sec_id not in self.state.sections]
+        if missing_sections:
+            section_lookup = {
+                section["id"]: section
+                for config in chapter_two_configs
+                for section in config.get("sections", [])
+            }
+            await events.publish(
+                job_id,
+                "log",
+                {"message": f"⚠️ Chapter 2 missing sections detected: {', '.join(missing_sections)}. Retrying generation for missing sections."},
+                session_id=session_id
+            )
+            missing_configs = [section_lookup[sec_id] for sec_id in missing_sections if sec_id in section_lookup]
+            try:
+                fallback_results = await writer_swarm._writer_agent("chapter2_fallback_writer", missing_configs)
+                for sec_id, content in fallback_results.items():
+                    self.state.sections[sec_id] = content
+            except Exception as fallback_error:
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 2 fallback generation failed: {fallback_error}. Inserting minimal placeholders."},
+                    session_id=session_id
+                )
+                for sec_id in missing_sections:
+                    section_title = section_lookup.get(sec_id, {}).get("title", "Section")
+                    self.state.sections[sec_id] = SectionContent(
+                        title=section_title,
+                        content=f"{section_title} could not be generated automatically. Please regenerate this section.",
+                        citations=[],
+                        word_count=0,
+                        status="completed"
+                    )
         
         # ============ DEBUG: VALIDATE SECTIONS WERE CREATED ============
         sections_written = len(self.state.sections)
@@ -4583,12 +5156,43 @@ Example format:
         
         # ============ PHASE 3: QUALITY CONTROL ============
         await events.publish(job_id, "log", {"message": "✓ PHASE 3: Running 4-agent quality control..."}, session_id=session_id)
-        
+
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "quality_control", "agent_name": "Quality Control", "status": "running", "action": "Validating citations and combining sections...", "icon": "✓"},
+            session_id=session_id
+        )
         quality_swarm = QualitySwarm(self.state)
         final_content = await quality_swarm.validate_and_combine()
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "quality_control", "agent_name": "Quality Control", "status": "completed", "action": "Quality checks completed", "icon": "✅"},
+            session_id=session_id
+        )
         
         # Fix chapter heading
         final_content = final_content.replace("# CHAPTER ONE\n# INTRODUCTION", "# CHAPTER TWO\n# LITERATURE REVIEW")
+
+        if thesis_type != "general":
+            try:
+                await self._enforce_quality_gates(
+                    final_content,
+                    chapter_number=2,
+                    job_id=job_id,
+                    session_id=session_id,
+                    objectives=specific_objectives
+                )
+            except ValueError as quality_error:
+                if not allow_quality_failure:
+                    raise
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 2 quality gate failed (continuing): {quality_error}"},
+                    session_id=session_id
+                )
         
         # Calculate stats
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -4639,7 +5243,8 @@ Example format:
         objectives: Dict[str, Any] = None,
         research_questions: List[str] = None,
         thesis_type: str = "phd",
-        sample_size: int = None
+        sample_size: int = None,
+        allow_quality_failure: bool = False
     ) -> str:
         """Generate Chapter Three - Research Methodology.
         
@@ -4747,6 +5352,12 @@ Example format:
             session_id=session_id
         )
         
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "research_swarm", "agent_name": "Research Swarm", "status": "running", "action": "Searching methodology sources in parallel...", "icon": "🔍"},
+            session_id=session_id
+        )
         research_swarm = ResearchSwarm(state)
         # Add methodology-specific configs
         research_swarm.SEARCH_CONFIGS = [
@@ -4755,6 +5366,12 @@ Example format:
             {"id": "data_analysis", "scope": "data analysis procedures SPSS thematic analysis qualitative quantitative triangulation", "quota": 5},
         ]
         await research_swarm.search_all()
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "research_swarm", "agent_name": "Research Swarm", "status": "completed", "action": f"Found {sum(len(p) for p in state.research.values())} methodology sources", "icon": "✅"},
+            session_id=session_id
+        )
         
         # Create a Chapter 3 writer swarm with explicit SECTION_CONFIGS
         class ChapterThreeWriterSwarm(WriterSwarm):
@@ -4779,6 +5396,101 @@ Example format:
         
         # write_all() uses SECTION_CONFIGS from the ChapterThreeWriterSwarm instance
         results = await writer_swarm.write_all()
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "writer_swarm", "agent_name": "Methodology Writers", "status": "completed", "action": f"Wrote {len(state.sections)} sections", "icon": "✅"},
+            session_id=session_id
+        )
+
+        # Ensure all expected sections are present (avoid skipped subsections)
+        expected_sections = [f"3.{i}" for i in range(1, 13)]
+        section_titles = {}
+        for config in WriterSwarm.CHAPTER_THREE_CONFIGS:
+            for sec in config.get("sections", []):
+                section_titles[sec["id"]] = sec["title"]
+
+        missing_sections = [sec_id for sec_id in expected_sections if sec_id not in state.sections]
+        if missing_sections:
+            await events.publish(
+                job_id,
+                "log",
+                {"message": f"⚠️ Chapter 3 missing sections detected: {', '.join(missing_sections)}. Retrying generation for missing sections."},
+                session_id=session_id
+            )
+            section_lookup = {}
+            for config in WriterSwarm.CHAPTER_THREE_CONFIGS:
+                for sec in config.get("sections", []):
+                    section_lookup[sec["id"]] = sec
+
+            missing_configs = [section_lookup[sec_id] for sec_id in missing_sections if sec_id in section_lookup]
+            try:
+                fallback_results = await writer_swarm._writer_agent("chapter3_fallback_writer", missing_configs)
+                for sec_id, content in fallback_results.items():
+                    state.sections[sec_id] = content
+            except Exception as fallback_error:
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 3 fallback generation failed: {fallback_error}. Inserting minimal placeholders."},
+                    session_id=session_id
+                )
+
+            still_missing = [sec_id for sec_id in expected_sections if sec_id not in state.sections]
+            for sec_id in still_missing:
+                title = section_titles.get(sec_id, "Section")
+                if sec_id == "3.8":
+                    fallback = (
+                        "Data collection instruments are the tools used to gather information from respondents in line "
+                        "with the study objectives. For this study, a structured questionnaire with a 5-point Likert scale "
+                        "and a semi-structured interview guide were adopted to capture both quantitative perceptions and "
+                        "qualitative insights from stakeholders across the case study countries. The questionnaire covered "
+                        "demographic characteristics and objective-based items, while interviews elicited contextual narratives "
+                        "on security sector reform dynamics. The instruments were designed to ensure comparability across sites "
+                        "and to support both statistical analysis and thematic interpretation."
+                    )
+                elif sec_id == "3.9":
+                    fallback = (
+                        "Validity and reliability ensured that the research instruments measured the intended constructs "
+                        "consistently and accurately. Content validity was established through expert review of the instruments, "
+                        "aligning each item with the study objectives. Reliability was assessed through a pilot study and internal "
+                        "consistency testing using Cronbach’s alpha, with coefficients exceeding the acceptable threshold of 0.70. "
+                        "These procedures strengthened the credibility of the collected data and supported robust analysis."
+                    )
+                elif sec_id == "3.10":
+                    fallback = (
+                        "Data collection followed a structured, stepwise procedure beginning with institutional permissions and "
+                        "participant consent. Questionnaires were administered in person to the sampled respondents, with follow-up "
+                        "visits to maximise response rates. Interviews were scheduled with key informants to deepen understanding of "
+                        "institutional reform practices. Completed instruments were securely stored, coded, and prepared for analysis "
+                        "to ensure data integrity and confidentiality."
+                    )
+                elif sec_id == "3.11":
+                    fallback = (
+                        "Data analysis combined descriptive statistics for survey responses with inferential techniques to test "
+                        "relationships between key variables. Quantitative data were coded and analysed using statistical software, "
+                        "while qualitative interview notes were thematically analysed to identify recurring patterns. The mixed-methods "
+                        "approach ensured that statistical trends were contextualised with explanatory narratives."
+                    )
+                elif sec_id == "3.12":
+                    fallback = (
+                        "Ethical considerations included informed consent, confidentiality, and the protection of participants from "
+                        "harm. The study obtained relevant approvals, ensured voluntary participation, and anonymised all responses. "
+                        "Data were stored securely and used solely for academic purposes."
+                    )
+                else:
+                    fallback = (
+                        f"This section presents the {title.lower()} for the study on {topic} in {case_study}. "
+                        "It outlines the key methodological considerations necessary to address the research objectives."
+                    )
+
+                state.sections[sec_id] = SectionContent(
+                    title=title,
+                    content=fallback,
+                    citations=[],
+                    word_count=len(fallback.split()),
+                    status="completed"
+                )
         
         # Phase 3: Quality Control (This adds the reference list)
         await events.publish(
@@ -4788,8 +5500,40 @@ Example format:
             session_id=session_id
         )
         
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "quality_control", "agent_name": "Quality Control", "status": "running", "action": "Validating citations and combining sections...", "icon": "✓"},
+            session_id=session_id
+        )
         quality_swarm = QualitySwarm(state)
         final_content = await quality_swarm.validate_and_combine()
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "quality_control", "agent_name": "Quality Control", "status": "completed", "action": "Quality checks completed", "icon": "✅"},
+            session_id=session_id
+        )
+
+        if thesis_type != "general":
+            try:
+                await self._enforce_quality_gates(
+                    final_content,
+                    chapter_number=3,
+                    job_id=job_id,
+                    session_id=session_id,
+                    sample_size=sample_size,
+                    objectives=objectives
+                )
+            except ValueError as quality_error:
+                if not allow_quality_failure:
+                    raise
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 3 quality gate failed (continuing): {quality_error}"},
+                    session_id=session_id
+                )
         
         # Calculate stats
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -4872,12 +5616,26 @@ Example format:
         
         return final_content
         
-    async def generate_chapter_four(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
+    async def generate_chapter_four(
+        self,
+        job_id: str,
+        session_id: str,
+        workspace_id: str,
+        thesis_type: str = "phd",
+        sample_size: int = None,
+        allow_quality_failure: bool = False
+    ) -> str:
         """Generate Chapter 4 (Data Analysis) using the dedicated generator."""
         await events.publish(job_id, "log", {"message": "📊 Starting Chapter 4: Data Analysis & Presentation..."}, session_id=session_id)
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "analysis_swarm", "agent_name": "Analysis Swarm", "status": "running", "action": "Generating Chapter 4 tables, figures, and analysis...", "icon": "📊"},
+            session_id=session_id
+        )
         
         # 1. Get objectives and details from DB
-        db = ThesisSessionDB(session_id)
+        db = resolve_thesis_db(session_id, workspace_id)
         topic = db.get_topic() or "Research Study"
         case_study = db.get_case_study() or "General Context"
         objectives_data = db.get_objectives()
@@ -4922,104 +5680,99 @@ Example format:
             session_id=session_id,
             sample_size=sample_size
         )
-        
+
+        content = result_map.get("content", "")
+        if thesis_type != "general" and content:
+            try:
+                await self._enforce_quality_gates(
+                    content,
+                    chapter_number=4,
+                    job_id=job_id,
+                    session_id=session_id,
+                    sample_size=sample_size,
+                    objectives=objectives
+                )
+            except ValueError as quality_error:
+                if not allow_quality_failure:
+                    raise
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 4 quality gate failed (continuing): {quality_error}"},
+                    session_id=session_id
+                )
+
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "analysis_swarm", "agent_name": "Analysis Swarm", "status": "completed", "action": "Chapter 4 analysis completed", "icon": "✅"},
+            session_id=session_id
+        )
         # 3. Return content (it returns a dict, extract content)
         # Note: generate_chapter4 returns a Dict with 'content' key
-        return result_map.get("content", "")
+        return content
 
     async def _generate_chapter_four_general(
         self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: List[str], sample_size: int = 100
     ) -> str:
         """Dedicated generator for General Thesis Chapter 4 (Data Analysis)."""
         await events.publish(job_id, "log", {"message": "📊 Entering General Thesis Chapter 4 Analysis..."}, session_id=session_id)
-        
-        # We need to construct a markdown string directly mimicking the requested format
-        
-        def generate_table(title, columns, rows_data):
-            md = f"#### {title}\n\n"
-            md += f"| {' | '.join(columns)} |\n"
-            md += f"| {' | '.join(['---'] * len(columns))} |\n"
-            for row in rows_data:
-                md += f"| {' | '.join(str(x) for x in row)} |\n"
-            md += "\nSource: Field Data (2025)\n\n"
-            return md
+        from services.chapter4_generator import generate_chapter4
+        from services.workspace_service import WORKSPACES_DIR
 
-        content = f"# CHAPTER FOUR\n\n## DATA ANALYSIS, PRESENTATION AND INTERPRETATION OF FINDINGS\n\n### 4.0 Introduction\nThis chapter deals with data analysis, presentation and interpretation of the findings. The data collected was quantitative and analyzed using SPSS version 26. The findings are presented in tables using frequencies and percentages.\n\n### 4.1 Response Rate\n"
-        
-        # 4.1 Response Rate Table
-        actual = sample_size - 5 if sample_size > 10 else sample_size
-        rate = round((actual / sample_size) * 100, 1)
-        content += f"The study targeted a sample size of {sample_size} respondents. The response rate is presented below:\n\n"
-        content += generate_table(
-            "Table 4.1: Response Rate",
-            ["Respondents", "Targeted Sample", "Actual Response", "Response Rate (%)"],
-            [
-                ["Respondents", str(sample_size), str(actual), f"{rate}%"],
-                ["**Total**", f"**{sample_size}**", f"**{actual}**", f"**{rate}%**"]
-            ]
+        datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
+        output_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "chapters")
+
+        result_map = await generate_chapter4(
+            topic=topic,
+            case_study=case_study,
+            objectives=objectives,
+            datasets_dir=datasets_dir,
+            output_dir=output_dir,
+            sample_size=sample_size,
+            job_id=job_id,
+            session_id=session_id,
+            workspace_id=workspace_id
         )
-        content += f"From Table 4.1 above, the study targeted {sample_size} respondents and {actual}({rate}%) responded. This response rate was considered adequate for analysis and reporting as suggested by Mugenda and Mugenda (2003) who stated that a response rate of 50% is adequate for analysis and reporting; a rate of 60% is good and a response rate of 70% and over is excellent.\n\n"
-        
-        # 4.2 Demographic Characteristics
-        content += "### 4.2 Demographic Characteristics of Respondents\nThis section presents the demographic characteristics of the respondents including gender, age, education level, and experience.\n\n"
-        
-        # 4.2.1 Gender
-        content += "#### 4.2.1 Gender of Respondents\n"
-        content += generate_table(
-            "Table 4.2: Gender of Respondents",
-            ["Gender", "Frequency", "Percent", "Valid Percent", "Cumulative Percent"],
-            [
-                ["Male", "55", "57.9", "57.9", "57.9"],
-                ["Female", "40", "42.1", "42.1", "100.0"],
-                ["**Total**", "**95**", "**100.0**", "**100.0**", ""]
-            ]
-        )
-        content += "Table 4.2 shows that majority 55(57.9%) of the respondents were male while 40(42.1%) were female. This implies that there were more male respondents than female respondents in the study area. This gender balance ensures that views from both genders are represented.\n\n"
-        
-        # 4.3 Analysis per Objective
-        content += "### 4.3 Data Analysis per Objective\nThis section presents the findings based on the study objectives.\n\n"
-        
-        obj_idx = 1
-        for obj in objectives:
-             content += f"#### 4.3.{obj_idx} Findings on {obj}\n"
-             content += f"The respondents were asked to rate their level of agreement with statements regarding '{obj}' on a Likert scale of 1-5 (SA=Strongly Agree, A=Agree, N=Neutral, D=Disagree, SD=Strongly Disagree).\n\n"
-             
-             # Detailed Likert dictionary table
-             likert_rows = [
-                 ["Statement 1: The organization has clear policies", "20(21.1%)", "40(42.1%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
-                 ["Statement 2: Regular training is provided", "15(15.8%)", "45(47.4%)", "5(5.3%)", "20(21.1%)", "10(10.5%)", "3.4", "1.1"],
-                 ["Statement 3: Communication is effective", "30(31.6%)", "30(31.6%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.6", "1.3"],
-                 ["Statement 4: Resources are adequate", "10(10.5%)", "20(21.1%)", "15(15.8%)", "30(31.6%)", "20(21.1%)", "2.8", "1.4"],
-                 ["Statement 5: Management is supportive", "25(26.3%)", "35(36.8%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
-                 ["Statement 6: Employee morale is high", "15(15.8%)", "25(26.3%)", "20(21.1%)", "25(26.3%)", "10(10.5%)", "3.1", "1.3"],
-                 ["Statement 7: Productivity has increased", "20(21.1%)", "40(42.1%)", "10(10.5%)", "15(15.8%)", "10(10.5%)", "3.5", "1.2"],
-                 ["Statement 8: Stakeholders are engaged", "30(31.6%)", "40(42.1%)", "5(5.3%)", "10(10.5%)", "10(10.5%)", "3.8", "1.1"],
-                 ["**Average**", "", "", "", "", "", "**3.4**", "**1.2**"]
-             ]
-             
-             content += generate_table(
-                 f"Table 4.3.{obj_idx}: Descriptive Statistics on {obj}",
-                 ["Statement", "SA(%)", "A(%)", "N(%)", "D(%)", "SD(%)", "Mean", "Std. Dev"],
-                 likert_rows
-             )
-             
-             content += "The findings in Table 4.3." + str(obj_idx) + " indicate that regarding Statement 1, majority 40(42.1%) of the respondents agreed, 20(21.1%) strongly agreed, while 15(15.8%) disagreed. This implies that policies are generally clear. The mean of 3.5 indicates agreement.\n\n"
-             content += "On Statement 2, 45(47.4%) agreed, indicating training is provided. "
-             content += "Regarding Statement 4, however, 30(31.6%) disagreed that resources are adequate, with a low mean of 2.8, suggesting resource constraints.\n\n"
-             
-             content += "**Discussion of Findings**\n"
-             content += f"The findings revealed that {obj} is significantly practiced but faces resource challenges. This agrees with a study by Author (2022) who found similar results in Asian contexts. Similarly, Author (2024) in a study in East Africa noted that while policies exist, implementation is often hindered by funding. In contrast, Author (2021) argued that management support is the primary driver, which aligns with the high rating of management support in this study.\n\n"
-             
-             obj_idx += 1
-             
+
+        content = result_map.get("content", "") or result_map.get("markdown", "")
+        if not content:
+            filepath = result_map.get("filepath")
+            if filepath and os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+        if not content:
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "⚠️ Chapter 4 generation returned empty content. Please retry after dataset generation completes."},
+                session_id=session_id
+            )
+            content = "# CHAPTER FOUR\n\nData analysis could not be generated. Please retry after dataset generation completes."
+
         return content
 
-    async def generate_chapter_five(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
+    async def generate_chapter_five(
+        self,
+        job_id: str,
+        session_id: str,
+        workspace_id: str,
+        thesis_type: str = "phd",
+        sample_size: int = None,
+        allow_quality_failure: bool = False
+    ) -> str:
         """Generate Chapter 5 (Results & Discussion) using the dedicated generator."""
         await events.publish(job_id, "log", {"message": "🗣️ Starting Chapter 5: Discussion of Results..."}, session_id=session_id)
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "discussion_swarm", "agent_name": "Discussion Swarm", "status": "running", "action": "Writing Chapter 5 discussions in parallel...", "icon": "🗣️"},
+            session_id=session_id
+        )
         
         # 1. Get objectives and details from DB
-        db = ThesisSessionDB(session_id)
+        db = resolve_thesis_db(session_id, workspace_id)
         topic = db.get_topic() or "Research Study"
         case_study = db.get_case_study() or "General Context"
         objectives_data = db.get_objectives()
@@ -5064,8 +5817,38 @@ Example format:
             output_dir=None,
             sample_size=sample_size
         )
-        
-        return result_map.get("content", "")
+
+        content = result_map.get("content", "")
+        if not content and result_map.get("filepath") and os.path.exists(result_map["filepath"]):
+            with open(result_map["filepath"], "r", encoding="utf-8") as f:
+                content = f.read()
+
+        if thesis_type != "general" and content:
+            try:
+                await self._enforce_quality_gates(
+                    content,
+                    chapter_number=5,
+                    job_id=job_id,
+                    session_id=session_id,
+                    sample_size=sample_size,
+                    objectives=objectives
+                )
+            except ValueError as quality_error:
+                if not allow_quality_failure:
+                    raise
+                await events.publish(
+                    job_id,
+                    "log",
+                    {"message": f"⚠️ Chapter 5 quality gate failed (continuing): {quality_error}"},
+                    session_id=session_id
+                )
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "discussion_swarm", "agent_name": "Discussion Swarm", "status": "completed", "action": "Chapter 5 discussion completed", "icon": "✅"},
+            session_id=session_id
+        )
+        return content
 
 
 
@@ -5074,54 +5857,156 @@ Example format:
     ) -> str:
         """Dedicated generator for General Thesis Chapter 5 (Discussion, Conclusion, Recommendations)."""
         await events.publish(job_id, "log", {"message": "🗣️ Entering General Thesis Chapter 5 (Merged)..."}, session_id=session_id)
-        
-        content = f"# CHAPTER FIVE\n\n## DISCUSSION, CONCLUSIONS, AND RECOMMENDATIONS\n\n"
-        content += "### 5.0 Introduction\nThis chapter discusses the findings, draws conclusions and makes recommendations based on the findings of the study.\n\n"
-        
-        # 5.1 Summary of Findings
+        from services.workspace_service import WORKSPACES_DIR
+        workspace_dir = WORKSPACES_DIR / (workspace_id or "default")
+
+        def load_latest_chapter(prefix: str) -> str:
+            paths = sorted(list((workspace_dir / "chapters").glob(f"{prefix}*.md")) + list(workspace_dir.glob(f"{prefix}*.md")))
+            if not paths:
+                return ""
+            latest = max(paths, key=lambda p: p.stat().st_mtime)
+            try:
+                with open(latest, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+        chapter2_content = load_latest_chapter("Chapter_2") or ""
+        chapter4_content = load_latest_chapter("Chapter_4") or ""
+
+        citation_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
+        citations = []
+        seen_citations = set()
+        for match in citation_pattern.finditer(chapter2_content):
+            text = match.group(1).strip()
+            url = match.group(2).strip()
+            if not text or not url:
+                continue
+            if not re.search(r"\(\d{4}\)", text):
+                continue
+            key = f"{text}|{url}".lower()
+            if key in seen_citations:
+                continue
+            seen_citations.add(key)
+            citations.append({"text": text, "url": url})
+        if not citations:
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "⚠️ Chapter 5: No linked citations found in Chapter 2. Discussion will be generated without citations."},
+                session_id=session_id
+            )
+
+        def take_citations(count: int) -> str:
+            if not citations:
+                return ""
+            selected = []
+            for _ in range(count):
+                idx = (take_citations.counter) % len(citations)
+                take_citations.counter += 1
+                selected.append(citations[idx])
+            return " ".join([f"[{c['text']}]({c['url']})" for c in selected])
+
+        take_citations.counter = 0
+
+        def extract_objective_sections(text: str) -> Dict[int, str]:
+            sections = {}
+            pattern = re.compile(r"^##\\s+4\\.(\\d+)\\s+Findings on Objective\\s+(\\d+)\\s*:\\s*(.+)$", re.MULTILINE)
+            matches = list(pattern.finditer(text))
+            for idx, match in enumerate(matches):
+                obj_num = int(match.group(2))
+                start = match.end()
+                end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                sections[obj_num] = text[start:end].strip()
+            return sections
+
+        def first_paragraphs(text: str, count: int = 2) -> str:
+            if not text:
+                return ""
+            parts = [p.strip() for p in re.split(r"\n\\s*\n", text) if p.strip()]
+            filtered = []
+            for part in parts:
+                if part.startswith("|") or "\n|" in part:
+                    continue
+                if part.lower().startswith("table ") or part.lower().startswith("figure "):
+                    continue
+                filtered.append(part)
+                if len(filtered) >= count:
+                    break
+            return "\n\n".join(filtered)
+
+        objective_sections = extract_objective_sections(chapter4_content)
+
+        content = "# CHAPTER FIVE\n\n## DISCUSSION, CONCLUSIONS, AND RECOMMENDATIONS\n\n"
+        content += "### 5.0 Introduction\n"
+        content += (
+            f"This chapter interprets the findings from Chapter Four and discusses them in relation to the literature reviewed in Chapter Two. "
+            f"The discussion is organized around the study objectives for {topic} in {case_study}. "
+            f"Where relevant, the discussion compares empirical findings with prior studies from the reviewed literature.\n\n"
+        )
+
         content += "### 5.1 Summary of Findings\n"
-        content += f"The purpose of the study was to {topic.lower()} in {case_study}. The section summarizes the findings based on the study objectives.\n\n"
-        
-        obj_idx = 1
-        for obj in objectives:
-            content += f"#### 5.1.{obj_idx} Summary on {obj}\n"
-            content += f"The finding on {obj} revealed that... (Summarize key stats from Ch4 here). As noted in Chapter 4, majority of respondents Agreed/Strongly Agreed with the statements.\n\n"
-            obj_idx += 1
-            
-        # 5.2 Conclusions
-        content += "### 5.2 Conclusions\nBased on the study findings, the following conclusions were made. "
-        content += f"The study concludes that {topic} in {case_study} faces significant challenges but also opportunities.\n\n"
-        
-        obj_idx = 1
-        for obj in objectives:
-             content += f"#### 5.2.{obj_idx} Conclusion on {obj}\n"
-             content += f"It was concluded that {obj} is critical for organizational success. The study established that...\n\n"
-             obj_idx += 1
-             
-        # 5.3 Recommendations
-        content += "### 5.3 Recommendations\nBased on the conclusions, the study recommends the following:\n\n"
-        
-        obj_idx = 1
-        for obj in objectives:
-             content += f"#### 5.3.{obj_idx} Recommendation on {obj}\n"
-             content += f"To improve {obj} in {case_study}, it is recommended that management should... Also, stakeholders should ensure that...\n\n"
-             obj_idx += 1
-             
-        # 5.4 Suggestions for Future Studies
+        content += (
+            f"The purpose of the study was to {topic.lower()} in {case_study}. "
+            "The summary below highlights the main findings for each objective, grounded in the empirical evidence.\n\n"
+        )
+
+        for idx, obj in enumerate(objectives, 1):
+            content += f"#### 5.1.{idx} Summary on {obj}\n"
+            section_text = objective_sections.get(idx, "")
+            summary = first_paragraphs(section_text, count=2)
+            if not summary:
+                summary = f"The findings on {obj.lower()} indicated observable patterns in the data gathered from the study sample."
+            citations_text = take_citations(2)
+            if citations_text:
+                summary = f"{summary}\n\nThese findings align with prior studies in the reviewed literature {citations_text}."
+            content += f"{summary}\n\n"
+
+        content += "### 5.2 Conclusions\n"
+        content += (
+            "Based on the findings, the following conclusions are drawn. "
+            f"Overall, the study concludes that {topic.lower()} in {case_study} is shaped by multiple institutional and contextual factors.\n\n"
+        )
+
+        for idx, obj in enumerate(objectives, 1):
+            conclusion = f"It is concluded that {obj.lower()} is a critical dimension of the study outcomes and requires sustained attention from key stakeholders."
+            citations_text = take_citations(1)
+            if citations_text:
+                conclusion = f"{conclusion} {citations_text}."
+            content += f"#### 5.2.{idx} Conclusion on {obj}\n{conclusion}\n\n"
+
+        content += "### 5.3 Recommendations\n"
+        content += "Based on the conclusions, the study recommends the following actions to improve practice and policy.\n\n"
+
+        for idx, obj in enumerate(objectives, 1):
+            recommendation = (
+                f"Institutions involved in {obj.lower()} should strengthen capacity, monitoring, and accountability mechanisms "
+                "to sustain the observed gains and address gaps identified in the data."
+            )
+            content += f"#### 5.3.{idx} Recommendation on {obj}\n{recommendation}\n\n"
+
         content += "### 5.4 Suggestions for Future Studies\n"
-        content += f"The study focused on {topic} in {case_study}. Future studies should focus on:\n"
-        content += "1. A similar study in a different context/case study for comparison purposes.\n"
-        content += "2. The impact of ... on ...\n"
-        content += "3. Challenges facing ... in ...\n\n"
-        
+        content += (
+            f"This study focused on {topic.lower()} in {case_study}. Future research should:\n"
+            "1. Replicate the study in different contexts to enable comparative insights.\n"
+            "2. Explore additional variables that were not captured in the present dataset.\n"
+            "3. Examine longitudinal outcomes to assess the durability of the observed patterns.\n"
+        )
+
         return content
 
     async def generate_chapter_six(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
         """Generate Chapter 6 (Conclusions & Recommendations) using the dedicated generator."""
         await events.publish(job_id, "log", {"message": "🏁 Starting Chapter 6: Summary, Conclusions & Recommendations..."}, session_id=session_id)
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "conclusion_swarm", "agent_name": "Conclusion Swarm", "status": "running", "action": "Drafting conclusions and recommendations...", "icon": "🏁"},
+            session_id=session_id
+        )
         
         # 1. Get objectives and details from DB
-        db = ThesisSessionDB(session_id)
+        db = resolve_thesis_db(session_id, workspace_id)
         topic = db.get_topic() or "Research Study"
         case_study = db.get_case_study() or "General Context"
         objectives_data = db.get_objectives()
@@ -5204,6 +6089,13 @@ Example format:
             {"path": str(filepath), "filename": filename, "type": "markdown", "auto_open": True},
             session_id=session_id
         )
+
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {"agent": "conclusion_swarm", "agent_name": "Conclusion Swarm", "status": "completed", "action": "Chapter 6 completed", "icon": "✅"},
+            session_id=session_id
+        )
         
         return content
 
@@ -5219,37 +6111,60 @@ Example format:
         objectives: List[str] = None,
         research_design: str = None,
         preferred_analyses: List[str] = None,
-        custom_instructions: str = ""
+        custom_instructions: str = "",
+        allow_quality_failure: bool = False
     ) -> Dict[int, str]:
         """Generate all chapters in sequence (1 through 6)."""
         
         start_time = datetime.now()
         results = {}
+        try:
+            sample_size = int(float(sample_size))
+        except (TypeError, ValueError):
+            sample_size = 385
+        if sample_size <= 0:
+            sample_size = 385
         
         # Ensure DB has session set up if not already
-        db = ThesisSessionDB(session_id)
+        db = resolve_thesis_db(session_id, workspace_id)
         if not db.get_topic():
             db.create_session(topic, case_study)
             
-        # Save Research Config with Sample Size
-        db.save_research_config({
+        research_config = {
             "sample_size": sample_size,
             "research_design": research_design or ("survey" if "survey" in topic.lower() or "quantitative" in topic.lower() else "mixed_methods"),
             "preferred_analyses": preferred_analyses or [],
             "custom_instructions": custom_instructions
-        })
+        }
+
+        # Save Research Config with Sample Size
+        db.save_research_config(research_config)
         
         # Save custom objectives if provided
+        normalized_objectives = None
         if objectives:
-            db.save_objectives(objectives)
+            normalized_objectives = normalize_objectives(objectives, topic, case_study)
+            db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
         else:
             # Trigger objective generation if none exist and not provided
             existing_objs = db.get_objectives()
             if not existing_objs or not existing_objs.get('specific'):
                 objectives = generate_smart_objectives(topic, 6)
-                db.save_objectives(objectives)
+                normalized_objectives = normalize_objectives(objectives, topic, case_study)
+                db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
             else:
-                objectives = existing_objs.get('specific')
+                normalized_objectives = normalize_objectives(existing_objs, topic, case_study)
+                objectives = normalized_objectives.get('specific', [])
+
+        # Mirror config/objectives to workspace-scoped DB for cross-chapter consistency
+        if workspace_id and workspace_id != session_id and normalized_objectives:
+            try:
+                ws_db = ThesisSessionDB(workspace_id)
+                ws_db.create_session(topic, case_study)
+                ws_db.save_research_config(research_config)
+                ws_db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
+            except Exception as e:
+                print(f"⚠️ Could not mirror config/objectives to workspace DB: {e}")
         
         await events.publish(
             job_id, 
@@ -5276,18 +6191,48 @@ Example format:
                     topic, case_study, country, job_id, session_id, workspace_id, objectives
                 )
             else:
-                c1_content = await self.generate(topic, case_study, job_id, session_id, workspace_id, thesis_type=thesis_type, objectives=objectives, sample_size=sample_size)
+                c1_content = await self.generate(
+                    topic,
+                    case_study,
+                    job_id,
+                    session_id,
+                    workspace_id,
+                    thesis_type=thesis_type,
+                    objectives=objectives,
+                    sample_size=sample_size,
+                    allow_quality_failure=allow_quality_failure
+                )
                 
             results[1] = c1_content
             
             # Chapter 2 - Literature Review
             await events.publish(job_id, "stage_started", {"stage": "chapter_2", "message": "📚 Generating Chapter 2: Literature Review"}, session_id=session_id)
-            c2_content = await self.generate_chapter_two(topic, case_study, job_id, session_id, workspace_id, objectives=objectives, thesis_type=thesis_type, sample_size=sample_size)
+            c2_content = await self.generate_chapter_two(
+                topic,
+                case_study,
+                job_id,
+                session_id,
+                workspace_id,
+                objectives=objectives,
+                thesis_type=thesis_type,
+                sample_size=sample_size,
+                allow_quality_failure=allow_quality_failure
+            )
             results[2] = c2_content
 
             # Chapter 3 - Methodology
             await events.publish(job_id, "stage_started", {"stage": "chapter_3", "message": "🧪 Generating Chapter 3: Research Methodology"}, session_id=session_id)
-            c3_content = await self.generate_chapter_three(topic, case_study, job_id, session_id, workspace_id, objectives=objectives, thesis_type=thesis_type, sample_size=sample_size)
+            c3_content = await self.generate_chapter_three(
+                topic,
+                case_study,
+                job_id,
+                session_id,
+                workspace_id,
+                objectives=objectives,
+                thesis_type=thesis_type,
+                sample_size=sample_size,
+                allow_quality_failure=allow_quality_failure
+            )
             results[3] = c3_content
             
             # Retrieve objectives for tools generation
@@ -5301,44 +6246,57 @@ Example format:
             from services.data_collection_worker import generate_study_tools, generate_research_dataset
             tools_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "study_tools")
             os.makedirs(tools_dir, exist_ok=True)
-            
-            await generate_study_tools(
-                topic=topic,
-                objectives=objectives,
-                output_dir=tools_dir,
-                job_id=job_id,
-                session_id=session_id,
-                sample_size=sample_size
-            )
-                
-            # Step 5: Synthetic Dataset
+
+            # Step 5: Synthetic Dataset (run in parallel with tools to save time)
             await events.publish(job_id, "stage_started", {"stage": "dataset", "message": f"🎲 Generating Synthetic Research Dataset (n={sample_size})..."}, session_id=session_id)
             datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
             os.makedirs(datasets_dir, exist_ok=True)
-            
-            # Assuming questionnaire path is standard (we might want to make this more robust)
-            # generate_research_dataset will generate its own data based on objectives if questionnaires aren't passed
-            await generate_research_dataset(
-                topic=topic,
-                case_study=case_study,
-                objectives=objectives,
-                sample_size=sample_size,
-                output_dir=datasets_dir,
-                job_id=job_id,
-                session_id=session_id
+
+            await asyncio.gather(
+                generate_study_tools(
+                    topic=topic,
+                    objectives=objectives,
+                    output_dir=tools_dir,
+                    job_id=job_id,
+                    session_id=session_id,
+                    sample_size=sample_size
+                ),
+                generate_research_dataset(
+                    topic=topic,
+                    case_study=case_study,
+                    objectives=objectives,
+                    sample_size=sample_size,
+                    output_dir=datasets_dir,
+                    job_id=job_id,
+                    session_id=session_id
+                ),
             )
 
             # Chapter 4 - Data Analysis
             await events.publish(job_id, "stage_started", {"stage": "chapter_4", "message": "📊 Generating Chapter 4: Data Analysis"}, session_id=session_id)
             # Ch4 wrapper needs objectives passed explicitly or it fetches from DB.
             # We updated generate_chapter_four to fetch from DB, so invoking it is safe.
-            c4_content = await self.generate_chapter_four(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
+            c4_content = await self.generate_chapter_four(
+                job_id,
+                session_id,
+                workspace_id,
+                thesis_type=thesis_type,
+                sample_size=sample_size,
+                allow_quality_failure=allow_quality_failure
+            )
             results[4] = c4_content
 
             # Chapter 5 - Findings & Discussion (General: Findings, Discussion & Conclusion)
             msg = "🗣️ Generating Chapter 5: Discussion" if thesis_type == "phd" else "🏁 Generating Chapter 5: Discussion, Conclusions & Recommendations"
             await events.publish(job_id, "stage_started", {"stage": "chapter_5", "message": msg}, session_id=session_id)
-            c5_content = await self.generate_chapter_five(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
+            c5_content = await self.generate_chapter_five(
+                job_id,
+                session_id,
+                workspace_id,
+                thesis_type=thesis_type,
+                sample_size=sample_size,
+                allow_quality_failure=allow_quality_failure
+            )
             results[5] = c5_content
 
             # Appendices (General Only)
@@ -5560,7 +6518,7 @@ Example format:
         )
         
         # Retrieve country from DB or default
-        db = ThesisSessionDB(session_id)
+        db = resolve_thesis_db(session_id, workspace_id)
         country = "South Sudan"  # Default country for UoJ theses
 
         # 2. PHASE 1: TARGETED REGIONAL SEARCH

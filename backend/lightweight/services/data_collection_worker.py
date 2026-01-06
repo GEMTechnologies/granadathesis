@@ -14,6 +14,7 @@ import re
 import csv
 import random
 import asyncio
+import math
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,7 +31,10 @@ class DataCollectionWorker:
         methodology_content: str = "",
         objectives: List[str] = None,
         sample_size: int = None,
-        interview_sample_size: int = None
+        interview_sample_size: int = None,
+        likert_scale: int = 5,
+        items_per_objective: int = None,
+        demographic_distributions: Optional[Dict[str, Dict[str, float]]] = None
     ):
         self.topic = topic
         self.case_study = case_study
@@ -39,6 +43,9 @@ class DataCollectionWorker:
         self.methodology_content = methodology_content
         self.objectives = objectives or []
         self.objective_variables = {}
+        self.likert_scale = likert_scale if likert_scale in (3, 5, 7) else 5
+        self.items_per_objective = items_per_objective or 5
+        self.demographic_distributions = demographic_distributions or {}
         
         # Load Golden Thread variables
         try:
@@ -81,6 +88,7 @@ class DataCollectionWorker:
         print(f"   - Interview Sample Size: {self.interview_sample_size}")
         print(f"   - Likert Sections: {len(self.likert_sections)}")
         print(f"   - Total Items: {sum(len(s['items']) for s in self.likert_sections)}")
+        print(f"   - Likert Scale: {self.likert_scale}-point")
     
     def _extract_sample_size(self) -> int:
         """Extract sample size from methodology content."""
@@ -109,26 +117,67 @@ class DataCollectionWorker:
     def _extract_demographics(self) -> List[Dict[str, Any]]:
         """Extract demographic questions from questionnaire."""
         demographics = []
-        
+
+        def normalize_weights(dist: Dict[str, float], options: List[str], mapping: Dict[str, str]) -> Optional[List[float]]:
+            if not dist:
+                return None
+            mapped = {mapping.get(k.lower(), k).lower(): v for k, v in dist.items()}
+            weights = []
+            for opt in options:
+                key = opt.lower()
+                weights.append(max(0.0, float(mapped.get(key, 0))))
+            total = sum(weights)
+            if total <= 0:
+                return None
+            return [w / total for w in weights]
+
+        age_options = ['18-25', '26-35', '36-45', '46-55', '55+']
+        gender_options = ['Male', 'Female', 'Other']
+        education_options = ['Primary', 'Secondary', 'Tertiary', 'Postgraduate', 'Other']
+
+        age_weights = normalize_weights(
+            self.demographic_distributions.get('age', {}),
+            age_options,
+            {k: k for k in age_options}
+        ) or [0.15, 0.30, 0.25, 0.20, 0.10]
+
+        gender_weights = normalize_weights(
+            self.demographic_distributions.get('gender', {}),
+            gender_options,
+            {'male': 'Male', 'female': 'Female', 'other': 'Other'}
+        ) or [0.50, 0.48, 0.02]
+
+        education_weights = normalize_weights(
+            self.demographic_distributions.get('education', {}),
+            education_options,
+            {
+                'primary': 'Primary',
+                'secondary': 'Secondary',
+                'tertiary': 'Tertiary',
+                'postgraduate': 'Postgraduate',
+                'other': 'Other'
+            }
+        ) or [0.10, 0.30, 0.45, 0.12, 0.03]
+
         demographics.append({
             'name': 'Age',
             'variable': 'age_group',
-            'options': ['18-25', '26-35', '36-45', '46-55', '56+'],
-            'weights': [0.15, 0.30, 0.25, 0.20, 0.10]
+            'options': age_options,
+            'weights': age_weights
         })
-        
+
         demographics.append({
             'name': 'Gender',
             'variable': 'gender',
-            'options': ['Male', 'Female'],
-            'weights': [0.52, 0.48]
+            'options': gender_options,
+            'weights': gender_weights
         })
-        
+
         demographics.append({
             'name': 'Education',
             'variable': 'education',
-            'options': ['Diploma', 'Bachelors', 'Masters', 'PhD', 'Other'],
-            'weights': [0.15, 0.45, 0.30, 0.05, 0.05]
+            'options': education_options,
+            'weights': education_weights
         })
         
         demographics.append({
@@ -245,7 +294,7 @@ class DataCollectionWorker:
                         })
                 else:
                     # Fallback to generic items (8 items per objective)
-                    for j in range(1, 9):
+                    for j in range(1, self.items_per_objective + 1):
                         items.append({
                             'number': j,
                             'text': f"Item {j} measuring {obj[:80]}",
@@ -285,19 +334,22 @@ class DataCollectionWorker:
         return random.choices(options, weights=weights)[0]
     
     def _generate_likert_response(self, respondent_profile: Dict[str, Any], section_idx: int) -> int:
-        """Generate a realistic Likert scale response (1-5)."""
-        base_weights = [0.05, 0.15, 0.25, 0.35, 0.20]
+        """Generate a realistic Likert scale response (1-N)."""
+        scale = self.likert_scale
         respondent_bias = respondent_profile.get('bias', 0)
-        
-        adjusted_weights = []
-        for i, w in enumerate(base_weights):
-            shift = (i - 2) * respondent_bias * 0.1
-            adjusted_weights.append(max(0.01, w + shift))
-        
-        total = sum(adjusted_weights)
-        adjusted_weights = [w/total for w in adjusted_weights]
-        
-        return random.choices([1, 2, 3, 4, 5], weights=adjusted_weights)[0]
+
+        mid = (scale + 1) / 2.0
+        sigma = max(1.0, scale / 3.0)
+        weights = []
+        for i in range(1, scale + 1):
+            base = math.exp(-((i - mid) ** 2) / (2 * sigma ** 2))
+            shift = (i - mid) * respondent_bias * 0.15
+            weights.append(max(0.01, base + shift))
+
+        total = sum(weights)
+        weights = [w / total for w in weights]
+
+        return random.choices(list(range(1, scale + 1)), weights=weights)[0]
     
     async def _generate_respondent(self, respondent_id: int) -> Dict[str, Any]:
         """Generate a complete respondent with all responses."""
@@ -684,7 +736,8 @@ Respond with ONLY the interview response text, no labels or formatting:"""
             import json
             variable_mapping = {
                 'demographics': {demo['variable']: demo.get('name', demo.get('question', demo['variable'])) for demo in self.demographic_questions},
-                'likert_items': {}
+                'likert_items': {},
+                'likert_scale': self.likert_scale
             }
             
             for section in self.likert_sections:
@@ -714,7 +767,8 @@ Respond with ONLY the interview response text, no labels or formatting:"""
         stats = {
             'n': len(respondents),
             'demographics': {},
-            'likert_summary': {}
+            'likert_summary': {},
+            'likert_scale': self.likert_scale
         }
         
         for demo in self.demographic_questions:
@@ -850,6 +904,9 @@ async def generate_research_dataset(
     session_id: str = None,
     generate_interviews: bool = True,
     output_dir: str = None,
+    likert_scale: int = 5,
+    items_per_objective: int = None,
+    demographic_distributions: Optional[Dict[str, Dict[str, float]]] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """Main function to generate research dataset.
@@ -878,7 +935,10 @@ async def generate_research_dataset(
         questionnaire_content=questionnaire_content,
         methodology_content=methodology_content,
         objectives=objectives,
-        sample_size=sample_size
+        sample_size=sample_size,
+        likert_scale=likert_scale,
+        items_per_objective=items_per_objective,
+        demographic_distributions=demographic_distributions
     )
     
     async def progress_callback(message: str):
@@ -939,7 +999,11 @@ async def generate_study_tools(
     output_dir: str = None,
     job_id: str = None,
     session_id: str = None,
-    sample_size: int = None
+    sample_size: int = None,
+    likert_scale: int = 5,
+    items_per_objective: int = 5,
+    interview_questions: int = 10,
+    fgd_questions: int = 8
 ) -> Dict[str, Any]:
     """Generate research study tools (questionnaire, interview guide, FGD guide, observation checklist).
     
@@ -971,6 +1035,41 @@ async def generate_study_tools(
         print(message)
     
     await publish_log("📋 Generating structured questionnaire and transmittal letter...")
+
+    scale = likert_scale if likert_scale in (3, 5, 7) else 5
+    if items_per_objective < 2:
+        items_per_objective = 2
+    elif items_per_objective > 8:
+        items_per_objective = 8
+
+    if scale == 3:
+        scale_labels = {
+            1: "Disagree",
+            2: "Neutral",
+            3: "Agree"
+        }
+    elif scale == 7:
+        scale_labels = {
+            1: "Strongly Disagree",
+            2: "Disagree",
+            3: "Slightly Disagree",
+            4: "Neutral",
+            5: "Slightly Agree",
+            6: "Agree",
+            7: "Strongly Agree"
+        }
+    else:
+        scale_labels = {
+            1: "Strongly Disagree",
+            2: "Disagree",
+            3: "Neutral",
+            4: "Agree",
+            5: "Strongly Agree"
+        }
+
+    scale_header = " | ".join([f"{scale_labels[num]} ({num})" for num in range(1, scale + 1)])
+    scale_cells = " | ".join(["[ ]" for _ in range(1, scale + 1)])
+    scale_lines = "\n".join([f"- **{num}** = {scale_labels[num]}" for num in range(1, scale + 1)])
     
     # ===================== QUESTIONNAIRE =====================
     questionnaire_content = f"""# TRANSMITTAL LETTER
@@ -1003,17 +1102,18 @@ A. 18-25 years
 B. 26-35 years
 C. 36-45 years
 D. 46-55 years
-E. 56 years and above
+E. 55 years and above
 
 2. **Gender:**
 A. Male
 B. Female
+C. Other
 
 3. **Highest Level of Education:**
-A. Diploma
-B. Bachelors
-C. Masters
-D. PhD
+A. Primary
+B. Secondary
+C. Tertiary
+D. Postgraduate
 E. Other
 
 4. **Years of Experience:**
@@ -1041,14 +1141,21 @@ D. Other
 ### SECTION B: MAIN RESEARCH QUESTIONS
 
 **Instructions:** Please indicate your level of agreement with each statement using the following scale:
-- **1** = Strongly Disagree
-- **2** = Disagree
-- **3** = Neutral
-- **4** = Agree
-- **5** = Strongly Agree
 
+{scale_lines}
 """
-    
+
+    item_templates = [
+        "I believe that {objective} is important",
+        "Adequate measures exist to support {objective}",
+        "Current practices effectively address {objective}",
+        "There are challenges related to {objective}",
+        "Notable improvements are needed regarding {objective}",
+        "Stakeholders demonstrate commitment to {objective}",
+        "Resources allocated to {objective} are sufficient",
+        "Policies governing {objective} are implemented effectively"
+    ]
+
     for i, obj in enumerate(objectives, 1):
         # Clean objective text
         obj_clean = obj.strip()
@@ -1056,18 +1163,16 @@ D. Other
             obj_clean = obj_clean[3:]
         obj_title = obj_clean.capitalize()
         
-        questionnaire_content += f"""
-#### Objective {i}: {obj_title}
+        questionnaire_content += (
+            f"\n#### Objective {i}: {obj_title}\n\n"
+            f"| # | Statement | {scale_header} |\n"
+            f"|---|-----------|{('|' + '|'.join(['---'] * scale) + '|')}"
+        )
 
-| # | Statement | SD (1) | D (2) | N (3) | A (4) | SA (5) |
-|---|-----------|--------|-------|-------|-------|--------|
-| {i}.1 | I believe that {obj_clean.lower()} is important | [ ] | [ ] | [ ] | [ ] | [ ] |
-| {i}.2 | Adequate measures exist to support {obj_clean.lower()} | [ ] | [ ] | [ ] | [ ] | [ ] |
-| {i}.3 | Current practices effectively address {obj_clean.lower()} | [ ] | [ ] | [ ] | [ ] | [ ] |
-| {i}.4 | There are challenges related to {obj_clean.lower()} | [ ] | [ ] | [ ] | [ ] | [ ] |
-| {i}.5 | Improvements are needed regarding {obj_clean.lower()} | [ ] | [ ] | [ ] | [ ] | [ ] |
-
-"""
+        for item_idx in range(1, items_per_objective + 1):
+            template = item_templates[(item_idx - 1) % len(item_templates)]
+            statement = template.format(objective=obj_clean.lower())
+            questionnaire_content += f"\n| {i}.{item_idx} | {statement} | {scale_cells} |"
     
     questionnaire_content += """
 ---
@@ -1360,4 +1465,3 @@ _____________________________________________________________
         'observation_path': observation_path,
         'files': [questionnaire_path, interview_path, fgd_path, observation_path]
     }
-

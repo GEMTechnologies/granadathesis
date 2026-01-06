@@ -46,6 +46,8 @@ export default function UniversalProgressOverlay({
     const [currentStatus, setCurrentStatus] = useState('Connecting to AntiGravity engine...');
     const [currentAgent, setCurrentAgent] = useState('');
     const [overallProgress, setOverallProgress] = useState(0);
+    const [expectedTotalSteps, setExpectedTotalSteps] = useState<number | null>(null);
+    const [progressOverride, setProgressOverride] = useState<number | null>(null);
     const [logs, setLogs] = useState<string[]>([]);
     const [isComplete, setIsComplete] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -99,17 +101,14 @@ export default function UniversalProgressOverlay({
 
     // Initialize steps based on job type
     useEffect(() => {
+        setOverallProgress(0);
+        setExpectedTotalSteps(null);
+        setProgressOverride(null);
+        setIsComplete(false);
+        setError(null);
+
         if (type === 'thesis') {
-            setSteps([
-                { id: '1', name: 'Chapter 1: Introduction', status: 'pending' },
-                { id: '2', name: 'Chapter 2: Literature Review', status: 'pending' },
-                { id: '3', name: 'Chapter 3: Methodology', status: 'pending' },
-                { id: '4', name: 'Study Tools Generation', status: 'pending' },
-                { id: '5', name: 'Synthetic Dataset', status: 'pending' },
-                { id: '6', name: 'Chapter 4: Data Analysis', status: 'pending' },
-                { id: '7', name: 'Chapter 5: Discussion', status: 'pending' },
-                { id: '8', name: 'Chapter 6: Conclusion', status: 'pending' },
-            ]);
+            setSteps([]);
         } else {
             setSteps([
                 { id: 'understand', name: 'Understanding Objective', status: 'pending', description: 'Analyzing intent and planning actions' },
@@ -118,12 +117,49 @@ export default function UniversalProgressOverlay({
                 { id: 'verify', name: 'Verifying Results', status: 'pending', description: 'Reviewing quality and consistency' },
             ]);
         }
-    }, [type]);
+    }, [type, jobId]);
+
+    const upsertStep = (incoming: ProgressStep) => {
+        setSteps(prev => {
+            const next = [...prev];
+            const idx = next.findIndex(step => step.id === incoming.id);
+            if (idx >= 0) {
+                next[idx] = { ...next[idx], ...incoming };
+            } else {
+                next.push(incoming);
+            }
+            return next.sort((a, b) => {
+                const aNum = parseInt(a.id.replace(/\D+/g, ''), 10);
+                const bNum = parseInt(b.id.replace(/\D+/g, ''), 10);
+                if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+                return a.id.localeCompare(b.id);
+            });
+        });
+    };
 
     // Auto-scroll logs
     useEffect(() => {
         logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [logs]);
+
+    useEffect(() => {
+        const completedCount = steps.filter(s => s.status === 'completed').length;
+        const denominator = expectedTotalSteps || Math.max(steps.length, 1);
+        const computed = Math.round((completedCount / denominator) * 100);
+        const nextProgress = progressOverride !== null
+            ? Math.max(progressOverride, computed)
+            : computed;
+        setOverallProgress(Math.min(100, Math.max(0, nextProgress)));
+    }, [steps, expectedTotalSteps, progressOverride]);
+
+    useEffect(() => {
+        if (!expectedTotalSteps) return;
+        const completedCount = steps.filter(s => s.status === 'completed').length;
+        if (completedCount >= expectedTotalSteps && !error) {
+            setIsComplete(true);
+            setCurrentStatus('🎉 All tasks completed successfully');
+        }
+    }, [steps, expectedTotalSteps, error]);
 
     // Connect to SSE
     useEffect(() => {
@@ -140,26 +176,31 @@ export default function UniversalProgressOverlay({
             addLog('📡 Connection established with backend');
         };
 
-        const updateStepStatus = (stepId: string, status: 'running' | 'completed' | 'error', description?: string) => {
-            setSteps(prev => {
-                const newSteps = prev.map(step =>
-                    step.id === stepId || step.name.toLowerCase().includes(stepId.toLowerCase())
-                        ? { ...step, status, description: description || step.description }
-                        : step
-                );
-
-                // Calculate progress
-                const completedCount = newSteps.filter(s => s.status === 'completed').length;
-                const total = newSteps.length;
-                setOverallProgress(Math.round((completedCount / total) * 100));
-
-                return newSteps;
+        const updateStepStatus = (stepId: string, status: 'running' | 'completed' | 'error', description?: string, name?: string) => {
+            upsertStep({
+                id: stepId,
+                name: name || description || 'Step',
+                status,
+                description
             });
+        };
+
+        const parseEventData = (payload: any): any => {
+            if (payload == null) return {};
+            if (typeof payload === 'object') return payload;
+            if (typeof payload !== 'string') return { message: String(payload) };
+            const trimmed = payload.trim();
+            if (!trimmed) return {};
+            try {
+                return JSON.parse(trimmed);
+            } catch {
+                return { message: trimmed };
+            }
         };
 
         // Event listeners
         eventSource.addEventListener('agent_activity', (e: any) => {
-            const data = JSON.parse(e.data);
+            const data = parseEventData(e.data);
             setCurrentAgent(data.agent_name || data.agent || '');
             if (data.message) {
                 setCurrentStatus(data.message);
@@ -185,43 +226,67 @@ export default function UniversalProgressOverlay({
         });
 
         eventSource.addEventListener('step_started', (e: any) => {
-            const data = JSON.parse(e.data);
+            const data = parseEventData(e.data);
             if (type === 'thesis' && data.step) {
-                updateStepStatus(data.step.toString(), 'running', data.name);
+                if (data.total_steps) {
+                    setExpectedTotalSteps(data.total_steps);
+                }
+                updateStepStatus(data.step.toString(), 'running', data.name, data.name);
             }
             addLog(`🚀 Starting: ${data.name || 'Next phase'}`);
         });
 
         eventSource.addEventListener('step_completed', (e: any) => {
-            const data = JSON.parse(e.data);
+            const data = parseEventData(e.data);
             if (type === 'thesis' && data.step) {
-                updateStepStatus(data.step.toString(), 'completed');
-                if (data.step === 8) setIsComplete(true);
+                updateStepStatus(data.step.toString(), 'completed', data.name, data.name);
             }
             addLog(`✅ Completed: ${data.name || 'Phase'}`);
         });
 
         eventSource.addEventListener('progress', (e: any) => {
-            const data = JSON.parse(e.data);
-            if (data.percentage) setOverallProgress(data.percentage);
+            const data = parseEventData(e.data);
+            const percent = data.percentage ?? data.percent;
+            if (typeof percent === 'number') {
+                setProgressOverride(Math.round(percent));
+            }
             if (data.message) setCurrentStatus(data.message);
         });
 
         eventSource.addEventListener('log', (e: any) => {
-            const data = JSON.parse(e.data);
+            const data = parseEventData(e.data);
             if (data.message) addLog(data.message);
         });
 
+        eventSource.addEventListener('agent_stream', (e: any) => {
+            try {
+                const data = parseEventData(e.data);
+                if (data.agent === 'planner' && Array.isArray(data.metadata?.steps)) {
+                    const plannerSteps = data.metadata.steps.map((step: any) => ({
+                        id: step.id || step.name || `${step.icon || 'step'}-${Math.random().toString(36).slice(2)}`,
+                        name: step.name || step.title || 'Step',
+                        status: step.status === 'done' ? 'completed' : step.status === 'running' ? 'running' : step.status === 'error' ? 'error' : 'pending',
+                        description: step.description
+                    }));
+                    setExpectedTotalSteps(plannerSteps.length);
+                    setSteps(plannerSteps);
+                }
+            } catch (err) {
+                console.error('Error parsing agent_stream event:', err);
+            }
+        });
+
         eventSource.addEventListener('error', (e: any) => {
-            const data = JSON.parse(e.data);
-            setError(data.message || 'Workflow failed');
+            const data = parseEventData(e.data);
+            const message = data.message || 'Workflow failed';
+            setError(message);
             setCurrentStatus('❌ Error');
-            addLog(`❌ ERROR: ${data.message}`);
+            addLog(`❌ ERROR: ${message}`);
         });
 
         eventSource.addEventListener('stage_completed', (e: any) => {
-            const data = JSON.parse(e.data);
-            if (data.status === 'success') {
+            const data = parseEventData(e.data);
+            if (data.stage === 'complete' && data.status === 'success') {
                 setIsComplete(true);
                 setOverallProgress(100);
                 setCurrentStatus('🎉 All tasks completed successfully');
