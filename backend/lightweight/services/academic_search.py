@@ -290,7 +290,7 @@ class AcademicSearchService:
                         "venue": item.get("primary_location", {}).get("source", {}).get("display_name", ""),
                         "url": item.get("doi") or item.get("id", ""),
                         "openAccessPdf": {"url": pdf_url} if pdf_url else None,
-                        "externalIds": {"DOI": item.get("doi", "").replace("https://doi.org/", "")},
+                        "externalIds": {"DOI": (item.get("doi") or "").replace("https://doi.org/", "")},
                         "source": "OpenAlex"
                     })
                 
@@ -620,4 +620,3 @@ class AcademicSearchService:
 
 # Singleton instance
 academic_search_service = AcademicSearchService()
-

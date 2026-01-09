@@ -6,6 +6,7 @@ Workspace-scoped collections for multi-tenancy.
 """
 
 import chromadb
+import os
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from pathlib import Path
@@ -38,16 +39,20 @@ class VectorService:
                 allow_reset=True
             )
         )
-        
-        # Use OpenAI embeddings (requires OPENAI_API_KEY env var)
-        # Falls back to default sentence transformers if not available
-        try:
-            self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
-                model_name="text-embedding-3-small"
-            )
-            print("✓ Vector service using OpenAI embeddings")
-        except Exception as e:
-            print(f"⚠️ OpenAI embeddings unavailable, using default: {e}")
+
+        # Use OpenAI embeddings if key is available, else default embeddings.
+        openai_key = getattr(settings, "OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            os.environ["OPENAI_API_KEY"] = openai_key
+            try:
+                self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+                    model_name="text-embedding-3-small"
+                )
+                print("✓ Vector service using OpenAI embeddings")
+            except Exception as e:
+                print(f"⚠️ OpenAI embeddings unavailable, using default: {e}")
+                self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
+        else:
             self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
     
     def _get_collection_name(self, workspace_id: str) -> str:

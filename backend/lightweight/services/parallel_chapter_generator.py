@@ -4114,6 +4114,60 @@ class ParallelChapterGenerator:
                 missing.append(obj_clean)
         return missing
 
+    async def _include_uploaded_sources(self, unique_results: List[ResearchResult], seen_identifiers: set) -> None:
+        """Fetch retrieval results for uploaded PDFs/data and add them to the research pool."""
+        if not self.state:
+            return
+        try:
+            user_results = await search_user_documents(
+                workspace_id=self.state.workspace_id,
+                query=self.state.topic,
+                n_results=8
+            )
+        except Exception as upload_err:
+            print(f"⚠️ Uploaded sources search failed: {upload_err}")
+            return
+
+        added = 0
+        for entry in user_results.get("results", []):
+            metadata = entry.get("metadata", {}) or {}
+            doc_id = metadata.get("document_id") or metadata.get("filename")
+            identifier = f"user_upload:{doc_id or entry.get('id')}"
+            if not doc_id or identifier in seen_identifiers:
+                continue
+
+            title = metadata.get("title") or metadata.get("filename") or "User Uploaded Document"
+            author = metadata.get("author")
+            authors = [author] if author else ["User Upload"]
+            year_val = metadata.get("year")
+            try:
+                year = int(year_val)
+            except (TypeError, ValueError):
+                year = datetime.now().year
+
+            research = ResearchResult(
+                title=title,
+                authors=authors,
+                year=year,
+                doi="",
+                url=metadata.get("file_path") or metadata.get("filename") or "",
+                abstract=(entry.get("text") or "")[:500],
+                source="user_upload",
+                venue=metadata.get("filename", "")
+            )
+
+            unique_results.append(research)
+            seen_identifiers.add(identifier)
+            added += 1
+
+        if added:
+            await events.publish(
+                self.state.job_id,
+                "log",
+                {"message": f"📄 Added {added} user-uploaded source{'s' if added != 1 else ''} to the research pool"},
+                session_id=self.state.session_id
+            )
+
     async def _enforce_quality_gates(
         self,
         content: str,
@@ -5719,6 +5773,7 @@ Example format:
         await events.publish(job_id, "log", {"message": "📊 Entering General Thesis Chapter 4 Analysis..."}, session_id=session_id)
         from services.chapter4_generator import generate_chapter4
         from services.workspace_service import WORKSPACES_DIR
+        from pathlib import Path
 
         datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
         output_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "chapters")
@@ -5750,6 +5805,32 @@ Example format:
                 session_id=session_id
             )
             content = "# CHAPTER FOUR\n\nData analysis could not be generated. Please retry after dataset generation completes."
+
+        filepath = result_map.get("filepath")
+        if not filepath:
+            try:
+                candidates = list(Path(output_dir).glob("Chapter_4*.md"))
+                if candidates:
+                    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+                    filepath = str(latest)
+            except Exception:
+                filepath = None
+
+        if not filepath:
+            safe_topic = re.sub(r"[^\w\s-]", "", topic)[:50].replace(" ", "_")
+            filename = f"Chapter_4_Data_Analysis_{safe_topic}.md"
+            os.makedirs(output_dir, exist_ok=True)
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        if filepath:
+            await events.publish(
+                job_id,
+                "file_created",
+                {"path": filepath, "filename": os.path.basename(filepath), "type": "markdown", "auto_open": True},
+                session_id=session_id
+            )
 
         return content
 
@@ -5993,6 +6074,20 @@ Example format:
             "3. Examine longitudinal outcomes to assess the durability of the observed patterns.\n"
         )
 
+        safe_topic = re.sub(r"[^\w\s-]", "", topic)[:50].replace(" ", "_")
+        filename = f"Chapter_5_Discussion_{safe_topic}.md"
+        os.makedirs(workspace_dir, exist_ok=True)
+        filepath = workspace_dir / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        await events.publish(
+            job_id,
+            "file_created",
+            {"path": str(filepath), "filename": filename, "type": "markdown", "auto_open": True},
+            session_id=session_id
+        )
+
         return content
 
     async def generate_chapter_six(self, job_id: str, session_id: str, workspace_id: str, thesis_type: str = "phd", sample_size: int = None) -> str:
@@ -6174,10 +6269,161 @@ Example format:
         )
 
         try:
+            if thesis_type == "general":
+                # Run General thesis flow with parallel tasks and clear dependencies.
+                await events.publish(job_id, "stage_started", {"stage": "prelims", "message": "📑 Generating Preliminary Pages..."}, session_id=session_id)
+                prelims_task = asyncio.create_task(
+                    generate_preliminary_pages_uoj(
+                        topic,
+                        case_study,
+                        job_id=job_id,
+                        session_id=session_id,
+                        workspace_id=workspace_id
+                    )
+                )
+
+                await events.publish(job_id, "stage_started", {"stage": "chapter_1", "message": "📖 Generating Chapter 1: Introduction"}, session_id=session_id)
+                country = "South Sudan"
+                c1_content = await generate_chapter_one_uoj(
+                    topic, case_study, country, job_id, session_id, workspace_id, normalized_objectives or objectives, thesis_type=thesis_type
+                )
+
+                await events.publish(job_id, "stage_started", {"stage": "chapter_2", "message": "📚 Generating Chapter 2: Literature Review"}, session_id=session_id)
+                ch2_gen = ParallelChapterGenerator()
+                c2_task = asyncio.create_task(
+                    ch2_gen.generate_chapter_two(
+                        topic,
+                        case_study,
+                        job_id,
+                        session_id,
+                        workspace_id,
+                        objectives=normalized_objectives or objectives,
+                        thesis_type=thesis_type,
+                        sample_size=sample_size,
+                        allow_quality_failure=allow_quality_failure
+                    )
+                )
+
+                await events.publish(job_id, "stage_started", {"stage": "chapter_3", "message": "🧪 Generating Chapter 3: Research Methodology"}, session_id=session_id)
+                ch3_gen = ParallelChapterGenerator()
+                c3_task = asyncio.create_task(
+                    ch3_gen.generate_chapter_three(
+                        topic,
+                        case_study,
+                        job_id,
+                        session_id,
+                        workspace_id,
+                        objectives=normalized_objectives or objectives,
+                        thesis_type=thesis_type,
+                        sample_size=sample_size,
+                        allow_quality_failure=allow_quality_failure
+                    )
+                )
+
+                c2_content, c3_content = await asyncio.gather(c2_task, c3_task)
+
+                await events.publish(job_id, "stage_started", {"stage": "study_tools", "message": "📋 Generating Study Tools (Questionnaire, Interview Guide)..."}, session_id=session_id)
+                from services.workspace_service import WORKSPACES_DIR
+                from services.data_collection_worker import generate_study_tools, generate_research_dataset
+                tools_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "study_tools")
+                os.makedirs(tools_dir, exist_ok=True)
+                tools_task = asyncio.create_task(
+                    generate_study_tools(
+                        topic=topic,
+                        objectives=normalized_objectives or objectives,
+                        output_dir=tools_dir,
+                        job_id=job_id,
+                        session_id=session_id,
+                        sample_size=sample_size
+                    )
+                )
+
+                await events.publish(job_id, "stage_started", {"stage": "dataset", "message": f"🎲 Generating Synthetic Research Dataset (n={sample_size})..."}, session_id=session_id)
+                datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
+                os.makedirs(datasets_dir, exist_ok=True)
+                dataset_task = asyncio.create_task(
+                    generate_research_dataset(
+                        topic=topic,
+                        case_study=case_study,
+                        objectives=normalized_objectives or objectives,
+                        sample_size=sample_size,
+                        output_dir=datasets_dir,
+                        job_id=job_id,
+                        session_id=session_id
+                    )
+                )
+
+                await asyncio.gather(tools_task, dataset_task)
+
+                await events.publish(job_id, "stage_started", {"stage": "chapter_4", "message": "📊 Generating Chapter 4: Data Analysis"}, session_id=session_id)
+                ch4_gen = ParallelChapterGenerator()
+                c4_content = await ch4_gen.generate_chapter_four(
+                    job_id,
+                    session_id,
+                    workspace_id,
+                    thesis_type=thesis_type,
+                    sample_size=sample_size,
+                    allow_quality_failure=allow_quality_failure
+                )
+
+                await events.publish(job_id, "stage_started", {"stage": "chapter_5", "message": "🏁 Generating Chapter 5: Discussion, Conclusions & Recommendations"}, session_id=session_id)
+                ch5_gen = ParallelChapterGenerator()
+                c5_content = await ch5_gen.generate_chapter_five(
+                    job_id,
+                    session_id,
+                    workspace_id,
+                    thesis_type=thesis_type,
+                    sample_size=sample_size,
+                    allow_quality_failure=allow_quality_failure
+                )
+
+                prelims = await prelims_task
+
+                results[0] = prelims
+                results[1] = c1_content
+                results[2] = c2_content
+                results[3] = c3_content
+                results[4] = c4_content
+                results[5] = c5_content
+
+                await events.publish(job_id, "stage_started", {"stage": "appendices", "message": "📎 Generating Appendices..."}, session_id=session_id)
+                try:
+                    appendices = await generate_appendices_uoj(topic, objectives)
+                    results[10] = appendices
+                except Exception as e:
+                    print(f"Error generating appendices: {e}")
+
+                await events.publish(job_id, "stage_started", {"stage": "combining", "message": "📑 Combining chapters into final thesis document..."}, session_id=session_id)
+                try:
+                    from services.thesis_combiner import ThesisCombiner
+                    combiner = ThesisCombiner(
+                        workspace_id=workspace_id,
+                        topic=topic,
+                        case_study=case_study,
+                        objectives=objectives,
+                        output_dir=None
+                    )
+                    combiner.load_chapters_from_files()
+                    combined_content, combined_path = combiner.combine_thesis()
+                    await events.publish(job_id, "file_created", {"path": combined_path, "filename": os.path.basename(combined_path), "type": "markdown", "auto_open": True}, session_id=session_id)
+                    await events.publish(job_id, "stage_completed", {"stage": "combining", "message": f"✅ Final Thesis Combined: {os.path.basename(combined_path)}"}, session_id=session_id)
+                    results["combined_thesis"] = combined_path
+                except Exception as e:
+                    print(f"❌ Error combining thesis: {e}")
+                    await events.publish(job_id, "error", {"message": f"Failed to combine thesis: {str(e)}"}, session_id=session_id)
+
+                return results
+
             # 0. Preliminary Pages (General Only)
             if thesis_type == "general":
                 await events.publish(job_id, "stage_started", {"stage": "prelims", "message": "📑 Generating Preliminary Pages..."}, session_id=session_id)
-                prelims = await generate_preliminary_pages_uoj(topic, case_study)
+                prelims = await generate_preliminary_pages_uoj(
+                    topic,
+                    case_study,
+                    job_id=job_id,
+                    session_id=session_id,
+                    workspace_id=workspace_id
+                )
                 results[0] = prelims
             
             # Chapter 1 - Introduction
@@ -6188,7 +6434,7 @@ Example format:
                 country = "South Sudan"  # Default country for UoJ theses
                 
                 c1_content = await generate_chapter_one_uoj(
-                    topic, case_study, country, job_id, session_id, workspace_id, objectives
+                    topic, case_study, country, job_id, session_id, workspace_id, objectives, thesis_type=thesis_type
                 )
             else:
                 c1_content = await self.generate(
@@ -6363,6 +6609,8 @@ Example format:
         # 1. Setup State & Logging
         await events.publish(job_id, "stage_started", {"stage": "chapter_two", "message": "📚 Starting General Chapter 2 Literature Review (Authentic Source Search)..."}, session_id=session_id)
         
+        if objectives and not isinstance(objectives, dict):
+            objectives = normalize_objectives(objectives, topic, case_study)
         saved_objectives = objectives or {"general": "", "specific": []}
         specific_objs = saved_objectives.get("specific", [])
         
@@ -6377,24 +6625,55 @@ Example format:
         )
         self.state.parameters["thesis_type"] = "general"
         
-        # 2. PHASE 1: REAL API SEARCH (Prevent Hallucinations)
-        await events.publish(job_id, "log", {"message": "🔍 Launching Academic Search Agents (Semantic Scholar/Crossref)..."}, session_id=session_id)
-        
-        # Define Search Queries (Theories + Empirical)
-        search_tasks = []
-        
-        # A. Theory Search (3 queries)
-        theory_queries = [
-            f"{topic} theoretical framework",
-            f"{topic} theory model",
-            f"{case_study} conceptual framework"
-        ]
-        
-        async def search_theories():
-            results = []
-            for query in theory_queries:
+        from core.config import settings
+        use_external_search = settings.GENERAL_LIT_SEARCH_ENABLED
+        all_papers = []
+
+        if use_external_search:
+            # 2. PHASE 1: REAL API SEARCH (Prevent Hallucinations)
+            await events.publish(job_id, "log", {"message": "🔍 Launching Academic Search Agents (Semantic Scholar/Crossref)..."}, session_id=session_id)
+
+            # Define Search Queries (Theories + Empirical)
+            search_tasks = []
+
+            # A. Theory Search (3 queries)
+            theory_queries = [
+                f"{topic} theoretical framework",
+                f"{topic} theory model",
+                f"{case_study} conceptual framework"
+            ]
+
+            async def search_theories():
+                results = []
+                for query in theory_queries:
+                    try:
+                        papers = await academic_search_service.search_academic_papers(query, max_results=15)
+                        for paper in papers:
+                            results.append(ResearchResult(
+                                title=paper.get("title", ""),
+                                authors=paper.get("authors", [])[:5],
+                                year=paper.get("year") or 2023,
+                                doi=paper.get("doi", ""),
+                                url=paper.get("url", ""),
+                                abstract=paper.get("abstract", "")[:500],
+                                source="theories",
+                                venue=paper.get("venue", "")
+                            ))
+                    except:
+                        pass
+                return results
+
+            search_tasks.append(search_theories())
+
+            # B. Empirical Search (Per Objective)
+            async def search_objective(obj_idx, obj_text):
+                results = []
+                # Extract keywords
+                clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "")
+                query = f"{clean_obj} {topic} {case_study}"[:100]
                 try:
-                    papers = await academic_search_service.search_academic_papers(query, max_results=15)
+                    # Targeted search for this objective
+                    papers = await academic_search_service.search_academic_papers(query, max_results=20)
                     for paper in papers:
                         results.append(ResearchResult(
                             title=paper.get("title", ""),
@@ -6403,48 +6682,33 @@ Example format:
                             doi=paper.get("doi", ""),
                             url=paper.get("url", ""),
                             abstract=paper.get("abstract", "")[:500],
-                            source="theories",
+                            source=f"theme{obj_idx+1}", # Align with WriterSwarm expecting theme sources
                             venue=paper.get("venue", "")
                         ))
-                except: pass
-            return results
-        
-        search_tasks.append(search_theories())
-        
-        # B. Empirical Search (Per Objective)
-        async def search_objective(obj_idx, obj_text):
-            results = []
-            # Extract keywords
-            clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "")
-            query = f"{clean_obj} {topic} {case_study}"[:100]
-            try:
-                # Targeted search for this objective
-                papers = await academic_search_service.search_academic_papers(query, max_results=20)
-                for paper in papers:
-                    results.append(ResearchResult(
-                        title=paper.get("title", ""),
-                        authors=paper.get("authors", [])[:5],
-                        year=paper.get("year") or 2023,
-                        doi=paper.get("doi", ""),
-                        url=paper.get("url", ""),
-                        abstract=paper.get("abstract", "")[:500],
-                        source=f"theme{obj_idx+1}", # Align with WriterSwarm expecting theme sources
-                        venue=paper.get("venue", "")
-                    ))
-            except: pass
-            return results
+                except:
+                    pass
+                return results
 
-        for i, obj in enumerate(specific_objs[:4]): # Limit to 4 objectives
-            search_tasks.append(search_objective(i, obj))
-            
-        # Execute Parallel Search
-        search_results_lists = await asyncio.gather(*search_tasks)
-        
-        # Flatten and Populate Citation Pool
-        all_papers = [p for sublist in search_results_lists for p in sublist]
-        self.state.chapter2_citation_pool = all_papers # CRITICAL: This enables citation injection
-        
-        await events.publish(job_id, "log", {"message": f"✅ Authentication Complete: Found {len(all_papers)} citable peer-reviewed papers."}, session_id=session_id)
+            for i, obj in enumerate(specific_objs[:4]): # Limit to 4 objectives
+                search_tasks.append(search_objective(i, obj))
+
+            # Execute Parallel Search
+            search_results_lists = await asyncio.gather(*search_tasks)
+
+            # Flatten and Populate Citation Pool
+            all_papers = [p for sublist in search_results_lists for p in sublist]
+            await events.publish(job_id, "log", {"message": f"✅ Search Complete: Found {len(all_papers)} citable peer-reviewed papers."}, session_id=session_id)
+        else:
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "📝 Skipping external academic search for General flow; using uploaded sources only."},
+                session_id=session_id
+            )
+            seen_identifiers = set()
+            await self._include_uploaded_sources(all_papers, seen_identifiers)
+
+        self.state.chapter2_citation_pool = all_papers  # Enables citation injection
 
         # 3. Build Write Configurations (General Structure)
         configs = []
@@ -6503,7 +6767,8 @@ Example format:
         
         # 1. Setup State & Logging
         await events.publish(job_id, "stage_started", {"stage": "chapter_two", "message": "📚 Starting UoJ Chapter 2: Literature Review (Region-Targeted Search)..."}, session_id=session_id)
-        
+        if objectives and not isinstance(objectives, dict):
+            objectives = normalize_objectives(objectives, topic, case_study)
         saved_objectives = objectives or {"general": "", "specific": []}
         specific_objs = saved_objectives.get("specific", [])
         
@@ -6517,88 +6782,120 @@ Example format:
             thesis_type="general"
         )
         
+        async def announce(action: str):
+            await events.publish(
+                job_id,
+                "agent_activity",
+                {
+                    "agent": "uoj_ch2_writer",
+                    "agent_name": "UoJ Chapter 2",
+                    "status": "running",
+                    "action": action,
+                    "icon": "✍️",
+                    "type": "chapter_generator"
+                },
+                session_id=session_id
+            )
+
         # Retrieve country from DB or default
         db = resolve_thesis_db(session_id, workspace_id)
         country = "South Sudan"  # Default country for UoJ theses
-
-        # 2. PHASE 1: TARGETED REGIONAL SEARCH
-        await events.publish(job_id, "log", {"message": "🌍 Launching Multi-Region Academic Search Agents..."}, session_id=session_id)
-        
-        search_tasks = []
-        
-        # A. Theory Search
-        theory_queries = [
-            f"{topic} theoretical framework",
-            f"{topic} theory model",
-            f"{case_study} conceptual framework"
-        ]
-        
-        async def search_theories():
-            results = []
-            for query in theory_queries:
-                try:
-                    papers = await academic_search_service.search_academic_papers(query, max_results=10)
-                    for p in papers:
-                        p['source_type'] = 'theory'
-                        results.append(p)
-                except: pass
-            return results
-        search_tasks.append(search_theories())
-
-        # B. Empirical Search (Region-Specific for EACH objective)
-        # Regions: Asia, South America, West Africa, Central/South Africa, East Africa, Local
         regions = ["Asia", "South America", "West Africa", "South Africa", "East Africa", country]
-        
-        async def search_objective_regions(obj_text, obj_idx):
-            results = []
-            clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "").replace("examine ", "")
-            base_query = f"{clean_obj} {topic}"[:60]
-            
-            for region in regions:
-                query = f"{base_query} {region}"
-                try:
-                    papers = await academic_search_service.search_academic_papers(query, max_results=3)
-                    for p in papers:
-                        p['source_type'] = f"obj_{obj_idx}_{region}"
-                        results.append(p)
-                except: pass
-            return results
 
-        # Limit to first 3 objectives for deep search to avoid rate limits/timeouts
-        for i, obj in enumerate(specific_objs[:3]):
-            search_tasks.append(search_objective_regions(obj, i))
-
-        # Execute Search
-        search_results_lists = await asyncio.gather(*search_tasks)
-        
-        # Flatten and deduplicate
+        from core.config import settings
+        use_external_search = settings.GENERAL_LIT_SEARCH_ENABLED
         all_papers = []
-        seen_dois = set()
-        for sublist in search_results_lists:
-            for p in sublist:
-                # Normalize paper object
-                paper_obj = ResearchResult(
-                    title=p.get("title", ""),
-                    authors=p.get("authors", [])[:5],
-                    year=p.get("year") or 2023,
-                    doi=p.get("doi", ""),
-                    url=p.get("url", ""),
-                    abstract=p.get("abstract", "")[:500],
-                    source=p.get('source_type', 'general'),
-                    venue=p.get("venue", "")
-                )
-                if paper_obj.title and paper_obj.title not in seen_dois: # Simple dedup by title/doi
-                    all_papers.append(paper_obj)
-                    seen_dois.add(paper_obj.title)
+
+        if use_external_search:
+            # 2. PHASE 1: TARGETED REGIONAL SEARCH
+            await events.publish(job_id, "log", {"message": "🌍 Launching Multi-Region Academic Search Agents..."}, session_id=session_id)
+            await announce("Launching academic search for Chapter 2 sources")
+            
+            search_tasks = []
+            
+            # A. Theory Search
+            theory_queries = [
+                f"{topic} theoretical framework",
+                f"{topic} theory model",
+                f"{case_study} conceptual framework"
+            ]
+            
+            async def search_theories():
+                results = []
+                for query in theory_queries:
+                    try:
+                        papers = await academic_search_service.search_academic_papers(query, max_results=10)
+                        for p in papers:
+                            p['source_type'] = 'theory'
+                            results.append(p)
+                    except:
+                        pass
+                return results
+            search_tasks.append(search_theories())
+
+            # B. Empirical Search (Region-Specific for EACH objective)
+            # Regions: Asia, South America, West Africa, Central/South Africa, East Africa, Local
+            async def search_objective_regions(obj_text, obj_idx):
+                results = []
+                clean_obj = obj_text.lower().replace("to ", "").replace("assess ", "").replace("determine ", "").replace("examine ", "")
+                base_query = f"{clean_obj} {topic}"[:60]
+                
+                for region in regions:
+                    query = f"{base_query} {region}"
+                    try:
+                        papers = await academic_search_service.search_academic_papers(query, max_results=3)
+                        for p in papers:
+                            p['source_type'] = f"obj_{obj_idx}_{region}"
+                            results.append(p)
+                    except:
+                        pass
+                return results
+
+            # Limit to first 3 objectives for deep search to avoid rate limits/timeouts
+            for i, obj in enumerate(specific_objs[:3]):
+                search_tasks.append(search_objective_regions(obj, i))
+
+            # Execute Search
+            search_results_lists = await asyncio.gather(*search_tasks)
+            
+            # Flatten and deduplicate
+            seen_dois = set()
+            for sublist in search_results_lists:
+                for p in sublist:
+                    # Normalize paper object
+                    paper_obj = ResearchResult(
+                        title=p.get("title", ""),
+                        authors=p.get("authors", [])[:5],
+                        year=p.get("year") or 2023,
+                        doi=p.get("doi", ""),
+                        url=p.get("url", ""),
+                        abstract=p.get("abstract", "")[:500],
+                        source=p.get('source_type', 'general'),
+                        venue=p.get("venue", "")
+                    )
+                    if paper_obj.title and paper_obj.title not in seen_dois: # Simple dedup by title/doi
+                        all_papers.append(paper_obj)
+                        seen_dois.add(paper_obj.title)
+
+            await events.publish(job_id, "log", {"message": f"✅ Found {len(all_papers)} region-specific papers."}, session_id=session_id)
+        else:
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "📝 Skipping external academic search for UoJ General; using uploaded sources only."},
+                session_id=session_id
+            )
+            seen_identifiers = set()
+            await self._include_uploaded_sources(all_papers, seen_identifiers)
 
         self.state.chapter2_citation_pool = all_papers
-        await events.publish(job_id, "log", {"message": f"✅ Found {len(all_papers)} region-specific papers."}, session_id=session_id)
 
         # 3. GENERATE CONTENT (Parallel Writing)
         write_tasks = []
 
         # 3.1 Introduction
         async def write_intro():
+            await announce("Writing Chapter 2 introduction")
             prompt = f"""Write Introduction of chapter two about literature reviews for {topic}.
             Say: "Chapter two of this study will be about literature reviews using previous information from former scholars... study gaps in accordance to {case_study}, {country} will be identified."
             One detailed paragraph."""
@@ -6607,6 +6904,7 @@ Example format:
         
         # 3.2 Theoretical Reviews
         async def write_theory_intro():
+            await announce("Writing theoretical review introduction")
             return await deepseek_direct_service.generate_content(f"""Write one paragraph introduction for Theoretical review section: "The study about {topic} will be guided by three theories...".""", max_tokens=300)
         write_tasks.append(("theory_intro", write_theory_intro()))
         
@@ -6614,6 +6912,7 @@ Example format:
         theory_targets = ["General Theory"] + [f"Theory for Objective {i+1}" for i in range(min(2, len(specific_objs)))]
         
         async def write_theory(idx, target):
+            await announce(f"Writing theoretical framework: {target}")
             relevant_papers = [p for p in all_papers if p.source == 'theory'] or all_papers[:5]
             citations = "\n".join([f"- {p.title} by {p.authors} ({p.year}) DOI: {p.doi}" for p in relevant_papers[:5]])
             prompt = f"""Write a Theoretical Framework for {target} regarding {topic}.
@@ -6634,10 +6933,12 @@ Example format:
 
         # 3.3 Empirical Reviews
         async def write_emp_intro():
+             await announce("Writing empirical review introduction")
              return await deepseek_direct_service.generate_content("Write one paragraph introduction to empirical review section.", max_tokens=300)
         write_tasks.append(("emp_intro", write_emp_intro()))
         
         async def write_empirical_obj(i, obj):
+            await announce(f"Writing empirical review for objective {i + 1}")
             # Generate content for 6 regions (Parallelized)
             region_tasks = []
             for region in regions:
@@ -6664,6 +6965,7 @@ Example format:
 
         # 3.4 Summary Gap
         async def write_gap():
+            await announce("Writing literature summary and gap")
             return await deepseek_direct_service.generate_content(f"""Write literature summary and knowledge gap based on the reviews in context of {case_study}, {country}.""", max_tokens=500)
         write_tasks.append(("gap", write_gap()))
         

@@ -6,12 +6,19 @@ import httpx
 import os
 from typing import Optional
 
+try:
+    from core.config import settings as _settings
+except Exception:
+    _settings = None
+
 
 class DeepSeekClient:
     """Direct DeepSeek API client."""
     
     def __init__(self):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key and _settings is not None:
+            self.api_key = getattr(_settings, "DEEPSEEK_API_KEY", None)
         self.base_url = "https://api.deepseek.com/v1"
         
         if not self.api_key:

@@ -8,6 +8,7 @@ Uses DeepSeek's direct API (not OpenRouter) with:
 Reasoning models are automatically used for complex tasks requiring reasoning.
 """
 
+import asyncio
 import httpx
 from typing import Dict, Any, List, Optional
 from core.config import settings
@@ -99,54 +100,68 @@ class DeepSeekDirectService:
             "stream": stream
         }
         
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-                if stream:
-                    # Streaming mode with callback
-                    full_content = []
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload
-                    ) as response:
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                    if stream:
+                        # Streaming mode with callback
+                        full_content = []
+                        async with client.stream(
+                            "POST",
+                            f"{self.base_url}/chat/completions",
+                            headers=headers,
+                            json=payload
+                        ) as response:
+                            if response.status_code != 200:
+                                err_body = await response.aread()
+                                print(f"❌ DeepSeek Error {response.status_code}: {err_body}")
+                                return ""
+
+                            async for line in response.aiter_lines():
+                                if not line or line.strip() == "":
+                                    continue
+                                if line.startswith("data: "):
+                                    line = line[6:]
+                                if line.strip() == "[DONE]":
+                                    break
+
+                                try:
+                                    import json
+                                    chunk_data = json.loads(line)
+                                    if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+                                        delta = chunk_data["choices"][0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            full_content.append(content)
+                                            if stream_callback:
+                                                await stream_callback(content)
+                                except json.JSONDecodeError:
+                                    continue
+
+                        return "".join(full_content)
+                    else:
+                        # Non-streaming mode
+                        response = await client.post(
+                            f"{self.base_url}/chat/completions",
+                            headers=headers,
+                            json=payload
+                        )
                         if response.status_code != 200:
-                             err_body = await response.aread()
-                             print(f"❌ DeepSeek Error {response.status_code}: {err_body}")
-                             response.raise_for_status()
-                        
-                        async for line in response.aiter_lines():
-                            if not line or line.strip() == "": continue
-                            if line.startswith("data: "): line = line[6:]
-                            if line.strip() == "[DONE]": break
-                            
-                            try:
-                                import json
-                                chunk_data = json.loads(line)
-                                if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
-                                    delta = chunk_data["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_content.append(content)
-                                        if stream_callback:
-                                            await stream_callback(content)
-                            except json.JSONDecodeError: continue
-                    
-                    return "".join(full_content)
-                else:
-                    # Non-streaming mode
-                    response = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload
-                    )
-                    if response.status_code != 200:
-                        response.raise_for_status()
-                    data = response.json()
-                    return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"⚠️  DeepSeek API error: {e}")
-            raise
+                            err_body = response.text
+                            print(f"❌ DeepSeek Error {response.status_code}: {err_body}")
+                            return ""
+                        data = response.json()
+                        return data["choices"][0]["message"]["content"]
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, httpx.NetworkError) as e:
+                print(f"⚠️  DeepSeek API timeout/network error (attempt {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(1.5 * attempt)
+                    continue
+                return ""
+            except Exception as e:
+                print(f"⚠️  DeepSeek API error: {e}")
+                return ""
     
     async def generate_stream(
         self,
@@ -286,4 +301,3 @@ class DeepSeekDirectService:
 # Singleton instance
 deepseek_direct_service = DeepSeekDirectService()
 deepseek_direct = deepseek_direct_service
-

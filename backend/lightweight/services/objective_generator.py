@@ -64,3 +64,32 @@ def generate_smart_objectives(topic: str, num_objectives: int = 4) -> list:
         objectives.append(f"To evaluate the {themes[5]}")
         
     return objectives[:num_objectives]
+
+
+def normalize_objectives(objectives: any, topic: str, case_study: str) -> dict:
+    """Normalize objectives into {general: str, specific: [str,...]}."""
+    if isinstance(objectives, dict):
+        general = objectives.get("general") or ""
+        specific = objectives.get("specific") or []
+    elif isinstance(objectives, list):
+        general = ""
+        specific = objectives
+    elif isinstance(objectives, str):
+        general = objectives
+        specific = []
+    else:
+        general = ""
+        specific = []
+
+    specific = [o.strip() for o in specific if isinstance(o, str) and o.strip()]
+
+    if not general:
+        if specific:
+            general = f"To investigate {extract_short_theme(topic)} in the context of {case_study}"
+        else:
+            general = f"To investigate {topic} in the context of {case_study}"
+
+    if not specific:
+        specific = generate_smart_objectives(topic, 4)
+
+    return {"general": general, "specific": specific}

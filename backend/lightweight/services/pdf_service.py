@@ -368,3 +368,20 @@ def get_pdf_service() -> PDFService:
     if _pdf_service is None:
         _pdf_service = PDFService()
     return _pdf_service
+
+
+async def extract_text_from_pdf(pdf_path: str, use_ocr: bool = False) -> str:
+    """Extract text from a PDF path for upload/RAG workflows."""
+    pdf_path_obj = Path(pdf_path)
+    if not pdf_path_obj.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    service = get_pdf_service()
+    if use_ocr:
+        return await asyncio.to_thread(service.extract_text_ocr, pdf_path_obj)
+
+    def extract_text() -> str:
+        text, _tables = service.extract_text_advanced(pdf_path_obj)
+        return text
+
+    return await asyncio.to_thread(extract_text)

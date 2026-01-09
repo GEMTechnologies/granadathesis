@@ -4,6 +4,7 @@ Generates Chapter 1 following UoJ Bachelor's thesis template with 16 sections.
 """
 from typing import Dict, Any
 from services.deepseek_direct import deepseek_direct_service
+from services.objective_generator import normalize_objectives
 from core.events import events
 from services.chapter_state import ChapterState
 
@@ -25,12 +26,30 @@ async def generate_chapter_one_uoj(
     
     await events.publish(job_id, "log", {"message": "📖 Generating UoJ Chapter 1 (16 sections)..."}, session_id=session_id)
     
+    if not isinstance(objectives, dict):
+        objectives = normalize_objectives(objectives or [], topic, case_study)
     general_objective = objectives.get("general", "")
     specific_objectives = objectives.get("specific", [])
+
+    async def announce(section_id: str, title: str):
+        await events.publish(
+            job_id,
+            "agent_activity",
+            {
+                "agent": "uoj_writer",
+                "agent_name": "UoJ Writer",
+                "status": "running",
+                "action": f"Writing §{section_id}: {title}",
+                "icon": "✍️",
+                "type": "chapter_generator"
+            },
+            session_id=session_id
+        )
     
     # ================================================================
     # SECTION 1.0: INTRODUCTION TO THE STUDY
     # ================================================================
+    await announce("1.0", "Introduction to the Study")
     intro_prompt = f"""Write a brief Introduction about {topic} in {country} and specifically in {case_study}.
 
 Make about three paragraphs for this Introduction with enough in-text citations (2020-2025, APA style).
@@ -54,6 +73,7 @@ Be brief but comprehensive."""
     # ================================================================
     # SECTION 1.1: BACKGROUND OF THE STUDY
     # ================================================================
+    await announce("1.1", "Background of the Study")
     background_prompt = f"""Write historical Background of the study about {topic}.
 
 Structure (all in ONE paragraph each):
@@ -79,6 +99,7 @@ Be comprehensive with citations at the end of each line/sentence."""
     # ================================================================
     # SECTION 1.2: PROBLEM STATEMENT
     # ================================================================
+    await announce("1.2", "Problem Statement")
     problem_prompt = f"""Write a standard problem Statement in APA style for the study about {topic} in {case_study}, {country}.
 
 Organize in this format (one paragraph per point):
@@ -104,6 +125,7 @@ Never say "we" - say "the study" or "the researcher"."""
     # ================================================================
     # SECTION 1.3: PURPOSE OF THE STUDY
     # ================================================================
+    await announce("1.3", "Purpose of the Study")
     purpose_prompt = f"""Write the purpose of the study about {topic} in {case_study}, {country}.
 
 Let it be precise and very summarized. Only the purpose of the study, don't add anything else.
@@ -130,6 +152,7 @@ Write in academic and professional tone. Be brief."""
 
 Return ONLY the questions, numbered 1-{len(specific_objectives)+1}. Be brief."""
 
+    await announce("1.5", "Study Questions")
     section_1_5 = await deepseek_direct_service.generate_content(
         prompt=questions_prompt,
         temperature=0.5,
@@ -150,6 +173,7 @@ H02: [null hypothesis for objective 2]
 
 Return ONLY the hypotheses. Be brief."""
 
+    await announce("1.6", "Research Hypothesis")
     section_1_6 = await deepseek_direct_service.generate_content(
         prompt=hypothesis_prompt,
         temperature=0.5,
@@ -159,6 +183,7 @@ Return ONLY the hypotheses. Be brief."""
     # ================================================================
     # SECTION 1.7: SIGNIFICANCE OF THE STUDY
     # ================================================================
+    await announce("1.7", "Significance of the Study")
     significance_prompt = f"""State the Significance of the study about {topic} in {country} and {case_study}.
 
 Format:
@@ -177,6 +202,7 @@ Be detailed and specific to {case_study}."""
     # ================================================================
     # SECTION 1.8: SCOPE OF THE STUDY
     # ================================================================
+    await announce("1.8", "Scope of the Study")
     scope_prompt = f"""State the Scope of the study about {topic} in {case_study}, {country} in terms of:
 
 1. **Content Scope**: What the study will cover
@@ -194,6 +220,7 @@ Don't bullet or number. Write in detailed paragraphs."""
     # ================================================================
     # SECTION 1.9: LIMITATIONS OF THE STUDY
     # ================================================================
+    await announce("1.9", "Limitations of the Study")
     limitations_prompt = f"""State the Limitations of the Study about {topic} in {case_study}, {country}.
 
 Explain each limitation in detail and talk in future tense. For each, tell us how you could mitigate it in a few sentences.
@@ -210,6 +237,7 @@ Don't bullet or number. Write in detailed paragraphs."""
     # ================================================================
     # SECTION 1.11: DELIMITATIONS OF THE STUDY
     # ================================================================
+    await announce("1.11", "Delimitations of the Study")
     delimitations_prompt = f"""State and explain the Delimitation(s) of the study about {topic} in {case_study}, {country}.
 
 Present all in ONE paragraph. Write in academic language."""
@@ -223,6 +251,7 @@ Present all in ONE paragraph. Write in academic language."""
     # ================================================================
     # SECTION 1.12: THEORETICAL FRAMEWORK
     # ================================================================
+    await announce("1.12", "Theoretical Framework of the Study")
     theoretical_prompt = f"""Generate one theory by a scholar or scholars for a study about {topic}.
 
 Structure:
@@ -248,6 +277,7 @@ Be very very detailed."""
     # ================================================================
     # SECTION 1.13: CONCEPTUAL FRAMEWORK
     # ================================================================
+    await announce("1.13", "Conceptual Framework")
     conceptual_prompt = f"""State Independent and dependent Variables for the study about {topic}.
 
 List:
@@ -290,6 +320,7 @@ Designed and Molded by Researcher (2025)"""
     # ================================================================
     # SECTION 1.15: DEFINITION OF KEY TERMS
     # ================================================================
+    await announce("1.15", "Definition of Key Terms")
     definitions_prompt = f"""Write definition of key terms on the study about {topic} in {case_study}.
 
 **CRITICAL**: Format ALL citations as clickable markdown hyperlinks: [Author et al., Year](https://doi.org/xxxxx)
@@ -306,6 +337,7 @@ Where you can't get real good citations, don't cite."""
     # ================================================================
     # SECTION 1.16: ORGANIZATION OF THE STUDY
     # ================================================================
+    await announce("1.16", "Organization of the Study")
     is_phd = thesis_type in ["phd", "uoj_phd"]
     ch_outline = "six chapters" if is_phd else "five chapters"
     ch6_text = "- Chapter six: Conclusions, recommendations, suggestions for future studies" if is_phd else ""
@@ -387,9 +419,25 @@ The study will be guided by both a general objective and a list of specific obje
     
     # Save to file
     from services.workspace_service import WORKSPACES_DIR
-    chapter_path = WORKSPACES_DIR / workspace_id / "Chapter_1_Introduction_UoJ.md"
+    import os
+    workspace_path = WORKSPACES_DIR / workspace_id
+    os.makedirs(workspace_path, exist_ok=True)
+    chapter_path = workspace_path / "Chapter_1_Introduction_UoJ.md"
     with open(chapter_path, "w", encoding="utf-8") as f:
         f.write(chapter_one_content)
+
+    await events.publish(
+        job_id,
+        "file_created",
+        {
+            "path": str(chapter_path),
+            "filename": chapter_path.name,
+            "type": "markdown",
+            "auto_open": True,
+            "content_preview": chapter_one_content[:500]
+        },
+        session_id=session_id
+    )
     
     await events.publish(job_id, "log", {"message": f"✅ UoJ Chapter 1 complete ({len(chapter_one_content.split())} words)"}, session_id=session_id)
     

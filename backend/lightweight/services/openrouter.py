@@ -50,9 +50,10 @@ class OpenRouterService:
     def __init__(self):
         self.api_key = settings.OPENROUTER_API_KEY
         self.base_url = "https://openrouter.ai/api/v1"
+        self.enabled = bool(self.api_key)
         
-        if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY is not configured")
+        if not self.enabled:
+            print("⚠️  WARNING: OPENROUTER_API_KEY not configured. OpenRouter features disabled.")
     
     async def generate_content(
         self,
@@ -81,6 +82,21 @@ class OpenRouterService:
         """
         if model_key not in self.MODELS:
             raise ValueError(f"Unknown model: {model_key}. Available: {list(self.MODELS.keys())}")
+
+        if not self.enabled:
+            if tools:
+                raise ValueError("OpenRouter tools require OPENROUTER_API_KEY")
+            if model_key != "deepseek":
+                raise ValueError("OPENROUTER_API_KEY is not configured")
+            from services.deepseek_direct import deepseek_direct
+            return await deepseek_direct.generate_content(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=self.MODELS["deepseek"]["max_tokens"],
+                stream=stream,
+                stream_callback=stream_callback
+            )
         
         # Use OpenRouter for all models
         model_config = self.MODELS[model_key]

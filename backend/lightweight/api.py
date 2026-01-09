@@ -1166,8 +1166,17 @@ async def serve_file(workspace_id: str, file_path: str):
     """Serve binary files (images, PDFs, etc.) with correct Content-Type for inline viewing."""
     try:
         # Use central thesis_data directory
-        workspace_path = WORKSPACES_DIR / workspace_id / file_path
-        
+        workspace_dir = WORKSPACES_DIR / workspace_id
+        workspace_path = workspace_dir / file_path
+
+        if not (workspace_path.exists() and workspace_path.is_file()):
+            fallback_dirs = ["figures", "chapters", "datasets", "study_tools", "sources"]
+            fallback_paths = [workspace_dir / subdir / file_path for subdir in fallback_dirs]
+            workspace_path = next(
+                (p for p in fallback_paths if p.exists() and p.is_file()),
+                workspace_path
+            )
+
         if not (workspace_path.exists() and workspace_path.is_file()):
             print(f"❌ File not found: {file_path}")
             print(f"   Checked: {workspace_path}")
@@ -4185,6 +4194,12 @@ async def get_workspace_data_summary(workspace_id: str):
 
 # Universities data
 UNIVERSITIES = {
+    "uoj_general": {
+        "type": "uoj_general",
+        "name": "University of Juba General",
+        "abbreviation": "UoJ",
+        "description": "General thesis template for University of Juba with 5-chapter structure"
+    },
     "uoj_phd": {
         "type": "uoj_phd",
         "name": "University of Juba PhD",
@@ -4225,6 +4240,23 @@ async def get_thesis_template(university_type: str):
         )
     
     templates = {
+        "uoj_general": {
+            "cover_page": {
+                "institution": "UNIVERSITY OF JUBA",
+                "fields": ["title", "author", "supervisor", "date"]
+            },
+            "preliminary_sections": [
+                "approval_page",
+                "declaration",
+                "dedication",
+                "acknowledgements",
+                "abstract",
+                "table_of_contents"
+            ],
+            "chapters": 5,
+            "appendices": True,
+            "page_numbering": "roman_then_arabic"
+        },
         "uoj_phd": {
             "cover_page": {
                 "institution": "UNIVERSITY OF JUBA",
@@ -4329,11 +4361,59 @@ async def generate_thesis(request: dict):
     parameters = request.get('parameters', {})
     
     university_type = request.get('university_type', 'generic')
+    thesis_type = request.get('thesis_type') or parameters.get('thesis_type')
+    if not thesis_type:
+        thesis_type = "general" if university_type in ["uoj_general", "general"] else "phd"
     title = request.get('title', 'Research Thesis')
     topic = parameters.get('topic') or request.get('topic', '')
     objectives = request.get('objectives', [topic]) if topic else []
     workspace_id = request.get('workspace_id', 'default')
     session_id = request.get('session_id', 'default')
+    student_name = (
+        parameters.get('studentName')
+        or parameters.get('student_name')
+        or request.get('student_name')
+        or request.get('studentName')
+        or "[STUDENT NAME]"
+    )
+    index_number = (
+        parameters.get('indexNumber')
+        or parameters.get('index_number')
+        or request.get('index_number')
+        or request.get('indexNumber')
+        or "[INDEX NUMBER]"
+    )
+    school_name = (
+        parameters.get('school')
+        or request.get('school')
+        or "[SCHOOL]"
+    )
+    department_name = (
+        parameters.get('department')
+        or request.get('department')
+        or "[DEPARTMENT]"
+    )
+    degree_name = (
+        parameters.get('degree')
+        or request.get('degree')
+        or "DOCTOR OF PHILOSOPHY"
+    )
+    supervisor_name = (
+        parameters.get('supervisorName')
+        or parameters.get('supervisor_name')
+        or parameters.get('supervisor')
+        or request.get('supervisor_name')
+        or request.get('supervisorName')
+        or "[SUPERVISOR NAME]"
+    )
+    co_supervisor_name = (
+        parameters.get('coSupervisorName')
+        or parameters.get('co_supervisor_name')
+        or parameters.get('co_supervisor')
+        or request.get('co_supervisor_name')
+        or request.get('coSupervisorName')
+        or "[CO-SUPERVISOR NAME]"
+    )
     raw_case_study = parameters.get('caseStudy') or request.get('case_study', '')
     background_style = request.get('background_style', 'inverted_pyramid')
     
@@ -4372,7 +4452,7 @@ async def generate_thesis(request: dict):
         objectives = objectives[:6]
 
     
-    print(f"📚 FULL THESIS request: {topic}")
+    print(f"📚 FULL THESIS request: {topic} ({thesis_type})")
     
     # Create workspace directories - use WORKSPACES_DIR for consistency with frontend
     from services.workspace_service import WORKSPACES_DIR
@@ -4397,18 +4477,17 @@ async def generate_thesis(request: dict):
             # ================================================================
             # STEP 0: INITIALIZATION
             # ================================================================
-            await events.publish(
-                job_id,
-                "response_chunk",
-                {"chunk": f"""# 📚 GENERATING COMPLETE PhD THESIS
-
-**Topic:** {topic}
-**University:** {university_type}
-**Case Study:** {case_study}
-
-## 📋 Generation Pipeline (8 Steps)
-
-| Step | Component | Status |
+            is_general = thesis_type == "general"
+            pipeline_title = "GENERAL ACADEMIC THESIS" if is_general else "PhD THESIS"
+            pipeline_steps = """| Step | Component | Status |
+|------|-----------|--------|
+| 1 | Chapter 1: Introduction | ⏳ Pending |
+| 2 | Chapter 2: Literature Review | ⏳ Pending |
+| 3 | Chapter 3: Methodology | ⏳ Pending |
+| 4 | Study Tools Generation | ⏳ Pending |
+| 5 | Synthetic Dataset Generation | ⏳ Pending |
+| 6 | Chapter 4: Data Analysis | ⏳ Pending |
+| 7 | Chapter 5: Discussion, Conclusion & Recommendations | ⏳ Pending |""" if is_general else """| Step | Component | Status |
 |------|-----------|--------|
 | 1 | Chapter 1: Introduction | ⏳ Pending |
 | 2 | Chapter 2: Literature Review | ⏳ Pending |
@@ -4417,13 +4496,46 @@ async def generate_thesis(request: dict):
 | 5 | Synthetic Dataset Generation | ⏳ Pending |
 | 6 | Chapter 4: Data Analysis | ⏳ Pending |
 | 7 | Chapter 5: Discussion | ⏳ Pending |
-| 8 | Chapter 6: Conclusion | ⏳ Pending |
+| 8 | Chapter 6: Conclusion | ⏳ Pending |"""
+
+            await events.publish(
+                job_id,
+                "response_chunk",
+                {"chunk": f"""# 📚 GENERATING COMPLETE {pipeline_title}
+
+**Topic:** {topic}
+**University:** {university_type}
+**Case Study:** {case_study}
+
+## 📋 Generation Pipeline ({'7 Steps' if is_general else '8 Steps'})
+
+{pipeline_steps}
 
 ---
 
 """, "accumulated": ""},
                 session_id=session_id
             )
+
+            if thesis_type == "general":
+                research_design = parameters.get("studyType") or parameters.get("research_design")
+                preferred_analyses = parameters.get("preferredAnalyses") or parameters.get("preferred_analyses") or []
+                custom_instructions = parameters.get("customInstructions") or parameters.get("custom_instructions") or ""
+                await parallel_chapter_generator.generate_full_thesis_sequence(
+                    topic=topic,
+                    case_study=case_study,
+                    job_id=job_id,
+                    session_id=session_id,
+                    workspace_id=workspace_id,
+                    sample_size=sample_size,
+                    thesis_type="general",
+                    objectives=objectives,
+                    research_design=research_design,
+                    preferred_analyses=preferred_analyses,
+                    custom_instructions=custom_instructions
+                )
+                await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=session_id)
+                return
             
             # ================================================================
             # STEP 1: CHAPTER 1 - INTRODUCTION
@@ -5159,17 +5271,23 @@ The study concludes that evidence-based interventions are essential for addressi
 
 ### {student_name or '_________________________'}
 
+**Index Number:** {index_number or '_________________________'}
+
 &nbsp;
 
 ---
 
 **A Thesis Submitted in Partial Fulfilment of the Requirements for the Award of the Degree of**
 
-## DOCTOR OF PHILOSOPHY
+## {degree_name or 'DOCTOR OF PHILOSOPHY'}
 
 **in**
 
 **{topic.split()[0].title()} Studies**
+
+**{department_name or '_________________________'}**
+
+**{school_name or '_________________________'}**
 
 ---
 
@@ -5193,7 +5311,7 @@ I, the undersigned, hereby declare that this thesis is my original work and has 
 
 **Signature:** _________________________ &nbsp;&nbsp;&nbsp;&nbsp; **Date:** _________________________
 
-**Name of Candidate:** _________________________
+**Name of Candidate:** {student_name or '_________________________'}
 
 &nbsp;
 
@@ -5205,9 +5323,9 @@ I, the undersigned, hereby declare that this thesis is my original work and has 
 
 **Signature:** _________________________ &nbsp;&nbsp;&nbsp;&nbsp; **Date:** _________________________
 
-**Name:** _________________________
+**Name:** {supervisor_name or '_________________________'}
 
-**Department:** _________________________
+**Department:** {department_name or '_________________________'}
 
 &nbsp;
 
@@ -5215,9 +5333,9 @@ I, the undersigned, hereby declare that this thesis is my original work and has 
 
 **Signature:** _________________________ &nbsp;&nbsp;&nbsp;&nbsp; **Date:** _________________________
 
-**Name:** _________________________
+**Name:** {co_supervisor_name or '_________________________'}
 
-**Department:** _________________________
+**Department:** {department_name or '_________________________'}
 
 </div>
 
@@ -5573,25 +5691,35 @@ Download the proposal or complete thesis from the file panel.
     
     print(f"✅ Full thesis generation started: job_id={job_id}")
     
+    steps = [
+        "Chapter 1: Introduction",
+        "Chapter 2: Literature Review",
+        "Chapter 3: Methodology",
+        "Study Tools Generation",
+        "Dataset Generation",
+        "Chapter 4: Data Analysis",
+        "Chapter 5: Discussion, Conclusion & Recommendations"
+    ] if thesis_type == "general" else [
+        "Chapter 1: Introduction",
+        "Chapter 2: Literature Review",
+        "Chapter 3: Methodology",
+        "Study Tools Generation",
+        "Dataset Generation",
+        "Chapter 4: Data Analysis",
+        "Chapter 5: Discussion",
+        "Chapter 6: Conclusion",
+        "Combine Final Thesis"
+    ]
+
     return {
         "success": True,
-        "message": f"🚀 Full thesis generation started for '{topic}'. Generating all 6 chapters + study tools + datasets.",
+        "message": f"🚀 Full thesis generation started for '{topic}'.",
         "job_id": job_id,
         "title": title,
         "topic": topic,
         "objectives": objectives,
         "status": "generating",
-        "steps": [
-            "Chapter 1: Introduction",
-            "Chapter 2: Literature Review",
-            "Chapter 3: Methodology",
-            "Study Tools Generation",
-            "Dataset Generation",
-            "Chapter 4: Data Analysis",
-            "Chapter 5: Discussion",
-            "Chapter 6: Conclusion",
-            "Combine Final Thesis"
-        ]
+        "steps": steps
     }
 
 @app.post("/api/thesis/generate-from-topic")

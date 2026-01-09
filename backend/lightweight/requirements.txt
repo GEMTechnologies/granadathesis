@@ -11,3 +11,10 @@ sse-starlette==1.8.2
 weasyprint==60.1
 markdown==3.5.1
 playwright==1.49.0
+pandas
+matplotlib
+chromadb
+scipy
+numpy<2
+aiofiles
+openpyxl

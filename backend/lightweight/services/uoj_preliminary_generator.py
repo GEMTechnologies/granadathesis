@@ -3,7 +3,10 @@ University of Juba Preliminary Pages Generator
 Generates Title Page, Declaration, Approval, Dedication, Acknowledgement, Abstract.
 """
 from datetime import datetime
+import os
 from services.deepseek_direct import deepseek_direct_service
+from core.events import events
+from services.workspace_service import WORKSPACES_DIR
 
 async def generate_preliminary_pages_uoj(
     topic: str,
@@ -13,7 +16,10 @@ async def generate_preliminary_pages_uoj(
     school: str = "EDUCATION",
     department: str = "[DEPARTMENT]",
     degree: str = "EDUCATION",
-    supervisor: str = "[SUPERVISOR NAME]"
+    supervisor: str = "[SUPERVISOR NAME]",
+    job_id: str = None,
+    session_id: str = None,
+    workspace_id: str = None
 ) -> str:
     """Generate all UoJ preliminary pages in sequence."""
     
@@ -111,4 +117,26 @@ Table of Contents .......................................................... vii
 """
 
     # Combined
-    return f"{title_page}\n<div style='page-break-after: always;'></div>\n{declaration}\n<div style='page-break-after: always;'></div>\n{approval}\n<div style='page-break-after: always;'></div>\n{dedication}\n<div style='page-break-after: always;'></div>\n{acknowledgement}\n<div style='page-break-after: always;'></div>\n{abstract}\n<div style='page-break-after: always;'></div>\n{toc}\n<div style='page-break-after: always;'></div>\n"
+    content = f"{title_page}\n<div style='page-break-after: always;'></div>\n{declaration}\n<div style='page-break-after: always;'></div>\n{approval}\n<div style='page-break-after: always;'></div>\n{dedication}\n<div style='page-break-after: always;'></div>\n{acknowledgement}\n<div style='page-break-after: always;'></div>\n{abstract}\n<div style='page-break-after: always;'></div>\n{toc}\n<div style='page-break-after: always;'></div>\n"
+
+    if workspace_id:
+        workspace_path = WORKSPACES_DIR / workspace_id
+        os.makedirs(workspace_path, exist_ok=True)
+        prelim_path = workspace_path / "Preliminary_Pages_UoJ.md"
+        with open(prelim_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        if job_id and session_id:
+            await events.publish(
+                job_id,
+                "file_created",
+                {
+                    "path": str(prelim_path),
+                    "filename": prelim_path.name,
+                    "type": "markdown",
+                    "auto_open": True,
+                    "content_preview": content[:500]
+                },
+                session_id=session_id
+            )
+
+    return content

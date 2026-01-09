@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     WEBHOOK_BASE_URL: Optional[str] = None
     TRIGGER_WEBHOOK_SECRET: Optional[str] = None
     SUPABASE_WEBHOOK_SECRET: Optional[str] = None
+
+    # Quality gates
+    PHD_QUALITY_MIN_SCORE: float = 75.0
+    PHD_QUALITY_STRICT: bool = False
+    PHD_OBJECTIVE_COVERAGE_STRICT: bool = False
+
+    # General flow tuning
+    GENERAL_LIT_SEARCH_ENABLED: bool = False
     
     # Langfuse Observability
     LANGFUSE_PUBLIC_KEY: Optional[str] = None

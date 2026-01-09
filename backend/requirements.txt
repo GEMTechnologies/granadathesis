@@ -15,3 +15,10 @@ asyncpg
 sse-starlette
 python-multipart
 python-docx
+pandas
+matplotlib
+chromadb
+scipy
+numpy<2
+aiofiles
+openpyxl
