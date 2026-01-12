@@ -67,6 +67,8 @@ const DEFAULT_WORKFLOWS: University[] = [
     }
 ];
 
+const DEFAULT_UNIVERSITIES = DEFAULT_WORKFLOWS;
+
 export function CleanChatInput({ onSend, placeholder = "What do you want to create?", disabled }: CleanChatInputProps) {
     const [message, setMessage] = useState('');
     const [images, setImages] = useState<File[]>([]);
