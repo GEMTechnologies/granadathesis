@@ -77,23 +77,23 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const suggestionsRef = useRef<HTMLDivElement>(null);
 
-    // Load universities on mount
+    // Load workflows on mount
     useEffect(() => {
-        const loadUniversities = async () => {
+        const loadWorkflows = async () => {
             try {
                 console.log('Loading universities from API...');
                 const response = await fetch('http://localhost:8000/api/thesis/universities');
                 const data = await response.json();
                 console.log('Universities loaded:', data.universities);
                 if (data.universities && data.universities.length > 0) {
-                    setUniversities(data.universities);
+                    setWorkflows(data.universities);
                 }
             } catch (error) {
                 console.error('Failed to load universities:', error);
                 // Keep defaults
             }
         };
-        loadUniversities();
+        loadWorkflows();
     }, []);
 
     // Handle paste (with image support)
@@ -122,7 +122,7 @@ export function CleanChatInput({ onSend, placeholder = "What do you want to crea
         const lastCharIsSlash = value[value.length - 1] === '/';
         const startsWithSlash = value.trim().startsWith('/');
 
-        console.log('Input changed:', { value, lastCharIsSlash, startsWithSlash, universitiesCount: universities.length });
+        console.log('Input changed:', { value, lastCharIsSlash, startsWithSlash, workflowsCount: workflows.length });
 
         if (lastCharIsSlash || startsWithSlash) {
             console.log('Slash detected! Showing workflows dropdown');

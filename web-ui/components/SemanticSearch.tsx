@@ -2,7 +2,16 @@
 
 import React, { useState, useCallback, useEffect } from 'react';
 import { Search, FileText, Calendar, User, Link as LinkIcon, Sparkles } from 'lucide-react';
-import { debounce } from 'lodash';
+
+const debounce = <T extends (...args: any[]) => void>(fn: T, delay: number) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    return (...args: Parameters<T>) => {
+        if (timer) {
+            clearTimeout(timer);
+        }
+        timer = setTimeout(() => fn(...args), delay);
+    };
+};
 
 interface SearchResult {
     text: string;
