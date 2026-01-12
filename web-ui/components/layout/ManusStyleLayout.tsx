@@ -161,7 +161,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
     jobId: string;
     workspaceId: string;
     sessionId?: string;
-    type?: 'thesis' | 'general';
+    type?: 'thesis' | 'general' | 'good';
     responseMessageId?: string;
     startedAt?: number;
   };
@@ -251,7 +251,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const [showProgressOverlay, setShowProgressOverlay] = useState(false);
   const [progressJobId, setProgressJobId] = useState<string | null>(null);
   const [progressTopic, setProgressTopic] = useState<string>('');
-  const [progressType, setProgressType] = useState<'thesis' | 'general'>('general');
+  const [progressType, setProgressType] = useState<'thesis' | 'general' | 'good'>('general');
 
   const normalizePlannerSteps = useCallback((steps: any[]) => {
     return steps.map((step: any) => {

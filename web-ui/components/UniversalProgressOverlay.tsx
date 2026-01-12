@@ -29,7 +29,7 @@ interface ProgressStep {
 interface UniversalProgressOverlayProps {
     jobId: string | null;
     title: string;
-    type?: 'thesis' | 'general' | 'analysis';
+    type?: 'thesis' | 'general' | 'analysis' | 'good';
     onClose: () => void;
     backendUrl?: string;
 }
