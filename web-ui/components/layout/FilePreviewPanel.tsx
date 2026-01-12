@@ -20,6 +20,13 @@ interface FilePreviewPanelProps {
     } | null;
 }
 
+type SpreadsheetData = {
+    data?: any[];
+    columns?: string[] | Record<string, string[]>;
+    sheets?: Record<string, any[]>;
+    row_count?: number | Record<string, number>;
+};
+
 // Copy button component
 const CopyButton = ({ text, className = '' }: { text: string; className?: string }) => {
     const [copied, setCopied] = useState(false);
@@ -54,7 +61,7 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
     const [codeOutput, setCodeOutput] = useState<{ stdout: string; stderr: string } | null>(null);
     const [isExportingDocx, setIsExportingDocx] = useState(false);
     const [showDownloadMenu, setShowDownloadMenu] = useState(false);
-    const [spreadsheetData, setSpreadsheetData] = useState<any[] | null>(null);
+    const [spreadsheetData, setSpreadsheetData] = useState<SpreadsheetData | null>(null);
     const downloadMenuRef = useRef<HTMLDivElement>(null);
     const iframeRef = useRef<HTMLIFrameElement>(null);
 
