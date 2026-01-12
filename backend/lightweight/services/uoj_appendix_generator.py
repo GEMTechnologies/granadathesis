@@ -85,4 +85,5 @@ Please tick [√] in the appropriate box or write your response in the spaces pr
     
     open_ended += open_text + "\n\n**THANK YOU FOR YOUR PARTICIPATION!**"
     
-    return f"{appendix_i}\n<div style='page-break-after: always;'></div>\n{questionnaire_intro}\n{likert_questions}\n{open_ended}\n"
+    page_break = "\n\n---\n\n"
+    return f"{appendix_i}{page_break}{questionnaire_intro}\n{likert_questions}\n{open_ended}\n"

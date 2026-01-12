@@ -17,7 +17,7 @@ import { EnhancedChatDisplay } from '../chat/EnhancedChatDisplay';
 import UniversalProgressOverlay from '../UniversalProgressOverlay';
 import { SourcesPanel } from '../sources/SourcesPanel';
 import { TopMenuBar } from './TopMenuBar';
-import { ProcessStatus } from '../ProcessStatus';
+import { ProcessPlanner } from '../ProcessPlanner';
 import { cn } from '../../lib/utils';
 import { ChatHistoryService } from '../../lib/chat-history';
 import { ThesisParameters } from '../../lib/thesisParameters';
@@ -108,6 +108,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
   const [currentDescription, setCurrentDescription] = useState<string>(''); // Current action description
   const [currentProgress, setCurrentProgress] = useState<number>(0); // Current progress percentage
   const [statusUpdates, setStatusUpdates] = useState<any[]>([]); // History of status updates
+  const [showProgressTracker, setShowProgressTracker] = useState(true);
 
   // Tabbed Preview State
   const [tabs, setTabs] = useState<Tab[]>([]);
@@ -393,7 +394,7 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
     jobId: string;
     streamSessionId: string;
     responseMessageId?: string;
-    type?: 'thesis' | 'general';
+    type?: 'thesis' | 'general' | 'good';
     resume?: boolean;
   }) => {
     const { jobId, streamSessionId, responseMessageId, type } = params;
@@ -734,6 +735,37 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
         window.dispatchEvent(new Event('workspace-refresh'));
       } catch (err) {
         console.error('Error parsing file_created event:', err);
+      }
+    });
+
+    eventSource.addEventListener('file_updated', (e) => {
+      try {
+        const eventData = JSON.parse(e.data);
+        const rawPath = eventData.full_path || eventData.path || '';
+        const wsId = eventData.workspace_id || deriveWorkspaceId(rawPath) || workspaceId;
+        const normalizedPath = normalizeWorkspacePath(rawPath, wsId);
+
+        setTabs(prev => prev.map(tab => {
+          if (tab.type !== 'file') return tab;
+          if (tab.data?.path !== normalizedPath) return tab;
+          return {
+            ...tab,
+            data: {
+              ...tab.data,
+              refreshedAt: Date.now()
+            }
+          };
+        }));
+
+        window.dispatchEvent(new Event('workspace-refresh'));
+        window.dispatchEvent(new CustomEvent('workspace-file-updated', {
+          detail: {
+            path: normalizedPath,
+            workspaceId: wsId
+          }
+        }));
+      } catch (err) {
+        console.error('Error parsing file_updated event:', err);
       }
     });
 
@@ -1210,6 +1242,10 @@ export function ManusStyleLayout({ children, leftPanel, workspaceId: propWorkspa
 
     eventSource.addEventListener('response_chunk', (e) => {
       try {
+        const jobType = activeJobsRef.current[jobId]?.type;
+        if (jobType === 'good') {
+          return;
+        }
         const chunkData = JSON.parse(e.data);
         const accumulated = chunkData.accumulated || '';
         const targetMessageId = jobReplacementRef.current[jobId] || resolvedMessageId;
@@ -1646,15 +1682,15 @@ Objectives:
           : `General Objective: ${generalObjective}`;
         paramObjectives.push(normalized);
       }
-      const specificObjectivesText = parameters?.specificObjectivesText?.trim();
-      if (specificObjectivesText) {
-        paramObjectives.push(...parseObjectiveLines(specificObjectivesText));
+      const specificObjectives = parameters?.specificObjectives || [];
+      if (specificObjectives.length > 0) {
+        paramObjectives.push(...specificObjectives);
       }
 
       // Parse objectives - handle numbered lists (1. 2. 3.) and bullet points
       const objectives = objectivesMatch
         ? parseObjectiveLines(objectivesMatch[1])
-        : []; // Empty array means backend will auto-generate 6 objectives
+        : []; // Empty array means backend will auto-generate objectives
 
       const sampleSizeMatch = userInput.match(/\b(n|sample[ _]size)\s*[:=]\s*(\d+)/i);
       const mergedParameters = parameters ? { ...parameters } : undefined;
@@ -1670,6 +1706,13 @@ Objectives:
         || 385;
 
       // Call thesis generation API
+      const objectivePayload = paramObjectives.length > 0
+        ? {
+            general: paramObjectives.find((obj) => obj.toLowerCase().startsWith('general objective')) || '',
+            specific: paramObjectives.filter((obj) => !obj.toLowerCase().startsWith('general objective'))
+          }
+        : (objectives.length > 0 ? objectives : [topic]);
+
       const thesisResponse = await fetch(`${backendUrl}/api/thesis/generate`, {
         method: 'POST',
         headers: {
@@ -1679,9 +1722,7 @@ Objectives:
           university_type: universityType,
           title: title,
           topic: topic,
-          objectives: paramObjectives.length > 0
-            ? paramObjectives
-            : (objectives.length > 0 ? objectives : [topic]),
+          objectives: objectivePayload,
           workspace_id: workspaceId,
           parameters: mergedParameters
         }),
@@ -1817,6 +1858,95 @@ Objectives:
       };
       setChatMessages(prev => [...prev, errorMessage]);
       setCurrentStatus('Error: Thesis generation failed');
+      syncProcessingState();
+    }
+  };
+
+  const handleGoodFlow = async (userInput: string, parameters?: ThesisParameters) => {
+    setIsProcessing(true);
+    setLiveResponse('');
+    setCurrentStatus('💾 Saving /good configuration...');
+    setCurrentStage('good_flow');
+
+    const userChatMessage: ChatMessage = {
+      id: `user-${Date.now()}`,
+      type: 'user',
+      content: userInput ? `/good ${userInput}` : '/good',
+      timestamp: new Date(),
+      isStreaming: false
+    };
+    setChatMessages(prev => [...prev, userChatMessage]);
+
+    const fallbackTopic = userInput?.trim() || '';
+    const topicMatch = fallbackTopic.match(/(?:Topic|topic|Title|title)\s*[:=]\s*(.+)/);
+    const topic = (parameters?.topic || (topicMatch ? topicMatch[1] : fallbackTopic)).trim();
+    const country = (parameters?.country || 'South Sudan').trim();
+    const caseStudy = (parameters?.caseStudy || 'Juba, Central Equatoria State, South Sudan').trim();
+
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+      const response = await fetch(`${backendUrl}/api/good/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspace_id: workspaceId,
+          session_id: sessionId || 'default',
+          topic,
+          country,
+          case_study: caseStudy,
+          objectives: parameters?.specificObjectives || [],
+          uploaded_materials: parameters?.uploadedMaterials || [],
+          literature_year_start: parameters?.literatureYearStart,
+          literature_year_end: parameters?.literatureYearEnd,
+          study_type: parameters?.studyType,
+          population: parameters?.population,
+          extra: {
+            raw_input: userInput || ''
+          }
+        })
+      });
+      if (!response.ok) {
+        throw new Error('Failed to save /good config');
+      }
+      const saved = await response.json();
+      const configId = saved?.config?.id;
+
+      const objectivesResponse = await fetch(`${backendUrl}/api/good/objectives`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspace_id: workspaceId,
+          session_id: sessionId || 'default',
+          config_id: configId,
+          topic,
+          case_study: caseStudy,
+          country
+        })
+      });
+      if (!objectivesResponse.ok) {
+        throw new Error('Failed to start /good objectives generation');
+      }
+      const objectivesData = await objectivesResponse.json();
+      if (objectivesData?.job_id) {
+        startJobStream({
+          jobId: objectivesData.job_id,
+          streamSessionId: sessionId || 'default',
+          type: 'good'
+        });
+      }
+
+      setCurrentStatus('🧠 Generating specific objectives...');
+    } catch (err) {
+      const assistantResponse: ChatMessage = {
+        id: `assistant-${Date.now()}`,
+        type: 'assistant',
+        content: '❌ Failed to save /good configuration. Please try again.',
+        timestamp: new Date(),
+        isStreaming: false
+      };
+      setChatMessages(prev => [...prev, assistantResponse]);
+      setCurrentStatus('❌ /good configuration failed');
+    } finally {
       syncProcessingState();
     }
   };
@@ -2113,6 +2243,12 @@ Objectives:
     const skipUserMessage = options?.skipUserMessage === true;
     const replaceAssistantMessageId = options?.replaceAssistantMessageId;
     const historyForContext = options?.historyOverride || chatMessages;
+
+    const goodMatch = message.trim().match(/^\/good(?:\s+([\s\S]*))?$/);
+    if (goodMatch) {
+      await handleGoodFlow((goodMatch[1] || '').trim(), parameters);
+      return;
+    }
 
     // Check if this is a university slash command
     // Match both: /uoj_phd and /uoj_phd some details
@@ -3140,6 +3276,34 @@ I'm having trouble connecting to the backend server. Please check:
                 <AgentActivityTracker activities={activeAgents} />
               </div>
             )}
+            {(plannerSteps.length > 0 || progressSteps.length > 0 || isProcessing) && (
+              <div
+                className="border-b px-4 py-3 space-y-2"
+                style={{ borderColor: 'rgba(31, 122, 140, 0.12)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/60">
+                    Progress Tracker
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowProgressTracker(prev => !prev)}
+                    className="text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors"
+                  >
+                    {showProgressTracker ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+                {showProgressTracker && (
+                  <div className="max-h-56 overflow-y-auto">
+                    <ProcessPlanner
+                      steps={plannerSteps.length > 0 ? plannerSteps : progressSteps}
+                      totalPercentage={currentProgress > 0 ? currentProgress : undefined}
+                      isCompact={true}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
             {/* Enhanced Chat Display - Shows messages with real streaming */}
             <EnhancedChatDisplay
               messages={chatMessages}
@@ -3231,6 +3395,8 @@ I'm having trouble connecting to the backend server. Please check:
                   placeholder="Type a message... (use @ to mention agents)"
                   currentStatus={currentStatus}
                   currentStage={currentStage}
+                  workspaceId={workspaceId}
+                  sessionId={sessionId}
                 />
               </div>
             )}

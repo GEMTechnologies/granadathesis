@@ -68,7 +68,7 @@ from services.planner import planner_service
 from services.chat_history_service import chat_history_service
 from services.skills_manager import get_skills_manager
 from core.events import events
-from services.objective_generator import extract_short_theme, generate_smart_objectives
+from services.objective_generator import extract_short_theme, generate_smart_objectives, normalize_objectives
 from services.spreadsheet_service import get_spreadsheet_service
 
 # Import RAG router for fast document upload and semantic search
@@ -4331,6 +4331,420 @@ async def list_thesis_workflows():
     return {"workflows": workflows}
 
 # ============================================================================
+# GOOD FLOW ENDPOINTS
+# ============================================================================
+
+@app.post("/api/good/save")
+async def save_good_flow_config(request: dict):
+    """Save /good flow configuration to local DB."""
+    from services.good_flow_db import save_good_config
+
+    topic = (request.get("topic") or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+
+    country = request.get("country") or "South Sudan"
+    case_study = request.get("case_study") or "Juba, Central Equatoria State, South Sudan"
+
+    extra = request.get("extra") or {}
+    if request.get("objectives"):
+        extra["user_objectives"] = request.get("objectives")
+
+    payload = {
+        "workspace_id": request.get("workspace_id", "default"),
+        "session_id": request.get("session_id", "default"),
+        "topic": topic,
+        "country": country,
+        "case_study": case_study,
+        "objectives": request.get("objectives") or [],
+        "uploaded_materials": request.get("uploaded_materials") or [],
+        "literature_year_start": request.get("literature_year_start"),
+        "literature_year_end": request.get("literature_year_end"),
+        "study_type": request.get("study_type"),
+        "population": request.get("population"),
+        "extra": extra,
+    }
+
+    saved = save_good_config(payload)
+    return {"success": True, "config": saved}
+
+
+@app.post("/api/good/objectives")
+async def generate_good_objectives(request: dict, background_tasks: BackgroundTasks):
+    """Generate 4 SMART specific objectives for /good flow and stream preview."""
+    job_id = str(uuid.uuid4())
+    session_id = request.get("session_id") or "default"
+    workspace_id = request.get("workspace_id") or "default"
+
+    await redis_client.setex(f"job:{job_id}:session", 3600, session_id)
+
+    background_tasks.add_task(
+        run_good_pipeline,
+        job_id,
+        workspace_id,
+        session_id,
+        request
+    )
+
+    return {
+        "status": "processing",
+        "job_id": job_id
+    }
+
+
+@app.get("/api/good/config")
+async def get_good_flow_config(
+    workspace_id: str,
+    config_id: Optional[int] = None,
+):
+    """Fetch the latest /good flow configuration for a workspace."""
+    from services.good_flow_db import get_good_config_by_id, get_latest_good_config
+    from services.sources_service import sources_service
+
+    config = get_good_config_by_id(config_id) if config_id else get_latest_good_config(workspace_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="No /good config found")
+
+    extra = config.get("extra_json") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except json.JSONDecodeError:
+            extra = {}
+    research = extra.get("research") or {}
+    if isinstance(research, str):
+        try:
+            research = json.loads(research)
+        except json.JSONDecodeError:
+            research = {}
+
+    objective_sources = research.get("objective_sources") or {}
+    objective_source_details = {}
+    if objective_sources:
+        sources = sources_service.list_sources(workspace_id)
+        sources_by_id = {s.get("id"): s for s in sources if s.get("id")}
+        for obj, source_ids in objective_sources.items():
+            detail_list = []
+            for source_id in source_ids or []:
+                source = sources_by_id.get(source_id)
+                if source:
+                    detail_list.append(source)
+            objective_source_details[obj] = detail_list
+
+    general_objective = (
+        extra.get("general_objective")
+        or extra.get("generated_general_objective")
+        or ""
+    )
+
+    return {
+        "config": config,
+        "objectives": config.get("objectives") or [],
+        "general_objective": general_objective,
+        "conceptual_variables": research.get("conceptual_variables") or {},
+        "research_keywords": research.get("research_keywords") or [],
+        "research_queries": research.get("research_queries") or [],
+        "objective_queries": research.get("objective_queries") or {},
+        "objective_sources": objective_sources,
+        "objective_source_details": objective_source_details,
+    }
+
+
+async def run_good_pipeline(job_id: str, workspace_id: str, session_id: str, request: dict) -> None:
+    """Run /good objectives, research, and Chapter One generation sequentially."""
+    from core.events import events
+    from services.good_research_service import run_good_background_research
+    from services.good_chapter_one_generator import run_good_chapter_one_generation
+
+    try:
+        await run_good_objective_generation(job_id, workspace_id, session_id, request)
+    except Exception as exc:
+        await events.log(job_id, f"⚠️ /good objectives failed: {exc}", session_id=session_id)
+
+    try:
+        await run_good_background_research(job_id, workspace_id, session_id, request)
+    except Exception as exc:
+        await events.log(job_id, f"⚠️ /good research failed: {exc}", session_id=session_id)
+
+    try:
+        await run_good_chapter_one_generation(job_id, workspace_id, session_id, request)
+    except Exception as exc:
+        await events.log(job_id, f"⚠️ /good Chapter One failed: {exc}", session_id=session_id)
+
+
+async def run_good_objective_generation(job_id: str, workspace_id: str, session_id: str, request: dict):
+    """Background task for /good objective generation."""
+    import re
+    from services.good_flow_db import (
+        get_good_config_by_id,
+        get_latest_good_config,
+        update_good_objectives,
+        update_good_status,
+    )
+    from services.good_objective_generator import (
+        build_good_objectives_prompt,
+        parse_objectives,
+        fallback_objectives,
+        parse_general_objective,
+        fallback_general_objective,
+        normalise_objectives,
+        objectives_to_questions,
+        objectives_to_hypotheses,
+        build_significance_lines,
+        format_location,
+        strip_location_from_topic
+    )
+    from services.deepseek_direct import deepseek_direct
+    from services.workspace_service import WORKSPACES_DIR
+    from core.events import events
+
+    await events.stage_started(
+        job_id,
+        "good_objectives",
+        {"message": "🧠 Generating /good objectives..."},
+        session_id=session_id,
+    )
+
+    config_id_raw = request.get("config_id")
+    config_id = None
+    if config_id_raw is not None:
+        try:
+            config_id = int(config_id_raw)
+        except (TypeError, ValueError):
+            config_id = None
+    topic = (request.get("topic") or "").strip()
+    case_study = (request.get("case_study") or "").strip()
+    country = (request.get("country") or "").strip()
+    user_objectives = []
+
+    stored = None
+    if config_id:
+        stored = get_good_config_by_id(config_id)
+    if not stored and workspace_id:
+        stored = get_latest_good_config(workspace_id)
+        if stored:
+            config_id = stored.get("id")
+    if stored:
+        topic = topic or stored.get("topic", "")
+        case_study = case_study or stored.get("case_study", "")
+        country = country or stored.get("country", "")
+        extra = stored.get("extra_json") or {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except json.JSONDecodeError:
+                extra = {}
+        user_objectives = extra.get("user_objectives") or []
+
+    topic = topic or "the study topic"
+    case_study = case_study or "the case study area"
+    country = country or "South Sudan"
+    location = format_location(case_study, country)
+    topic_clean = strip_location_from_topic(topic, location) or topic
+
+    good_dir = WORKSPACES_DIR / workspace_id / "good"
+    good_dir.mkdir(parents=True, exist_ok=True)
+    file_path = good_dir / "Chapter_1_Introduction.md"
+    file_exists = file_path.exists()
+    def build_objectives_prefix(text: str) -> str:
+        prefix_value = ""
+        if text:
+            match = re.search(
+                r"(?m)^##\s*\*\*1\.4 Objectives of the Study\*\*|^1\.4 Objectives of the Study",
+                text,
+            )
+            if match:
+                prefix_value = text[:match.start()].rstrip() + "\n\n"
+            else:
+                prefix_value = text.rstrip() + "\n\n"
+        if not prefix_value:
+            prefix_value = "**CHAPTER ONE: INTRODUCTION**\n\n"
+        if "CHAPTER ONE: INTRODUCTION" in prefix_value:
+            prefix_value = re.sub(
+                r"(?m)^CHAPTER ONE: INTRODUCTION\s*$",
+                "**CHAPTER ONE: INTRODUCTION**",
+                prefix_value,
+            )
+        elif "CHAPTER ONE: INTRODUCTION" not in prefix_value:
+            prefix_value = "**CHAPTER ONE: INTRODUCTION**\n\n" + prefix_value.lstrip()
+        return prefix_value
+
+    existing_text = file_path.read_text(encoding="utf-8") if file_exists else ""
+    prefix = build_objectives_prefix(existing_text)
+
+    file_path.write_text(
+        prefix + "## **1.4 Objectives of the Study**\n_Generating objectives..._\n",
+        encoding="utf-8",
+    )
+
+    await events.publish(
+        job_id,
+        "file_created",
+        {
+            "path": str(file_path),
+            "full_path": str(file_path),
+            "type": "file",
+            "workspace_id": workspace_id,
+            "filename": file_path.name
+        },
+        session_id=session_id
+    )
+    await events.file_updated(job_id, str(file_path), session_id=session_id)
+
+    prompt = build_good_objectives_prompt(topic_clean, case_study, country)
+    accumulated = ""
+
+    async def on_chunk(chunk: str):
+        nonlocal accumulated
+        if not chunk:
+            return
+        accumulated += chunk
+        file_path.write_text(prefix + accumulated, encoding="utf-8")
+        await events.file_updated(job_id, str(file_path), session_id=session_id)
+
+    response = await deepseek_direct.generate_content(
+        prompt=prompt,
+        system_prompt="You are an academic writing assistant.",
+        temperature=0.3,
+        max_tokens=500,
+        stream=True,
+        stream_callback=on_chunk
+    )
+
+    raw_text = (response or accumulated).strip()
+    general_objective = parse_general_objective(raw_text)
+    if not general_objective:
+        general_objective = fallback_general_objective(topic_clean, case_study, country)
+    general_objective = re.sub(r'(?i)1\.4\.1\s*general objective of the study', '', general_objective).strip()
+    general_objective = re.sub(r'(?i)the general objective of the study is to', '', general_objective).strip()
+    if not general_objective:
+        general_objective = fallback_general_objective(topic_clean, case_study, country)
+    general_objective = f"The general objective of the study is to {general_objective.rstrip('.') }."
+
+    objectives = parse_objectives(raw_text)
+    user_provided = bool(user_objectives)
+    if user_provided:
+        objectives = normalise_objectives(user_objectives, user_provided=True)
+    else:
+        if len(objectives) < 4:
+            objectives = fallback_objectives(topic_clean, case_study, country)
+        objectives = normalise_objectives(objectives, user_provided=False)
+
+    questions = objectives_to_questions(objectives)
+    hypotheses = objectives_to_hypotheses(objectives)
+
+    significance_lines = build_significance_lines(topic_clean, country, case_study)
+
+    final_text = (
+        "## **1.4 Objectives of the Study**\n"
+        "The study will be guided by both a general objective and a list of specific objectives as presented below.\n\n"
+        "### ***1.4.1 General objective of the study***\n"
+        f"{general_objective}\n\n"
+        "### ***1.4.2 Specific Objectives***\n"
+        + "\n\n".join([f"{obj}" for obj in objectives])
+        + "\n\n"
+        "## **1.5 Study Questions**\n"
+        + "\n\n".join([f"{q}" for q in questions])
+        + "\n\n"
+        "## **1.6 Research Hypothesis**\n"
+        + "\n\n".join(hypotheses)
+        + "\n\n"
+        "## **1.7 Significance of the Study**\n"
+        + "\n\n".join(significance_lines)
+        + "\n\n"
+        "## **1.8 Scope of the Study**\n"
+        f"The study on {topic_clean} in {location} will be guided by three scopes as presented below.\n\n"
+        "### ***1.8.1 Content scope***\n"
+        f"The content scope focuses on the core dimensions of {topic_clean}, including its causes, manifestations, and impacts "
+        f"within the context of {location}. It covers the key actors, settings, and processes that shape the phenomenon, "
+        "while aligning with the study objectives.\n\n"
+        "### ***1.8.2 Geographical scope***\n"
+        f"The geographical scope is limited to {location}. The study will describe the setting, its neighbouring areas, "
+        "and its broader spatial orientation, including approximate directional placement within the surrounding localities.\n\n"
+        "### ***1.8.3 Time scope***\n"
+        "The time scope is set in 2026 and will cover a three-month period of data collection and analysis, providing a focused "
+        "contemporary snapshot of the study area.\n\n"
+        "## **1.9 Limitations of the Study**\n"
+        f"Access to participants may be constrained by the sensitivity of {topic_clean}, and this will be mitigated by building trust and "
+        "assuring confidentiality. The availability of reliable records may be uneven, and this will be mitigated through source "
+        "triangulation and careful verification. The three-month study window may limit longitudinal observation, and this will be "
+        "mitigated by focusing on the most critical variables aligned with the objectives. Logistical disruptions or security concerns "
+        f"in {location} may affect scheduling, and this will be mitigated through flexible planning and contingency arrangements.\n\n"
+        "## **1.11 Delimitation of the Study**\n"
+        f"This study is delimited to {topic_clean} within {location} and concentrates on the specific objectives outlined in this chapter. "
+        "It does not extend to comprehensive regional comparisons or historical accounts beyond what is necessary for context, ensuring "
+        "a focused and manageable scope aligned with the study purpose.\n"
+    )
+    latest_text = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+    prefix = build_objectives_prefix(latest_text)
+    file_path.write_text(prefix + final_text, encoding="utf-8")
+    await events.response_chunk(job_id, "", final_text, completed=True, session_id=session_id)
+    await events.file_updated(job_id, str(file_path), session_id=session_id)
+
+    if config_id:
+        try:
+            update_good_objectives(config_id, objectives, general_objective)
+            status_row = update_good_status(config_id, {"objectives_done": True})
+            status_meta = (status_row or {}).get("extra_json") or {}
+            status = status_meta.get("status") or {}
+            if status.get("research_done") and status.get("chapter1_done") and not status.get("complete_sent"):
+                update_good_status(config_id, {"complete_sent": True})
+        except Exception as e:
+            await events.log(job_id, f"⚠️ Failed to update objectives in DB: {e}", session_id=session_id)
+
+    try:
+        from services.good_chapter_two_generator import run_good_chapter_two_intro
+        from services.good_chapter_three_generator import run_good_chapter_three_generation
+        from services.good_study_tools_generator import run_good_study_tools_generation
+
+        asyncio.create_task(
+            run_good_study_tools_generation(
+                job_id,
+                workspace_id,
+                session_id,
+                {
+                    "config_id": config_id,
+                    "topic": topic_clean,
+                    "case_study": case_study,
+                    "country": country,
+                    "study_type": stored.get("study_type") if stored else None,
+                },
+            )
+        )
+        asyncio.create_task(
+            run_good_chapter_two_intro(
+                job_id,
+                workspace_id,
+                session_id,
+                {
+                    "config_id": config_id,
+                    "topic": topic,
+                    "case_study": case_study,
+                    "country": country,
+                },
+            )
+        )
+        asyncio.create_task(
+            run_good_chapter_three_generation(
+                job_id,
+                workspace_id,
+                session_id,
+                {
+                    "config_id": config_id,
+                    "topic": topic_clean,
+                    "case_study": case_study,
+                    "country": country,
+                    "study_type": stored.get("study_type") if stored else None,
+                    "population": stored.get("population") if stored else None,
+                },
+            )
+        )
+    except Exception as e:
+        await events.log(job_id, f"⚠️ Failed to start /good downstream tasks: {e}", session_id=session_id)
+
+    await events.stage_completed(job_id, "good_objectives", {"count": len(objectives)}, session_id=session_id)
+
+# ============================================================================
 # THESIS GENERATION ENDPOINTS
 # ============================================================================
 
@@ -4366,7 +4780,34 @@ async def generate_thesis(request: dict):
         thesis_type = "general" if university_type in ["uoj_general", "general"] else "phd"
     title = request.get('title', 'Research Thesis')
     topic = parameters.get('topic') or request.get('topic', '')
-    objectives = request.get('objectives', [topic]) if topic else []
+    research_design = (
+        parameters.get('researchDesign')
+        or parameters.get('studyType')
+        or parameters.get('research_design')
+        or request.get('research_design')
+    )
+    preferred_analyses = parameters.get('preferredAnalyses') or parameters.get('preferred_analyses') or []
+    custom_instructions = parameters.get('customInstructions') or parameters.get('custom_instructions') or ""
+    target_pages = parameters.get('targetPages') or parameters.get('target_pages')
+    words_per_page = parameters.get('wordsPerPage') or parameters.get('words_per_page')
+    target_word_count = parameters.get('targetWordCount') or parameters.get('target_word_count')
+
+    try:
+        if target_word_count is None and target_pages and words_per_page:
+            target_word_count = int(target_pages) * int(words_per_page)
+    except (TypeError, ValueError):
+        target_word_count = target_word_count or None
+
+    raw_objectives = request.get('objectives')
+    param_general_objective = parameters.get('generalObjective') or parameters.get('general_objective')
+    param_specific_objectives = parameters.get('specificObjectives') or parameters.get('specific_objectives') or []
+    if param_general_objective or param_specific_objectives:
+        raw_objectives = {
+            "general": param_general_objective or "",
+            "specific": param_specific_objectives or []
+        }
+    if raw_objectives is None:
+        raw_objectives = [topic] if topic else []
     workspace_id = request.get('workspace_id', 'default')
     session_id = request.get('session_id', 'default')
     student_name = (
@@ -4383,6 +4824,69 @@ async def generate_thesis(request: dict):
         or request.get('indexNumber')
         or "[INDEX NUMBER]"
     )
+
+    custom_outline = parameters.get('customOutline') or parameters.get('custom_outline') or request.get('custom_outline')
+    outline_summary = None
+    outline_defaults = {}
+    if custom_outline and thesis_type != "general":
+        print(f"⚠️ Custom outline ignored for thesis_type={thesis_type}")
+        custom_outline = None
+    if custom_outline:
+        try:
+            import json
+            if isinstance(custom_outline, str):
+                custom_outline = json.loads(custom_outline)
+            from services.outline_parser import outline_parser
+
+            if outline_parser.save_outline(workspace_id, custom_outline):
+                if isinstance(custom_outline, dict):
+                    outline_defaults = custom_outline.get("defaults") or {}
+                outline_lines = []
+                for chapter in custom_outline.get("chapters", []):
+                    ch_num = chapter.get("number")
+                    ch_title = chapter.get("title")
+                    if ch_num and ch_title:
+                        outline_lines.append(f"Chapter {ch_num}: {ch_title}")
+                        for section in chapter.get("sections", []):
+                            outline_lines.append(f"- {section}")
+                if outline_lines:
+                    outline_summary = "CUSTOM OUTLINE:\n" + "\n".join(outline_lines)
+                    custom_instructions = f"{custom_instructions}\n\n{outline_summary}".strip()
+            else:
+                print("⚠️ Custom outline invalid; using default outline.")
+        except Exception as e:
+            print(f"⚠️ Failed to parse custom outline: {e}")
+    if thesis_type == "general" and not custom_outline:
+        try:
+            from services.outline_parser import outline_parser
+            default_outline = outline_parser.get_default_outline("uoj_bsc_accounting_finance")
+            if outline_parser.save_outline(workspace_id, default_outline):
+                custom_outline = default_outline
+                outline_defaults = default_outline.get("defaults") or {}
+                outline_lines = []
+                for chapter in default_outline.get("chapters", []):
+                    ch_num = chapter.get("number")
+                    ch_title = chapter.get("title")
+                    if ch_num and ch_title:
+                        outline_lines.append(f"Chapter {ch_num}: {ch_title}")
+                        for section in chapter.get("sections", []):
+                            outline_lines.append(f"- {section}")
+                if outline_lines:
+                    outline_summary = "CUSTOM OUTLINE:\n" + "\n".join(outline_lines)
+                    custom_instructions = f"{custom_instructions}\n\n{outline_summary}".strip()
+        except Exception as e:
+            print(f"⚠️ Failed to apply default UoJ outline: {e}")
+
+    length_lines = []
+    if target_pages:
+        length_lines.append(f"Target pages: {target_pages}")
+    if words_per_page:
+        length_lines.append(f"Words per page: {words_per_page}")
+    if target_word_count:
+        length_lines.append(f"Target word count: {target_word_count}")
+    if length_lines:
+        length_note = "LENGTH TARGETS:\n" + "\n".join(length_lines)
+        custom_instructions = f"{custom_instructions}\n\n{length_note}".strip()
     school_name = (
         parameters.get('school')
         or request.get('school')
@@ -4419,6 +4923,7 @@ async def generate_thesis(request: dict):
     
     # NEW: Extract Sample Size (n) from parameters or topic string
     sample_size = parameters.get('sample_size') or request.get('sample_size')
+    sample_size_provided = sample_size is not None
     if not sample_size:
         import re
         n_match = re.search(r'\b(n|sample_size)\s*[:=]\s*(\d+)', f"{topic} {title}", re.IGNORECASE)
@@ -4426,9 +4931,107 @@ async def generate_thesis(request: dict):
             sample_size = int(n_match.group(2))
         else:
             sample_size = 385  # Academic standard default
+    if not sample_size_provided and isinstance(outline_defaults, dict):
+        default_sample = outline_defaults.get("sample_size")
+        if default_sample:
+            try:
+                sample_size = int(default_sample)
+            except (TypeError, ValueError):
+                pass
     
     # Extract meaningful case study (not just repeating the topic)
     case_study = extract_case_study(topic, raw_case_study)
+
+    def _design_family(design: str) -> str:
+        if not design:
+            return "quantitative"
+        value = design.strip().lower().replace('-', '_').replace(' ', '_')
+        qualitative = {
+            'qualitative', 'ethnographic', 'phenomenological', 'phenomenology',
+            'grounded_theory', 'narrative', 'case_study', 'case_study_research'
+        }
+        mixed = {'mixed', 'mixed_methods', 'convergent', 'sequential_explanatory', 'sequential_exploratory'}
+        experimental = {'experimental', 'quasi_experimental', 'clinical', 'rct', 'randomized_controlled_trial'}
+        if value in qualitative:
+            return "qualitative"
+        if value in mixed:
+            return "mixed"
+        if value in experimental:
+            return "experimental"
+        return "quantitative"
+
+    def _extract_specific_objectives(value):
+        if isinstance(value, dict):
+            return [o for o in value.get('specific', []) if isinstance(o, str) and o.strip()]
+        if isinstance(value, list):
+            return [o for o in value if isinstance(o, str) and o.strip()]
+        return []
+
+    user_specific_objectives = _extract_specific_objectives(raw_objectives)
+    objective_target_count = None
+    if isinstance(outline_defaults, dict):
+        objective_target_count = outline_defaults.get("specific_objectives")
+        try:
+            objective_target_count = int(objective_target_count) if objective_target_count else None
+        except (TypeError, ValueError):
+            objective_target_count = None
+    auto_generated_objectives = False
+    if isinstance(raw_objectives, list):
+        is_placeholder = (
+            len(raw_objectives) == 1
+            and isinstance(raw_objectives[0], str)
+            and raw_objectives[0].strip().lower() == (topic or "").strip().lower()
+        )
+        if is_placeholder:
+            user_specific_objectives = []
+    if not user_specific_objectives:
+        target_count = objective_target_count or 6
+        user_specific_objectives = generate_smart_objectives(topic, target_count)
+        auto_generated_objectives = True
+
+    normalized_objectives = normalize_objectives(
+        {
+            "general": param_general_objective or "",
+            "specific": user_specific_objectives
+        },
+        topic,
+        case_study
+    )
+
+    if auto_generated_objectives:
+        if objective_target_count:
+            if len(normalized_objectives["specific"]) < objective_target_count:
+                more_objs = generate_smart_objectives(topic, objective_target_count)
+                for obj in more_objs:
+                    if obj not in normalized_objectives["specific"] and len(normalized_objectives["specific"]) < objective_target_count:
+                        normalized_objectives["specific"].append(obj)
+            if len(normalized_objectives["specific"]) > objective_target_count:
+                normalized_objectives["specific"] = normalized_objectives["specific"][:objective_target_count]
+        else:
+            # Ensure minimum 5, maximum 6 for professional PhD balance
+            if len(normalized_objectives["specific"]) < 5:
+                more_objs = generate_smart_objectives(topic, 6)
+                for obj in more_objs:
+                    if obj not in normalized_objectives["specific"] and len(normalized_objectives["specific"]) < 5:
+                        normalized_objectives["specific"].append(obj)
+            if len(normalized_objectives["specific"]) > 6:
+                normalized_objectives["specific"] = normalized_objectives["specific"][:6]
+
+    objectives = normalized_objectives["specific"]
+    objectives_payload = normalized_objectives
+
+    design_family = _design_family(research_design)
+    likert_scale = parameters.get("likertScale") or parameters.get("likert_scale") or 5
+    items_per_objective = parameters.get("itemsPerObjective") or parameters.get("items_per_objective")
+    interview_questions = parameters.get("interviewQuestions") or parameters.get("interview_questions")
+    fgd_questions = parameters.get("fgdQuestions") or parameters.get("fgd_questions")
+    chapter2_paragraphs = parameters.get("chapter2Paragraphs") or parameters.get("chapter2_paragraphs")
+    chapter2_paragraph_plan = parameters.get("chapter2ParagraphPlan") or parameters.get("chapter2_paragraph_plan")
+    demographic_distributions = {
+        "gender": parameters.get("genderDistribution") or {},
+        "age": parameters.get("ageDistribution") or {},
+        "education": parameters.get("educationDistribution") or {}
+    }
     
     if not topic:
         return {
@@ -4437,19 +5040,6 @@ async def generate_thesis(request: dict):
             "file_path": None
         }
     
-    # Auto-generate objectives using global helper function
-    if not objectives or (len(objectives) == 1 and objectives[0] == topic):
-        objectives = generate_smart_objectives(topic, 6)
-    
-    # Ensure minimum 5, maximum 6 for professional PhD balance
-    if len(objectives) < 5:
-        more_objs = generate_smart_objectives(topic, 6)
-        for obj in more_objs:
-            if obj not in objectives and len(objectives) < 5:
-                objectives.append(obj)
-    
-    if len(objectives) > 6:
-        objectives = objectives[:6]
 
     
     print(f"📚 FULL THESIS request: {topic} ({thesis_type})")
@@ -4473,6 +5063,81 @@ async def generate_thesis(request: dict):
         
         try:
             await events.connect()
+            from services.plan_tracker import ensure_plan_file, get_plan_chapter_labels, mark_plan_item
+            from services.outline_parser import outline_parser
+
+            plan_outline = None
+            outline_path = workspace_path / "outline.json"
+            if thesis_type == "general":
+                if isinstance(custom_outline, dict) and custom_outline.get("chapters"):
+                    plan_outline = custom_outline
+                elif outline_path.exists():
+                    plan_outline = outline_parser.load_outline(workspace_id)
+
+            plan_path, plan_created = ensure_plan_file(workspace_id, plan_outline, thesis_type)
+            plan_chapter_labels = get_plan_chapter_labels(plan_outline, thesis_type)
+            plan_label_map = {num: label for num, label in plan_chapter_labels}
+            if plan_created:
+                await events.publish(
+                    job_id,
+                    "file_created",
+                    {
+                        "path": str(plan_path),
+                        "filename": plan_path.name,
+                        "workspace_id": workspace_id,
+                        "type": "markdown"
+                    },
+                    session_id=session_id
+                )
+
+            async def _update_plan(label: str, cascade: bool = False):
+                if not label:
+                    return
+                if mark_plan_item(workspace_id, label, cascade=cascade):
+                    await events.publish(
+                        job_id,
+                        "file_updated",
+                        {
+                            "path": str(plan_path.relative_to(workspace_path)),
+                            "full_path": str(plan_path),
+                            "filename": plan_path.name,
+                            "workspace_id": workspace_id,
+                            "type": "markdown"
+                        },
+                        session_id=session_id
+                    )
+
+            data_collection_methods = ["questionnaire"]
+            if design_family == "qualitative":
+                data_collection_methods = ["interview", "fgd", "observation"]
+            elif design_family == "mixed":
+                data_collection_methods = ["questionnaire", "interview", "fgd"]
+            elif design_family == "experimental":
+                data_collection_methods = ["questionnaire", "observation"]
+
+            measurement_scale = "text" if design_family == "qualitative" else "likert"
+
+            try:
+                from services.thesis_session_db import ThesisSessionDB
+                db_targets = {workspace_id, session_id}
+                for target_id in db_targets:
+                    db = ThesisSessionDB(target_id)
+                    db.create_session(topic, case_study)
+                    db.save_research_config({
+                        "topic": topic,
+                        "case_study": case_study,
+                        "sample_size": sample_size,
+                        "research_design": research_design or "",
+                        "measurement_scale": measurement_scale,
+                        "data_collection_methods": data_collection_methods,
+                        "preferred_analyses": preferred_analyses,
+                        "custom_instructions": custom_instructions,
+                        "items_per_objective": items_per_objective,
+                        "likert_scale": likert_scale
+                    })
+                    db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
+            except Exception as e:
+                print(f"⚠️ Could not save research configuration/objectives: {e}")
             
             # ================================================================
             # STEP 0: INITIALIZATION
@@ -4516,11 +5181,24 @@ async def generate_thesis(request: dict):
 """, "accumulated": ""},
                 session_id=session_id
             )
+            if outline_summary:
+                await events.publish(
+                    job_id,
+                    "response_chunk",
+                    {
+                        "chunk": f"""## 📑 Custom Outline Loaded
+
+```
+{outline_summary}
+```
+
+""",
+                        "accumulated": ""
+                    },
+                    session_id=session_id
+                )
 
             if thesis_type == "general":
-                research_design = parameters.get("studyType") or parameters.get("research_design")
-                preferred_analyses = parameters.get("preferredAnalyses") or parameters.get("preferred_analyses") or []
-                custom_instructions = parameters.get("customInstructions") or parameters.get("custom_instructions") or ""
                 await parallel_chapter_generator.generate_full_thesis_sequence(
                     topic=topic,
                     case_study=case_study,
@@ -4529,10 +5207,12 @@ async def generate_thesis(request: dict):
                     workspace_id=workspace_id,
                     sample_size=sample_size,
                     thesis_type="general",
-                    objectives=objectives,
+                    objectives=objectives_payload,
                     research_design=research_design,
                     preferred_analyses=preferred_analyses,
-                    custom_instructions=custom_instructions
+                    custom_instructions=custom_instructions,
+                    chapter2_paragraphs=chapter2_paragraphs,
+                    chapter2_paragraph_plan=chapter2_paragraph_plan
                 )
                 await events.publish(job_id, "stage_completed", {"stage": "complete", "status": "success"}, session_id=session_id)
                 return
@@ -4578,6 +5258,7 @@ async def generate_thesis(request: dict):
             await events.publish(job_id, "file_created", {"path": str(ch1_file), "filename": ch1_file.name, "step": 1}, session_id=session_id)
             # Then send step_completed
             await events.publish(job_id, "step_completed", {"step": 1, "name": "Chapter 1: Introduction", "word_count": len(chapter1_result.split()), "file": str(ch1_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(1), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -4612,7 +5293,9 @@ async def generate_thesis(request: dict):
                 topic=topic,
                 case_study=case_study,
                 job_id=job_id,
-                session_id=session_id
+                session_id=session_id,
+                chapter2_paragraphs=chapter2_paragraphs,
+                chapter2_paragraph_plan=chapter2_paragraph_plan
             )
             chapter_contents['chapter2'] = chapter2_result
             
@@ -4623,6 +5306,7 @@ async def generate_thesis(request: dict):
             
             await events.publish(job_id, "file_created", {"path": str(ch2_file), "filename": ch2_file.name, "step": 2}, session_id=session_id)
             await events.publish(job_id, "step_completed", {"step": 2, "name": "Chapter 2: Literature Review", "word_count": len(chapter2_result.split()), "file": str(ch2_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(2), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -4668,6 +5352,7 @@ async def generate_thesis(request: dict):
             
             await events.publish(job_id, "file_created", {"path": str(ch3_file), "filename": ch3_file.name, "step": 3}, session_id=session_id)
             await events.publish(job_id, "step_completed", {"step": 3, "name": "Chapter 3: Methodology", "word_count": len(chapter3_result.split()), "file": str(ch3_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(3), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -4699,6 +5384,10 @@ async def generate_thesis(request: dict):
             # Generate study tools
             from services.data_collection_worker import generate_study_tools
             questionnaire_path = None
+            include_questionnaire = design_family in ("quantitative", "mixed", "experimental")
+            include_interviews = design_family in ("qualitative", "mixed")
+            include_fgd = design_family in ("qualitative", "mixed")
+            include_observation = design_family in ("qualitative", "mixed", "experimental")
             try:
                 tools_result = await generate_study_tools(
                     topic=topic,
@@ -4706,7 +5395,15 @@ async def generate_thesis(request: dict):
                     output_dir=str(workspace_path),
                     job_id=job_id,
                     session_id=session_id,
-                    sample_size=sample_size
+                    sample_size=sample_size,
+                    likert_scale=likert_scale,
+                    items_per_objective=items_per_objective or 5,
+                    interview_questions=interview_questions or 10,
+                    fgd_questions=fgd_questions or 8,
+                    include_questionnaire=include_questionnaire,
+                    include_interviews=include_interviews,
+                    include_fgd=include_fgd,
+                    include_observation=include_observation
                 )
                 questionnaire_path = tools_result.get('questionnaire_path')
             except Exception as e:
@@ -4773,7 +5470,10 @@ async def generate_thesis(request: dict):
                     output_dir=str(datasets_path),
                     sample_size=sample_size,
                     job_id=job_id,
-                    session_id=session_id
+                    session_id=session_id,
+                    likert_scale=likert_scale,
+                    items_per_objective=items_per_objective,
+                    demographic_distributions=demographic_distributions
                 )
                 dataset_file = dataset_result.get('csv_path') if dataset_result else None
             except Exception as e:
@@ -4920,6 +5620,7 @@ This chapter has presented the key findings related to {topic}.
             
             await events.publish(job_id, "file_created", {"path": str(ch4_file), "filename": ch4_file.name, "step": 6}, session_id=session_id)
             await events.publish(job_id, "step_completed", {"step": 6, "name": "Chapter 4: Data Analysis", "word_count": len(chapter4_result.split()), "file": str(ch4_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(4), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -5006,6 +5707,7 @@ This chapter has discussed the key findings in relation to existing literature o
             
             await events.publish(job_id, "file_created", {"path": str(ch5_file), "filename": ch5_file.name, "step": 7}, session_id=session_id)
             await events.publish(job_id, "step_completed", {"step": 7, "name": "Chapter 5: Discussion", "word_count": len(chapter5_result.split()), "file": str(ch5_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(5), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -5091,6 +5793,7 @@ Future researchers should explore...
             
             await events.publish(job_id, "file_created", {"path": str(ch6_file), "filename": ch6_file.name, "step": 8}, session_id=session_id)
             await events.publish(job_id, "step_completed", {"step": 8, "name": "Chapter 6: Conclusion", "word_count": len(chapter6_result.split()), "file": str(ch6_file)}, session_id=session_id)
+            await _update_plan(plan_label_map.get(6), cascade=True)
             await events.publish(
                 job_id,
                 "response_chunk",
@@ -5098,6 +5801,66 @@ Future researchers should explore...
                 session_id=session_id
             )
             print(f"✅ Chapter 6 complete! {len(chapter6_result)} chars")
+
+            # ================================================================
+            # OPTIONAL: REFORMAT TO CUSTOM OUTLINE
+            # ================================================================
+            outline = None
+            try:
+                from services.outline_parser import outline_parser
+                outline_path = workspace_path / "outline.json"
+                outline = outline_parser.load_outline(workspace_id) if outline_path.exists() else None
+                if thesis_type == "general" and outline and outline.get("chapters"):
+                    await events.publish(job_id, "log", {"message": "🧭 Reformatting chapters to custom outline..."}, session_id=session_id)
+                    from services.outline_rewriter import rewrite_thesis_to_outline
+                    import re
+
+                    source_chapters = {
+                        1: chapter_contents.get("chapter1", ""),
+                        2: chapter_contents.get("chapter2", ""),
+                        3: chapter_contents.get("chapter3", ""),
+                        4: chapter_contents.get("chapter4", ""),
+                        5: chapter_contents.get("chapter5", ""),
+                        6: chapter_contents.get("chapter6", "")
+                    }
+                    rewritten = await rewrite_thesis_to_outline(
+                        outline=outline,
+                        source_chapters=source_chapters,
+                        topic=topic,
+                        case_study=case_study,
+                        thesis_type=thesis_type
+                    )
+                    chapter_titles = {}
+                    for idx, chapter in enumerate(outline.get("chapters", []), 1):
+                        number = chapter.get("number") or idx
+                        try:
+                            number = int(number)
+                        except (TypeError, ValueError):
+                            number = idx
+                        chapter_titles[number] = chapter.get("title") or f"Chapter {number}"
+
+                    for ch_num, content in rewritten.items():
+                        raw_title = chapter_titles.get(ch_num, f"Chapter {ch_num}")
+                        safe_title = re.sub(r"[^\w\s-]", "", raw_title).strip().replace(" ", "_")
+                        chapter_filename = f"Chapter_{ch_num}_{safe_title}.md" if safe_title else f"Chapter_{ch_num}.md"
+                        chapter_path = chapters_path / chapter_filename
+                        with open(chapter_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        chapter_contents[f"chapter{ch_num}"] = content
+            except Exception as e:
+                print(f"⚠️ Outline rewrite failed: {e}")
+
+            outline_order = [(num, f"Chapter {num}") for num in range(1, 7)]
+            if outline and outline.get("chapters"):
+                outline_order = []
+                for idx, chapter in enumerate(outline.get("chapters", []), 1):
+                    number = chapter.get("number") or idx
+                    try:
+                        number = int(number)
+                    except (TypeError, ValueError):
+                        number = idx
+                    title_text = chapter.get("title") or f"Chapter {number}"
+                    outline_order.append((number, title_text))
             
             # ================================================================
             # FINAL STEP: GENERATE BOTH PROPOSAL AND COMPLETE THESIS
@@ -5139,21 +5902,12 @@ Future researchers should explore...
             for i, obj in enumerate(objectives, 1):
                 proposal_content += f"{i}. {obj}\n"
             
+            proposal_content += "\n\n---\n\n"
+            proposal_chapters = outline_order[:3] if outline_order else [(1, "Introduction"), (2, "Literature Review"), (3, "Research Methodology")]
+            for ch_num, ch_title in proposal_chapters:
+                proposal_content += f"# CHAPTER {ch_num}\n\n# {ch_title}\n\n{chapter_contents.get(f'chapter{ch_num}', '')}\n\n---\n\n"
+
             proposal_content += f"""
-
----
-
-{chapter_contents.get('chapter1', '')}
-
----
-
-{chapter_contents.get('chapter2', '')}
-
----
-
-{chapter_contents.get('chapter3', '')}
-
----
 
 # REFERENCES
 
@@ -5198,14 +5952,12 @@ Future researchers should explore...
             # ================================================================
             
             # Convert Chapters 1-3 from future to past tense for the complete thesis
-            chapter1_thesis = convert_future_to_past_tense(chapter_contents.get('chapter1', ''))
-            chapter2_thesis = convert_future_to_past_tense(chapter_contents.get('chapter2', ''))
-            chapter3_thesis = convert_future_to_past_tense(chapter_contents.get('chapter3', ''))
-            
-            # Chapters 4-6 are already in past tense (reporting completed research)
-            chapter4_thesis = chapter_contents.get('chapter4', '')
-            chapter5_thesis = chapter_contents.get('chapter5', '')
-            chapter6_thesis = chapter_contents.get('chapter6', '')
+            chapter_thesis_content = {}
+            for ch_num, _ch_title in outline_order:
+                content = chapter_contents.get(f"chapter{ch_num}", "")
+                if ch_num <= 3:
+                    content = convert_future_to_past_tense(content)
+                chapter_thesis_content[ch_num] = content
             
             # Generate proper academic abstract using LLM
             await events.publish(job_id, "log", {"message": "📝 Generating abstract and preliminaries..."}, session_id=session_id)
@@ -5255,11 +6007,140 @@ The study concludes that evidence-based interventions are essential for addressi
 **Keywords:** {topic.split()[0]}, {topic.split()[1] if len(topic.split()) > 1 else 'Research'}, {case_study.split()[0]}, Mixed Methods, PhD Research, {case_study.split()[-1] if len(case_study.split()) > 1 else 'Study'}"""
 
             # Combine all chapters into final thesis with proper academic structure
-            logo_path = "/home/gemtech/Desktop/thesis/backend/lightweight/uoj_logo.png"
+            import shutil
+            from pathlib import Path
+
+            logo_source = Path(__file__).parent / "uoj_logo.png"
+            logo_markdown = ""
+            try:
+                if logo_source.exists():
+                    logo_dest = workspace_path / "uoj_logo.png"
+                    if not logo_dest.exists():
+                        shutil.copyfile(logo_source, logo_dest)
+                    logo_markdown = "![UNIVERSITY OF JUBA LOGO](uoj_logo.png)"
+            except Exception as logo_err:
+                print(f"⚠️ Could not prepare logo: {logo_err}")
+
+            def _format_authors(authors: list) -> str:
+                if not authors:
+                    return "Unknown Author"
+                names = []
+                for author in authors:
+                    if isinstance(author, dict):
+                        name = str(author.get("name", "")).strip()
+                    else:
+                        name = str(author).strip()
+                    if not name:
+                        continue
+                    parts = name.split()
+                    if len(parts) == 1:
+                        names.append(parts[0])
+                    else:
+                        last = parts[-1]
+                        initials = " ".join([p[0] + "." for p in parts[:-1] if p])
+                        names.append(f"{last}, {initials}".strip())
+                if not names:
+                    return "Unknown Author"
+                if len(names) == 1:
+                    return names[0]
+                if len(names) == 2:
+                    return f"{names[0]}, & {names[1]}"
+                if len(names) > 20:
+                    return ", ".join(names[:19]) + ", ... " + names[-1]
+                return ", ".join(names[:-1]) + ", & " + names[-1]
+
+            def _build_references_from_sources() -> str:
+                try:
+                    from services.sources_service import SourcesService
+                    sources_service = SourcesService()
+                    sources_index = sources_service._load_index(workspace_id)
+                    sources = sources_index.get("sources", []) if isinstance(sources_index, dict) else []
+                except Exception as ref_err:
+                    print(f"⚠️ Could not load sources index: {ref_err}")
+                    sources = []
+
+                if not sources:
+                    return "_No sources found in workspace._"
+
+                def sort_key(source: dict) -> str:
+                    authors = source.get("authors") or []
+                    if authors:
+                        if isinstance(authors[0], dict):
+                            name = str(authors[0].get("name", "")).strip()
+                        else:
+                            name = str(authors[0]).strip()
+                        return name.lower()
+                    return "unknown"
+
+                entries = []
+                for source in sorted(sources, key=sort_key):
+                    authors_text = _format_authors(source.get("authors") or [])
+                    year = source.get("year") or "n.d."
+                    title_text = source.get("title") or "Untitled"
+                    venue = source.get("venue") or ""
+                    doi = source.get("doi") or ""
+                    url = source.get("url") or ""
+                    if doi and not url:
+                        url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+                    entry = f"{authors_text} ({year}). *{title_text}*."
+                    if venue:
+                        entry += f" {venue}."
+                    if url:
+                        entry += f" {url}"
+                    entries.append(entry)
+
+                return "\n\n".join(entries)
+
+            def _load_latest_text(directory: Path, patterns: list) -> str:
+                matches = []
+                if directory.exists():
+                    for pattern in patterns:
+                        matches.extend(list(directory.glob(pattern)))
+                if not matches:
+                    return ""
+                latest = max(matches, key=lambda p: p.stat().st_mtime)
+                try:
+                    return latest.read_text(encoding="utf-8").strip()
+                except Exception:
+                    return ""
+
+            study_tools_dir = workspace_path / "study_tools"
+            questionnaire_text = _load_latest_text(study_tools_dir, ["Questionnaire*.md"])
+            interview_text = _load_latest_text(study_tools_dir, ["Interview_Guide*.md"])
+            fgd_text = _load_latest_text(study_tools_dir, ["FGD_Guide*.md", "FGD*.md"])
+            observation_text = _load_latest_text(study_tools_dir, ["Observation_Checklist*.md", "Observation*.md"])
+
+            datasets_dir = workspace_path / "datasets"
+            dataset_files = []
+            if datasets_dir.exists():
+                dataset_files = [p.name for p in datasets_dir.glob("*.*") if p.is_file()]
+
+            references_block = _build_references_from_sources()
+            appendices_sections = []
+            appendices_sections.append(
+                "## Appendix A: Research Questionnaire\n\n" + (questionnaire_text or "[Questionnaire not generated]")
+            )
+            appendices_sections.append(
+                "## Appendix B: Interview Guide\n\n" + (interview_text or "[Interview guide not generated]")
+            )
+            appendices_sections.append(
+                "## Appendix C: Focus Group Discussion Guide\n\n" + (fgd_text or "[FGD guide not generated]")
+            )
+            appendices_sections.append(
+                "## Appendix D: Observation Checklist\n\n" + (observation_text or "[Observation checklist not generated]")
+            )
+            if dataset_files:
+                appendices_sections.append(
+                    "## Appendix E: Raw Data Files\n\n" + "\n".join([f"- {name}" for name in dataset_files])
+                )
+            else:
+                appendices_sections.append("## Appendix E: Raw Data Files\n\n[No datasets found]")
+            appendices_block = "\n\n".join(appendices_sections)
+
             full_thesis = f"""
 <div style="text-align: center; page-break-after: always;">
 
-![UNIVERSITY OF JUBA LOGO]({logo_path})
+{logo_markdown}
 
 # {title.upper()}
 
@@ -5508,99 +6389,35 @@ Finally, I extend my appreciation to my colleagues and friends who provided inte
             for i, obj in enumerate(objectives, 1):
                 full_thesis += f"{i}. {obj}\n"
             
+            full_thesis += "\n\n---\n\n"
+            for ch_num, ch_title in outline_order:
+                full_thesis += f"# CHAPTER {ch_num}\n\n# {ch_title}\n\n{chapter_thesis_content.get(ch_num, '')}\n\n---\n\n"
+
             full_thesis += f"""
-
----
-
-# CHAPTER ONE
-
-# INTRODUCTION
-
-{chapter1_thesis}
-
----
-
-# CHAPTER TWO
-
-# LITERATURE REVIEW
-
-{chapter2_thesis}
-
----
-
-# CHAPTER THREE
-
-# RESEARCH METHODOLOGY
-
-{chapter3_thesis}
-
----
-
-# CHAPTER FOUR
-
-# DATA PRESENTATION, ANALYSIS AND INTERPRETATION
-
-{chapter4_thesis}
-
----
-
-# CHAPTER FIVE
-
-# DISCUSSION OF FINDINGS
-
-{chapter5_thesis}
-
----
-
-# CHAPTER SIX
-
-# SUMMARY, CONCLUSIONS AND RECOMMENDATIONS
-
-{chapter6_thesis}
-
----
-
 # REFERENCES
 
-All scholarly sources cited in this thesis are embedded as hyperlinks throughout the document. A consolidated reference list in APA 7th Edition format is available in the exported document.
+{references_block}
 
 ---
 
 # APPENDICES
 
-## Appendix A: Research Questionnaire
-
-The structured questionnaire used for data collection is available as a separate document:
-- **File:** `Questionnaire_{timestamp}.md`
-
-## Appendix B: Interview Guide
-
-The semi-structured interview guide for qualitative data collection:
-- **File:** `Interview_Guide_{timestamp}.md`
-
-## Appendix C: Focus Group Discussion Guide
-
-The FGD protocol and questions:
-- **File:** See Interview Guide
-
-## Appendix D: Research Permit/Authorisation Letters
-
-*[To be inserted by researcher]*
-
-## Appendix E: Informed Consent Form
-
-*[To be inserted by researcher]*
-
-## Appendix F: Raw Data
-
-Statistical outputs and transcripts are available in:
-- **Folder:** `datasets/`
+{appendices_block}
 
 ---
 
 **— END OF THESIS —**
 
 """
+            # Strip HTML wrappers from markdown output
+            try:
+                import re as _re
+                full_thesis = _re.sub(r"<div[^>]*>", "", full_thesis, flags=_re.IGNORECASE)
+                full_thesis = _re.sub(r"</div>", "", full_thesis, flags=_re.IGNORECASE)
+                full_thesis = full_thesis.replace("&nbsp;", "")
+                full_thesis = _re.sub(r"\n{3,}", "\n\n", full_thesis)
+            except Exception as clean_err:
+                print(f"⚠️ Could not clean HTML wrappers: {clean_err}")
             
             # Save complete thesis
             thesis_filename = f"Complete_PhD_Thesis_{topic.replace(' ', '_')}_{timestamp}.md"
@@ -5612,12 +6429,10 @@ Statistical outputs and transcripts are available in:
             word_count = len(full_thesis.split())
             
             # Calculate chapter word counts
-            ch1_words = len(chapter_contents.get('chapter1', '').split())
-            ch2_words = len(chapter_contents.get('chapter2', '').split())
-            ch3_words = len(chapter_contents.get('chapter3', '').split())
-            ch4_words = len(chapter_contents.get('chapter4', '').split())
-            ch5_words = len(chapter_contents.get('chapter5', '').split())
-            ch6_words = len(chapter_contents.get('chapter6', '').split())
+            chapter_word_rows = ""
+            for ch_num, ch_title in outline_order:
+                words = len(chapter_thesis_content.get(ch_num, "").split())
+                chapter_word_rows += f"| {ch_num} | {ch_title} | {words:,} |\n"
             
             # Notify completion with detailed summary
             proposal_words = len(proposal_content.split())
@@ -5642,12 +6457,7 @@ Statistical outputs and transcripts are available in:
 
 | Chapter | Title | Words |
 |---------|-------|-------|
-| 1 | Introduction | {ch1_words:,} |
-| 2 | Literature Review | {ch2_words:,} |
-| 3 | Methodology | {ch3_words:,} |
-| 4 | Data Analysis | {ch4_words:,} |
-| 5 | Discussion | {ch5_words:,} |
-| 6 | Conclusion | {ch6_words:,} |
+{chapter_word_rows.rstrip()}
 | **Total** | **Complete Thesis** | **{word_count:,}** |
 
 ## 📁 Files Generated
@@ -5660,7 +6470,7 @@ Statistical outputs and transcripts are available in:
 ### 📚 Complete PhD Thesis (Past Tense)
 - `{thesis_filename}` ({word_count:,} words)
 - Chapters 1-3 converted to **past tense** ("was", "were")
-- Chapters 4-6 report completed research
+- Later chapters report completed research
 - Use this for final thesis submission
 
 ### 📂 Other Files
@@ -5759,3 +6569,71 @@ async def generate_thesis_from_topic(request: dict):
             "university_type": request.get('university_type', 'unknown'),
             "title": request.get('title', 'unknown')
         }
+
+# ============================================================================
+# OUTLINE TEMPLATE ENDPOINTS
+# ============================================================================
+
+@app.post("/api/workspace/{workspace_id}/upload-outline")
+async def upload_outline(workspace_id: str, outline: dict):
+    """Upload custom thesis outline."""
+    try:
+        from services.outline_parser import outline_parser
+
+        success = outline_parser.save_outline(workspace_id, outline)
+        if not success:
+            raise HTTPException(status_code=400, detail="Invalid outline structure")
+
+        return {
+            "success": True,
+            "workspace_id": workspace_id,
+            "chapters": len(outline.get("chapters", []))
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workspace/{workspace_id}/outline")
+async def get_outline(workspace_id: str):
+    """Get thesis outline for workspace."""
+    try:
+        from services.outline_parser import outline_parser
+
+        outline = outline_parser.load_outline(workspace_id)
+        return {
+            "workspace_id": workspace_id,
+            "outline": outline
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/outlines/templates")
+async def list_outline_templates():
+    """List available outline templates."""
+    try:
+        from services.outline_parser import outline_parser
+
+        templates = outline_parser.list_templates()
+        return {
+            "templates": templates
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/outlines/templates/{template_id}")
+async def get_outline_template(template_id: str):
+    """Get specific outline template."""
+    try:
+        from services.outline_parser import outline_parser
+
+        outline = outline_parser.get_default_outline(template_id)
+        return {
+            "template_id": template_id,
+            "outline": outline
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

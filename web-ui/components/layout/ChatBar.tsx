@@ -40,9 +40,12 @@ interface ChatBarProps {
   onStop?: () => void;
   currentStatus?: string;
   currentStage?: string;
+  workspaceId?: string;
+  sessionId?: string;
 }
 
 const DEFAULT_WORKFLOWS: Workflow[] = [
+  { command: 'good', description: 'Custom love flow (topic, country, case study)', icon: '❤️', category: 'thesis' },
   { command: 'uoj_general', description: 'University of Juba General (Bachelor) Proposal', icon: '🎓', category: 'thesis' },
   { command: 'uoj_phd', description: 'University of Juba PhD Thesis', icon: '🏛️', category: 'thesis' },
   { command: 'generate-full-thesis', description: 'Generate complete PhD thesis (all 6 chapters)', icon: '📚', category: 'thesis' },
@@ -57,7 +60,9 @@ export function ChatBar({
   placeholder = 'Ask me about your research, request content generation, or seek assistance... (use @ for agents, / for thesis commands)',
   onStop,
   currentStatus,
-  currentStage
+  currentStage,
+  workspaceId,
+  sessionId
 }: ChatBarProps) {
   const [message, setMessage] = useState('');
   const [isFocused, setIsFocused] = useState(false);
@@ -267,7 +272,7 @@ export function ChatBar({
     if (nMatch) params.sampleSize = parseInt(nMatch[2]);
 
     // Extract design: design="mixed"
-    const designMatch = msg.match(/design\s*[:=]\s*['"]?(quantitative|qualitative|mixed)['"]?/i);
+    const designMatch = msg.match(/design\s*[:=]\s*['"]?(quantitative|qualitative|mixed|mixed_methods|survey|case_study|ethnographic|phenomenological|grounded_theory|experimental|quasi_experimental|clinical|descriptive|correlational|longitudinal|cross_sectional)['"]?/i);
     if (designMatch) params.researchDesign = designMatch[1] as any;
 
     // Fallback: If no explicit topic tag, use all text after the command as the topic
@@ -657,6 +662,8 @@ export function ChatBar({
           workflowCommand={selectedWorkflow.command}
           workflowDescription={selectedWorkflow.description}
           initialParameters={initialParameters}
+          workspaceId={workspaceId}
+          sessionId={sessionId}
         />
       )}
     </div>

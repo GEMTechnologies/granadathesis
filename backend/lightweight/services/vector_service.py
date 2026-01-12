@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import hashlib
 import json
+from core.config import settings
 
 # Storage directory for ChromaDB
 VECTOR_DB_DIR = Path(__file__).parent.parent.parent / "chroma_data"

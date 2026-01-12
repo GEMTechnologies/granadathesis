@@ -145,7 +145,9 @@ class Chapter4Generator:
         variable_mapping: Dict[str, Any] = None,  # NEW: Maps variable names to real text
         objective_variables: Dict[str, List[str]] = None,  # NEW: Golden Thread variables
         figures_dir: str = None,  # NEW: Explicit figures output directory
-        sample_size: int = None
+        sample_size: int = None,
+        research_design: str = None,
+        design_family: str = None
     ):
         # CLEAN METADATA from topic
         import re
@@ -168,6 +170,8 @@ class Chapter4Generator:
         self.observation_data = observation_data or []
         self.objective_variables = objective_variables or {}
         self.sample_size = sample_size or len(self.questionnaire_data) or 385
+        self.research_design = research_design or ""
+        self.design_family = design_family or self._design_family(self.research_design)
         
         # Variable mapping for real statement text (instead of S1, S2, etc.)
         self.variable_mapping = variable_mapping or {}
@@ -267,6 +271,24 @@ class Chapter4Generator:
         
         # Chart planner for intelligent selection
         self.chart_planner = ChartPlanner()
+
+    def _design_family(self, design: str) -> str:
+        if not design:
+            return "quantitative"
+        value = design.strip().lower().replace("-", "_").replace(" ", "_")
+        qualitative = {
+            "qualitative", "ethnographic", "phenomenological", "phenomenology",
+            "grounded_theory", "narrative", "case_study", "case_study_research"
+        }
+        mixed = {"mixed", "mixed_methods", "convergent", "sequential_explanatory", "sequential_exploratory"}
+        experimental = {"experimental", "quasi_experimental", "clinical", "rct", "randomized_controlled_trial"}
+        if value in qualitative:
+            return "qualitative"
+        if value in mixed:
+            return "mixed"
+        if value in experimental:
+            return "experimental"
+        return "quantitative"
     
     def _get_distinct_colors(self, n: int) -> List[str]:
         """Get n distinct colors - each item gets a DIFFERENT color."""
@@ -279,28 +301,37 @@ class Chapter4Generator:
     
     def _generate_likert_stacked_bar(self, items_data: List[Dict], title: str, filename_suffix: str) -> Tuple[str, int]:
         """Generate a 100% stacked bar chart for Likert items."""
+        valid_items = [
+            item for item in items_data
+            if isinstance(item, dict)
+            and isinstance(item.get('stats'), dict)
+            and 'likert_pct' in item['stats']
+        ]
+        if not valid_items:
+            raise ValueError("No Likert stats available for stacked bar chart")
+
         fig_num = self._next_figure_number()
         
-        labels = [item['label'][:20] + "..." for item in items_data]
+        labels = [item['label'][:20] + "..." for item in valid_items]
         # Data for SD, D, N, A, SA
         data = {
-            'SD': [item['stats']['likert_pct'].get(1, 0) for item in items_data],
-            'D': [item['stats']['likert_pct'].get(2, 0) for item in items_data],
-            'N': [item['stats']['likert_pct'].get(3, 0) for item in items_data],
-            'A': [item['stats']['likert_pct'].get(4, 0) for item in items_data],
-            'SA': [item['stats']['likert_pct'].get(5, 0) for item in items_data]
+            'SD': [item['stats']['likert_pct'].get(1, 0) for item in valid_items],
+            'D': [item['stats']['likert_pct'].get(2, 0) for item in valid_items],
+            'N': [item['stats']['likert_pct'].get(3, 0) for item in valid_items],
+            'A': [item['stats']['likert_pct'].get(4, 0) for item in valid_items],
+            'SA': [item['stats']['likert_pct'].get(5, 0) for item in valid_items]
         }
         
         category_names = ['SD', 'D', 'N', 'A', 'SA']
         category_colors = ['#d73027', '#fc8d59', '#ffffbf', '#91bfdb', '#4575b4']
         
-        fig, ax = plt.subplots(figsize=(10, len(items_data) * 0.8 + 2))
+        fig, ax = plt.subplots(figsize=(10, len(valid_items) * 0.8 + 2))
         
         # Calculate optimal font size
         self.FONT_SIZES['tick_label'] = 10
         
         widths = np.array([data[k] for k in category_names])
-        starts = np.zeros(len(items_data))
+        starts = np.zeros(len(valid_items))
         
         for i, (colname, color) in enumerate(zip(category_names, category_colors)):
             rects = ax.barh(labels, widths[i], left=starts, height=0.6, label=colname, color=color)
@@ -853,9 +884,32 @@ Figure {fig_num}: {title}
 Source: Field Data, 2025
 """, fig_num
     
-    def _generate_stacked_bar_chart(self, data: Dict[str, Dict[str, float]], title: str,
+    def _generate_stacked_bar_chart(self, data: Any, title: str,
                                      filename: str, ylabel: str = "Percentage (%)") -> str:
         """Generate a stacked bar chart for Likert scale distribution."""
+        # Accept either dict of dicts or list of items with stats.likert_pct
+        if isinstance(data, list):
+            normalized: Dict[str, Dict[str, float]] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                stats = item.get('stats')
+                if not isinstance(stats, dict) or 'likert_pct' not in stats:
+                    continue
+                label = item.get('label', 'Statement')
+                normalized[label] = {
+                    'SD': stats['likert_pct'].get(1, 0),
+                    'D': stats['likert_pct'].get(2, 0),
+                    'N': stats['likert_pct'].get(3, 0),
+                    'A': stats['likert_pct'].get(4, 0),
+                    'SA': stats['likert_pct'].get(5, 0)
+                }
+            if not normalized:
+                raise ValueError("No Likert stats available for stacked bar chart")
+            data = normalized
+        elif not isinstance(data, dict):
+            raise TypeError("Stacked bar chart data must be a dict or list of items")
+
         fig_num = self._next_figure_number()
         
         categories = list(data.keys())
@@ -1344,7 +1398,53 @@ The chapter was structured as follows: Section 4.1 presented the response rate o
 All statistical analyses were conducted at a 95% confidence level (α = 0.05). Descriptive statistics including frequencies, percentages, means, and standard deviations were used to summarise the data. Inferential statistics including correlation and regression analyses were employed to test the research hypotheses. Qualitative data from interviews and focus group discussions were presented as direct quotations to support and triangulate the quantitative findings.
 
 """
+
+    async def generate_quantitative_introduction(self) -> str:
+        """Generate quantitative-focused Chapter 4 introduction."""
+        return f"""## 4.0 Introduction
+
+This chapter presented the quantitative findings of the study on {self.topic}. Data were collected primarily through structured questionnaires and analysed using descriptive and inferential statistics. The findings were organised according to the research objectives and presented using tables and figures.
+
+The chapter was structured as follows: Section 4.1 presented the response rate of the study instruments; Section 4.2 presented the demographic characteristics of the respondents; subsequent sections presented findings for each research objective based on statistical analysis.
+
+All statistical analyses were conducted at a 95% confidence level (α = 0.05). Descriptive statistics including frequencies, percentages, means, and standard deviations were used to summarise the data. Inferential statistics including correlation and regression analyses were employed to test the research hypotheses.
+
+"""
     
+    async def generate_qualitative_introduction(self) -> str:
+        """Generate qualitative-focused Chapter 4 introduction."""
+        return f"""## 4.0 Introduction
+
+This chapter presented the qualitative findings of the study on {self.topic}. Data were generated through interviews, focus group discussions, and field observations, and were analysed thematically to identify patterns, meanings, and contextual explanations. The findings were organised according to the research objectives and presented primarily through narrative analysis supported by direct quotations where appropriate.
+
+The chapter was structured as follows: Section 4.1 described the qualitative data sources and participant profile; subsequent sections presented findings for each research objective using thematic narratives and illustrative excerpts. No statistical tests were applied, as the focus was on depth of understanding rather than numerical generalisation.
+
+"""
+
+    async def generate_qualitative_data_sources(self) -> str:
+        """Generate Section 4.1 for qualitative data sources."""
+        interviews_conducted = len({row.get('respondent_id') for row in self.interview_data if row.get('respondent_id')})
+        fgd_groups = len({row.get('fgd_group') for row in self.fgd_data if row.get('fgd_group')})
+        observations = len({row.get('observation_id') for row in self.observation_data if row.get('observation_id')})
+
+        parts = []
+        if interviews_conducted:
+            parts.append(f"{interviews_conducted} key informant interviews")
+        if fgd_groups:
+            parts.append(f"{fgd_groups} focus group discussions")
+        if observations:
+            parts.append(f"{observations} observation sessions")
+
+        sources_text = ", ".join(parts) if parts else "qualitative narratives from the study instruments"
+
+        return f"""## 4.1 Qualitative Data Sources and Participant Profile
+
+This section summarised the sources of qualitative evidence used in the analysis. The dataset comprised {sources_text}. Participants were selected purposively to ensure information-rich perspectives relevant to the study objectives, and data collection continued until thematic saturation was achieved.
+
+The collected narratives provided contextual insights into the phenomena under investigation, enabling a deeper understanding of experiences, perceptions, and institutional practices within the study context.
+
+"""
+
     async def generate_response_rate(self) -> str:
         """Generate section 4.1 Study Tools Rate of Return."""
         total_questionnaires = len(self.questionnaire_data)
@@ -1355,18 +1455,29 @@ All statistical analyses were conducted at a 95% confidence level (α = 0.05). D
         interviews_conducted = len(set(row.get('respondent_id') for row in self.interview_data))
         fgd_groups = len(set(row.get('fgd_group') for row in self.fgd_data))
         observations = len(set(row.get('observation_id') for row in self.observation_data))
-        
-        table, table_num = self._format_table(
-            "Response Rate of Study Instruments",
-            ["Instrument", "Distributed/Planned", "Returned/Conducted", "Rate (%)"],
-            [
-                ["Questionnaires", distributed, total_questionnaires, f"{response_rate:.1f}%"],
+
+        rows = [
+            ["Questionnaires", distributed, total_questionnaires, f"{response_rate:.1f}%"]
+        ]
+        if self.design_family in ("mixed", "qualitative"):
+            rows.extend([
                 ["Key Informant Interviews", interviews_conducted, interviews_conducted, "100.0%"],
                 ["Focus Group Discussions", fgd_groups, fgd_groups, "100.0%"],
                 ["Observations", observations, observations, "100.0%"],
-            ]
+            ])
+
+        table, table_num = self._format_table(
+            "Response Rate of Study Instruments",
+            ["Instrument", "Distributed/Planned", "Returned/Conducted", "Rate (%)"],
+            rows
         )
-        
+
+        qualitative_note = ""
+        if self.design_family in ("mixed", "qualitative"):
+            qualitative_note = f"""
+Additionally, {interviews_conducted} key informant interviews were conducted, {fgd_groups} focus group discussions were held, and {observations} observation sessions were completed. All planned qualitative data collection activities were successfully executed, providing rich insights to complement the quantitative data.
+"""
+
         return f"""## 4.1 Study Tools Rate of Return
 
 This section presented the response rates achieved for each data collection instrument employed in the study.
@@ -1375,7 +1486,7 @@ This section presented the response rates achieved for each data collection inst
 
 The findings presented in Table {table_num} indicated that a total of {distributed} questionnaires were distributed to respondents, out of which {total_questionnaires} were successfully completed and returned, yielding a response rate of {response_rate:.1f}%. According to Mugenda and Mugenda (2003), a response rate of 70% and above is considered excellent for analysis. The achieved response rate was therefore deemed adequate for the study.
 
-Additionally, {interviews_conducted} key informant interviews were conducted, {fgd_groups} focus group discussions were held, and {observations} observation sessions were completed. All planned qualitative data collection activities were successfully executed, providing rich insights to complement the quantitative data.
+{qualitative_note}
 
 The high response rate was attributed to the careful selection of respondents, prior appointment scheduling, and the use of research assistants who followed up on unreturned questionnaires. The adequate response rate enhanced the reliability and generalisability of the study findings.
 
@@ -1526,6 +1637,8 @@ The {var_name} distribution indicated that the study sample was adequately diver
     async def generate_objective_analysis(self, objective_num: int, objective: str) -> str:
         """Generate analysis section for a specific objective with Variable-based hierarchy."""
         section_num = f"4.{objective_num + 2}"  # Start from 4.3
+        include_qualitative = self.design_family in ("mixed", "qualitative")
+        include_triangulation = self.design_family == "mixed"
         
         md = f"""## {section_num} Findings on Objective {objective_num}: {objective[:80]}
         
@@ -1539,8 +1652,10 @@ This section presents the findings related to the {self._ordinal(objective_num)}
             # Fallback if no variables extracted
             md += await self._generate_descriptive_stats_section(objective_num, objective)
             md += await self._generate_inferential_stats_section(objective_num, objective)
-            md += await self._generate_qualitative_section(objective_num, objective)
-            md += await self._generate_triangulation_section(objective_num, objective)
+            if include_qualitative:
+                md += await self._generate_qualitative_section(objective_num, objective)
+            if include_triangulation:
+                md += await self._generate_triangulation_section(objective_num, objective)
         else:
             # Descriptive Statistics OVERVIEW (The Big Table)
             md += await self._generate_descriptive_stats_section(objective_num, objective)
@@ -1557,10 +1672,15 @@ This section presents the findings related to the {self._ordinal(objective_num)}
             md += f"### {section_num}.{inf_num} Inferential Statistical Analysis\n\n"
             md += await self._generate_inferential_stats_section(objective_num, objective)
             
-            # Triangulation
-            tri_num = len(vars_for_obj) + 2
-            md += f"### {section_num}.{tri_num} Triangulation of Findings\n\n"
-            md += await self._generate_triangulation_section(objective_num, objective)
+            if include_qualitative:
+                qual_num = len(vars_for_obj) + 2
+                md += f"### {section_num}.{qual_num} Qualitative Findings\n\n"
+                md += await self._generate_qualitative_section(objective_num, objective)
+
+            if include_triangulation:
+                tri_num = len(vars_for_obj) + (3 if include_qualitative else 2)
+                md += f"### {section_num}.{tri_num} Triangulation of Findings\n\n"
+                md += await self._generate_triangulation_section(objective_num, objective)
             
         return md
 
@@ -1703,13 +1823,20 @@ Source: Field Data, 2025
         # 1. Stacked Bar Chart for Likert Distribution (if we have items_data)
         if items_data and len(items_data) > 0:
             try:
-                stacked_chart_md, stacked_fig_num = self._generate_likert_stacked_bar(
-                    items_data,
-                    f"Likert Scale Distribution for Objective {obj_num}",
-                    f"obj{obj_num}_likert_distribution"
-                )
-                chart_md += f"\n{stacked_chart_md}\n"
-                chart_md += f"Figure {stacked_fig_num} presented the distribution of responses across the five-point Likert scale for all statements under Objective {obj_num}. The stacked bar chart illustrated the proportion of respondents selecting each response category (Strongly Disagree to Strongly Agree) for each statement. The visual representation confirmed that the majority of responses were concentrated in the 'Agree' and 'Strongly Agree' categories, indicating overall positive perceptions.\n\n"
+                valid_items = [
+                    item for item in items_data
+                    if isinstance(item, dict)
+                    and isinstance(item.get('stats'), dict)
+                    and 'likert_pct' in item['stats']
+                ]
+                if valid_items:
+                    stacked_chart_md, stacked_fig_num = self._generate_likert_stacked_bar(
+                        valid_items,
+                        f"Likert Scale Distribution for Objective {obj_num}",
+                        f"obj{obj_num}_likert_distribution"
+                    )
+                    chart_md += f"\n{stacked_chart_md}\n"
+                    chart_md += f"Figure {stacked_fig_num} presented the distribution of responses across the five-point Likert scale for all statements under Objective {obj_num}. The stacked bar chart illustrated the proportion of respondents selecting each response category (Strongly Disagree to Strongly Agree) for each statement. The visual representation confirmed that the majority of responses were concentrated in the 'Agree' and 'Strongly Agree' categories, indicating overall positive perceptions.\n\n"
             except Exception as e:
                 print(f"⚠️ Could not generate stacked bar chart: {e}")
         
@@ -2119,8 +2246,82 @@ Overall, the mixed methods approach employed in this study proved effective in c
 
 """
 
+    async def generate_qualitative_objective_analysis(self, obj_num: int, objective: str) -> str:
+        """Generate qualitative-only findings for a specific objective."""
+        section_num = obj_num + 1
+
+        interview_quotes = self._extract_quotes(
+            [r for r in self.interview_data if str(obj_num) in str(r.get('question_number', ''))]
+            or self.interview_data,
+            'response',
+            min_quotes=6,
+            max_quotes=10
+        )
+
+        fgd_quotes = self._extract_quotes(
+            [r for r in self.fgd_data if str(obj_num) in str(r.get('theme_number', ''))]
+            or self.fgd_data,
+            'response',
+            min_quotes=4,
+            max_quotes=8
+        )
+
+        observation_quotes = self._extract_quotes(
+            self.observation_data,
+            'observation',
+            min_quotes=3,
+            max_quotes=6
+        )
+
+        md = f"""## 4.{section_num} Findings on Objective {obj_num}: {objective[:80]}
+
+This section presents the qualitative findings for the {self._ordinal(obj_num)} objective, which sought to {objective.lower() if not objective.lower().startswith('to ') else objective[3:].lower()}. The analysis is organised around key themes and supported by illustrative excerpts.
+
+### 4.{section_num}.1 Key Informant Interview Responses
+
+"""
+
+        if interview_quotes:
+            md += self._format_quotes_section(
+                interview_quotes,
+                "Key informants highlighted the following themes:"
+            )
+        else:
+            md += "The interview data indicated consistent themes aligned with the objective, although direct quotations were limited in the available records.\n\n"
+
+        md += f"""### 4.{section_num}.2 Focus Group Discussion Responses
+
+"""
+
+        if fgd_quotes:
+            md += self._format_quotes_section(
+                fgd_quotes,
+                "Focus group participants offered the following perspectives:"
+            )
+        else:
+            md += "The focus group discussions reinforced the interview themes, emphasising shared experiences and contextual factors relevant to the objective.\n\n"
+
+        md += f"""### 4.{section_num}.3 Observational Notes
+
+"""
+
+        if observation_quotes:
+            md += self._format_quotes_section(
+                observation_quotes,
+                "Field observations provided the following contextual evidence:"
+            )
+        else:
+            md += "Observational notes provided contextual support for the thematic patterns identified in interviews and group discussions.\n\n"
+
+        md += "Overall, the qualitative evidence demonstrated coherent themes that illuminate the objective in the study context.\n\n"
+
+        return md
+
     async def generate_summary(self) -> str:
         """Generate summary of findings section."""
+        if self.design_family in ("quantitative", "experimental"):
+            return await self.generate_quantitative_summary()
+
         last_section = len(self.objectives) + 3
         
         # Use actual sample size from data
@@ -2144,6 +2345,47 @@ The triangulation of quantitative and qualitative data sources yielded consisten
 """
         
         return summary
+
+    async def generate_quantitative_summary(self) -> str:
+        """Generate summary for quantitative-only Chapter 4."""
+        last_section = len(self.objectives) + 3
+        n_size = self.sample_size or len(self.questionnaire_data) or 385
+
+        summary = f"""## 4.{last_section} Summary of Findings
+
+This chapter presented the quantitative findings of the study based on data collected from {n_size} questionnaire respondents. The key findings were summarised as follows:
+
+"""
+        for i, obj in enumerate(self.objectives, 1):
+            summary += f"""Objective {i}: {obj}
+
+The findings revealed that respondents generally held positive perceptions regarding this objective, with mean scores indicating agreement with the related statements. The inferential statistics confirmed statistically significant relationships at α = 0.05 where applicable, supporting the study hypotheses.
+
+"""
+
+        summary += "The next chapter discusses these findings in relation to the existing literature and theoretical framework.\n\n"
+
+        return summary
+
+    async def generate_qualitative_summary(self) -> str:
+        """Generate summary for qualitative-only Chapter 4."""
+        last_section = len(self.objectives) + 2
+
+        summary = f"""## 4.{last_section} Summary of Findings
+
+This chapter presented the qualitative findings of the study based on interviews, focus group discussions, and field observations. The key themes that emerged across the objectives are summarised below.
+
+"""
+        for i, obj in enumerate(self.objectives, 1):
+            summary += f"""Objective {i}: {obj}
+
+The analysis revealed convergent themes that explained how participants experienced and interpreted the issues related to this objective. Illustrative narratives highlighted both enabling factors and persistent constraints within the study context.
+
+"""
+
+        summary += "The qualitative evidence provided depth and context to the study, and the next chapter discusses these themes in relation to the literature and theoretical framework.\n\n"
+
+        return summary
     
     def _ordinal(self, n: int) -> str:
         """Convert number to ordinal (1st, 2nd, 3rd, etc.)."""
@@ -2156,23 +2398,34 @@ The triangulation of quantitative and qualitative data sources yielded consisten
     async def generate_full_chapter(self) -> str:
         """Generate the complete Chapter 4."""
         chapter = "# CHAPTER FOUR\n\n# DATA PRESENTATION, ANALYSIS, AND INTERPRETATION\n\n"
-        
+
+        if self.design_family == "qualitative":
+            chapter += await self.generate_qualitative_introduction()
+            chapter += await self.generate_qualitative_data_sources()
+            for i, obj in enumerate(self.objectives, 1):
+                chapter += await self.generate_qualitative_objective_analysis(i, obj)
+            chapter += await self.generate_qualitative_summary()
+            return chapter
+
         # 4.0 Introduction
-        chapter += await self.generate_introduction()
-        
+        if self.design_family in ("quantitative", "experimental"):
+            chapter += await self.generate_quantitative_introduction()
+        else:
+            chapter += await self.generate_introduction()
+
         # 4.1 Response Rate
         chapter += await self.generate_response_rate()
-        
+
         # 4.2 Demographics
         chapter += await self.generate_demographics_section()
-        
+
         # 4.3+ Objective Analyses
         for i, obj in enumerate(self.objectives, 1):
             chapter += await self.generate_objective_analysis(i, obj)
-        
+
         # Summary
         chapter += await self.generate_summary()
-        
+
         return chapter
 
 
@@ -2253,6 +2506,8 @@ async def generate_chapter4(
     # ============================================================
     analysis_context = None
     sample_size_override = None
+    design_family = None
+    research_design = None
     try:
         from services.thesis_config_integration import get_chapter_generation_context
         chapter_ctx = get_chapter_generation_context(workspace_id, chapter_number=4)
@@ -2260,6 +2515,8 @@ async def generate_chapter4(
         
         if analysis_context:
             sample_size_override = analysis_context.get('sample_size')
+            design_family = analysis_context.get('design_family')
+            research_design = analysis_context.get('research_design')
             selected_analyses = analysis_context.get('selected_analyses', [])
             
             print(f"📊 Analysis Configuration Loaded:")
@@ -2273,6 +2530,18 @@ async def generate_chapter4(
                 print(f"⚠️ No existing data found. Will generate {sample_size_override} synthetic responses.")
     except Exception as e:
         print(f"⚠️ Could not load analysis context (using defaults): {e}")
+    # ============================================================
+    # Determine effective sample size from actual data/config
+    data_sample_size = len(questionnaire_data) if questionnaire_data else 0
+    effective_sample_size = None
+    if data_sample_size:
+        effective_sample_size = data_sample_size
+        if sample_size_override and sample_size_override != data_sample_size:
+            print(f"⚠️ Sample size mismatch: config n={sample_size_override} vs data n={data_sample_size}. Using data size.")
+    elif sample_size_override:
+        effective_sample_size = sample_size_override
+    elif sample_size:
+        effective_sample_size = sample_size
     # ============================================================
 
     # Create generator with variable mapping for real statement text
@@ -2291,7 +2560,9 @@ async def generate_chapter4(
         objective_variables=objective_variables,
         output_dir=output_dir,
         figures_dir=root_figures_dir,  # Explicitly save figures to root
-        sample_size=sample_size
+        sample_size=effective_sample_size,
+        research_design=research_design,
+        design_family=design_family
     )
     
     # ============================================================
@@ -2301,11 +2572,9 @@ async def generate_chapter4(
         # Store analysis context in generator for use during generation
         generator.analysis_context = analysis_context
         
-        # Override sample size if specified
-        if sample_size_override and hasattr(generator, 'questionnaire_data'):
-            # If we need to adjust data size, we'd do it here
-            # For now, just log it
-            print(f"   ℹ️ Analysis will use n={sample_size_override}")
+        # Log effective sample size for analysis
+        if effective_sample_size:
+            print(f"   ℹ️ Analysis will use n={effective_sample_size}")
     # ============================================================
     
     # Generate chapter

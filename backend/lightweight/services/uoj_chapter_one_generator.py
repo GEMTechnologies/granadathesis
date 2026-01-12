@@ -7,6 +7,8 @@ from services.deepseek_direct import deepseek_direct_service
 from services.objective_generator import normalize_objectives
 from core.events import events
 from services.chapter_state import ChapterState
+from services.plan_tracker import ensure_plan_file, mark_plan_item
+from services.workspace_service import WORKSPACES_DIR
 
 
 async def generate_chapter_one_uoj(
@@ -30,6 +32,65 @@ async def generate_chapter_one_uoj(
         objectives = normalize_objectives(objectives or [], topic, case_study)
     general_objective = objectives.get("general", "")
     specific_objectives = objectives.get("specific", [])
+    chapter_one_outline_sentence = (
+        "Due to the above introduction, chapter one of this study will focus on historical "
+        "background, problem statement, purpose of the study, objectives of the study outlining "
+        "the general and specific objectives, research questions and hypothesis, significance of "
+        "the study, scope of the study, brief methodology of the study, anticipated limitations and "
+        "delimitation, assumptions of the study, definition of key terms, and summary of chapter one."
+    )
+    custom_outline = None
+    try:
+        from services.outline_parser import outline_parser
+        from services.workspace_service import WORKSPACES_DIR
+
+        outline_path = WORKSPACES_DIR / workspace_id / "outline.json"
+        if outline_path.exists():
+            custom_outline = outline_parser.load_outline(workspace_id)
+            chapter_one_outline = outline_parser.get_chapter_structure(custom_outline, 1)
+            section_list = []
+            if chapter_one_outline and chapter_one_outline.get("sections"):
+                section_list = [
+                    section for section in chapter_one_outline.get("sections", [])
+                    if isinstance(section, str) and section.strip()
+                ]
+            if section_list:
+                section_text = ", ".join(section_list)
+                chapter_one_outline_sentence = (
+                    "Due to the above introduction, chapter one of this study will focus on "
+                    f"{section_text}."
+                )
+    except Exception as e:
+        print(f"⚠️ Could not load custom outline for introduction: {e}")
+
+    plan_outline = custom_outline
+    try:
+        if not plan_outline:
+            outline_path = WORKSPACES_DIR / workspace_id / "outline.json"
+            if outline_path.exists():
+                from services.outline_parser import outline_parser
+                plan_outline = outline_parser.load_outline(workspace_id)
+    except Exception as e:
+        print(f"⚠️ Could not load outline for planner: {e}")
+
+    plan_path, _ = ensure_plan_file(workspace_id, plan_outline, thesis_type)
+
+    async def _update_plan_section(label: str):
+        if not label:
+            return
+        if mark_plan_item(workspace_id, label, cascade=False):
+            await events.publish(
+                job_id,
+                "file_updated",
+                {
+                    "path": str(plan_path.relative_to(WORKSPACES_DIR / workspace_id)),
+                    "full_path": str(plan_path),
+                    "filename": plan_path.name,
+                    "workspace_id": workspace_id,
+                    "type": "markdown"
+                },
+                session_id=session_id
+            )
 
     async def announce(section_id: str, title: str):
         await events.publish(
@@ -54,7 +115,7 @@ async def generate_chapter_one_uoj(
 
 Make about three paragraphs for this Introduction with enough in-text citations (2020-2025, APA style).
 
-Fourth paragraph: outline the structure of chapter one, saying "Due to the above introduction, chapter one of this study will focus on historical background, problem statement, purpose of the study, objectives of the study outlining the general and specific objectives, research questions and hypothesis, significance of the study, scope of the study, brief methodology of the study, anticipated limitations and delimitation, assumptions of the study, definition of key terms, and summary of chapter one."
+Fourth paragraph: outline the structure of chapter one, saying "{chapter_one_outline_sentence}"
 
 NOTE: Current year is 2025. Citations must be between June 2020 to June 2025, APA 7 style.
 **CRITICAL**: Format ALL citations as clickable markdown hyperlinks: [Author et al., Year](https://doi.org/xxxxx)
@@ -69,6 +130,7 @@ Be brief but comprehensive."""
         temperature=0.7,
         max_tokens=800
     )
+    await _update_plan_section("1.0 Introduction to the Study")
     
     # ================================================================
     # SECTION 1.1: BACKGROUND OF THE STUDY
@@ -95,6 +157,7 @@ Be comprehensive with citations at the end of each line/sentence."""
         temperature=0.7,
         max_tokens=1500
     )
+    await _update_plan_section("1.1 Background of the Study")
     
     # ================================================================
     # SECTION 1.2: PROBLEM STATEMENT
@@ -121,6 +184,7 @@ Never say "we" - say "the study" or "the researcher"."""
         temperature=0.7,
         max_tokens=1200
     )
+    await _update_plan_section("1.2 Problem Statement")
     
     # ================================================================
     # SECTION 1.3: PURPOSE OF THE STUDY
@@ -136,6 +200,7 @@ Write in academic and professional tone. Be brief."""
         temperature=0.6,
         max_tokens=200
     )
+    await _update_plan_section("1.3 Purpose of the Study")
     
     # ================================================================
     # SECTIONS 1.4-1.6: OBJECTIVES, QUESTIONS, HYPOTHESIS
@@ -158,6 +223,7 @@ Return ONLY the questions, numbered 1-{len(specific_objectives)+1}. Be brief."""
         temperature=0.5,
         max_tokens=400
     )
+    await _update_plan_section("1.5 Study Questions")
     
     # Generate hypotheses
     hypothesis_prompt = f"""Convert these objectives into hypothesis statements:
@@ -179,6 +245,7 @@ Return ONLY the hypotheses. Be brief."""
         temperature=0.5,
         max_tokens=600
     )
+    await _update_plan_section("1.6 Research Hypothesis")
     
     # ================================================================
     # SECTION 1.7: SIGNIFICANCE OF THE STUDY
@@ -198,6 +265,7 @@ Be detailed and specific to {case_study}."""
         temperature=0.7,
         max_tokens=600
     )
+    await _update_plan_section("1.7 Significance of the Study")
     
     # ================================================================
     # SECTION 1.8: SCOPE OF THE STUDY
@@ -216,6 +284,7 @@ Don't bullet or number. Write in detailed paragraphs."""
         temperature=0.7,
         max_tokens=800
     )
+    await _update_plan_section("1.8 Scope of the Study")
     
     # ================================================================
     # SECTION 1.9: LIMITATIONS OF THE STUDY
@@ -233,6 +302,7 @@ Don't bullet or number. Write in detailed paragraphs."""
         temperature=0.7,
         max_tokens=800
     )
+    await _update_plan_section("1.9 Limitations of the Study")
     
     # ================================================================
     # SECTION 1.11: DELIMITATIONS OF THE STUDY
@@ -247,6 +317,7 @@ Present all in ONE paragraph. Write in academic language."""
         temperature=0.7,
         max_tokens=400
     )
+    await _update_plan_section("1.11 Delimitations of the Study")
     
     # ================================================================
     # SECTION 1.12: THEORETICAL FRAMEWORK
@@ -273,6 +344,7 @@ Be very very detailed."""
         temperature=0.7,
         max_tokens=1500
     )
+    await _update_plan_section("1.12 Theoretical Framework of the Study")
     
     # ================================================================
     # SECTION 1.13: CONCEPTUAL FRAMEWORK
@@ -316,6 +388,7 @@ Designed and Molded by Researcher (2025)"""
         temperature=0.7,
         max_tokens=1200
     )
+    await _update_plan_section("1.13 Conceptual Framework")
     
     # ================================================================
     # SECTION 1.15: DEFINITION OF KEY TERMS
@@ -333,6 +406,7 @@ Where you can't get real good citations, don't cite."""
         temperature=0.7,
         max_tokens=800
     )
+    await _update_plan_section("1.15 Definition of Key Terms")
     
     # ================================================================
     # SECTION 1.16: ORGANIZATION OF THE STUDY
@@ -340,16 +414,33 @@ Where you can't get real good citations, don't cite."""
     await announce("1.16", "Organization of the Study")
     is_phd = thesis_type in ["phd", "uoj_phd"]
     ch_outline = "six chapters" if is_phd else "five chapters"
-    ch6_text = "- Chapter six: Conclusions, recommendations, suggestions for future studies" if is_phd else ""
-    ch5_text = "- Chapter five: Discussions, summary, conclusions, recommendations, suggestions for future studies" if not is_phd else "- Chapter five: Discussions"
-    
+    chapter_lines = []
+
+    try:
+        if custom_outline and custom_outline.get("chapters"):
+            for chapter in custom_outline.get("chapters", []):
+                ch_num = chapter.get("number")
+                ch_title = chapter.get("title")
+                if ch_num and ch_title:
+                    chapter_lines.append(f"- Chapter {ch_num}: {ch_title}")
+    except Exception as e:
+        print(f"⚠️ Could not load custom outline for organisation section: {e}")
+
+    if not chapter_lines:
+        ch6_text = "- Chapter six: Conclusions, recommendations, suggestions for future studies" if is_phd else ""
+        ch5_text = "- Chapter five: Discussions, summary, conclusions, recommendations, suggestions for future studies" if not is_phd else "- Chapter five: Discussions"
+        chapter_lines = [
+            "- Chapter one: Introduction",
+            "- Chapter two: Literature review",
+            "- Chapter three: Methodology",
+            "- Chapter four: Data analysis, presentation and interpretations of findings",
+            ch5_text,
+            ch6_text
+        ]
+        chapter_lines = [line for line in chapter_lines if line]
+
     organization_prompt = f"""Write Organisation of the study which will be guided in {ch_outline}:
-- Chapter one: Introduction
-- Chapter two: Literature review
-- Chapter three: Methodology
-- Chapter four: Data analysis, presentation and interpretations of findings
-{ch5_text}
-{ch6_text}
+{chr(10).join(chapter_lines)}
 
 Write in context of {topic} in {case_study}.
 Be brief and academic."""
@@ -359,6 +450,7 @@ Be brief and academic."""
         temperature=0.6,
         max_tokens=400
     )
+    await _update_plan_section("1.16 Organization of the Study")
     
     # ================================================================
     # ASSEMBLE CHAPTER 1

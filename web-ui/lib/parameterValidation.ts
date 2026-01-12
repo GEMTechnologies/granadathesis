@@ -64,6 +64,16 @@ export function validateThesisParameters(params: ThesisParameters): ValidationRe
         warnings.push('Research topic seems very short. Consider providing more detail.');
     }
 
+    if (params.generalObjective && params.generalObjective.trim().length < 10) {
+        warnings.push('General objective seems very short. Consider providing more detail.');
+    }
+
+    if (params.specificObjectives && params.specificObjectives.length > 0) {
+        if (params.specificObjectives.length === 1) {
+            warnings.push('Only one specific objective provided. Consider adding more.');
+        }
+    }
+
     // Sample size
     const sampleSizeValidation = validateRange(
         params.sampleSize,
@@ -156,6 +166,81 @@ export function validateThesisParameters(params: ThesisParameters): ValidationRe
         );
         if (!fgdValidation.isValid) {
             errors.push(fgdValidation.error!);
+        }
+    }
+
+    // Chapter 2 paragraphs per section
+    if (params.chapter2Paragraphs !== undefined) {
+        const chapter2Validation = validateRange(
+            params.chapter2Paragraphs,
+            DEFAULT_CONSTRAINTS.chapter2Paragraphs.min,
+            DEFAULT_CONSTRAINTS.chapter2Paragraphs.max,
+            'Chapter 2 paragraphs per section'
+        );
+        if (!chapter2Validation.isValid) {
+            errors.push(chapter2Validation.error!);
+        }
+    }
+
+    if (params.chapter2ParagraphPlan) {
+        const plan = params.chapter2ParagraphPlan;
+        const entries: Array<[string, number | undefined, string]> = [
+            ['intro', plan.intro, 'Chapter 2 introduction paragraphs'],
+            ['frameworkIntro', plan.frameworkIntro, 'Framework introduction paragraphs'],
+            ['theoryPerObjective', plan.theoryPerObjective, 'Theory paragraphs per objective'],
+            ['conceptualFramework', plan.conceptualFramework, 'Conceptual framework paragraphs'],
+            ['empiricalIntro', plan.empiricalIntro, 'Empirical introduction paragraphs'],
+            ['empiricalPerVariable', plan.empiricalPerVariable, 'Empirical paragraphs per variable'],
+            ['gap', plan.gap, 'Research gap paragraphs']
+        ];
+        for (const [, value, label] of entries) {
+            if (value !== undefined) {
+                const planValidation = validateRange(
+                    value,
+                    DEFAULT_CONSTRAINTS.chapter2Paragraphs.min,
+                    DEFAULT_CONSTRAINTS.chapter2Paragraphs.max,
+                    label
+                );
+                if (!planValidation.isValid) {
+                    errors.push(planValidation.error!);
+                }
+            }
+        }
+    }
+
+    if (params.targetPages !== undefined) {
+        const targetPagesValidation = validateRange(
+            params.targetPages,
+            DEFAULT_CONSTRAINTS.targetPages.min,
+            DEFAULT_CONSTRAINTS.targetPages.max,
+            'Target pages'
+        );
+        if (!targetPagesValidation.isValid) {
+            errors.push(targetPagesValidation.error!);
+        }
+    }
+
+    if (params.wordsPerPage !== undefined) {
+        const wordsPerPageValidation = validateRange(
+            params.wordsPerPage,
+            DEFAULT_CONSTRAINTS.wordsPerPage.min,
+            DEFAULT_CONSTRAINTS.wordsPerPage.max,
+            'Words per page'
+        );
+        if (!wordsPerPageValidation.isValid) {
+            errors.push(wordsPerPageValidation.error!);
+        }
+    }
+
+    if (params.targetWordCount !== undefined) {
+        const targetWordCountValidation = validateRange(
+            params.targetWordCount,
+            DEFAULT_CONSTRAINTS.targetWordCount.min,
+            DEFAULT_CONSTRAINTS.targetWordCount.max,
+            'Target word count'
+        );
+        if (!targetWordCountValidation.isValid) {
+            errors.push(targetWordCountValidation.error!);
         }
     }
 

@@ -62,7 +62,8 @@ class ThesisCombiner:
         supervisor_name: str = "[Supervisor Name]",
         university: str = "University of Juba",
         department: str = "Department/Faculty",
-        degree: str = "Doctor of Philosophy (PhD)"
+        degree: str = "Doctor of Philosophy (PhD)",
+        custom_outline: Optional[Dict[str, Any]] = None
     ):
         """
         Initialise thesis combiner.
@@ -94,7 +95,121 @@ class ThesisCombiner:
         self.supervisor_name = supervisor_name
         self.university = university
         self.department = department
+        if custom_outline and isinstance(custom_outline, dict):
+            outline_degree = custom_outline.get("thesis_type")
+            if outline_degree and degree == "Doctor of Philosophy (PhD)":
+                degree = outline_degree
         self.degree = degree
+        self.custom_outline = custom_outline
+        self.chapter_order: List[Tuple[int, str]] = self._build_chapter_order()
+
+    def _degree_slug(self) -> str:
+        """Create a short degree label for filenames."""
+        if not self.degree:
+            return "Thesis"
+        match = re.search(r"\(([^)]+)\)", self.degree)
+        label = match.group(1).strip() if match else self.degree
+        label = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+        return label or "Thesis"
+
+    def _build_chapter_order(self) -> List[Tuple[int, str]]:
+        """Determine chapter order and titles from a custom outline if provided."""
+        if self.custom_outline and isinstance(self.custom_outline, dict):
+            chapters = []
+            for idx, chapter in enumerate(self.custom_outline.get("chapters", []), 1):
+                number = chapter.get("number") or idx
+                try:
+                    number = int(number)
+                except (TypeError, ValueError):
+                    number = idx
+                title = chapter.get("title") or f"Chapter {number}"
+                chapters.append((number, title))
+            if chapters:
+                return chapters
+        return [(num, f"Chapter {num}") for num in range(1, 7)]
+
+    def _format_authors(self, authors: list) -> str:
+        if not authors:
+            return "Unknown Author"
+        names = []
+        for author in authors:
+            if isinstance(author, dict):
+                name = str(author.get("name", "")).strip()
+            else:
+                name = str(author).strip()
+            if not name:
+                continue
+            parts = name.split()
+            if len(parts) == 1:
+                names.append(parts[0])
+            else:
+                last = parts[-1]
+                initials = " ".join([p[0] + "." for p in parts[:-1] if p])
+                names.append(f"{last}, {initials}".strip())
+        if not names:
+            return "Unknown Author"
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return f"{names[0]}, & {names[1]}"
+        if len(names) > 20:
+            return ", ".join(names[:19]) + ", ... " + names[-1]
+        return ", ".join(names[:-1]) + ", & " + names[-1]
+
+    def _build_references_from_sources(self) -> List[str]:
+        try:
+            from services.sources_service import SourcesService
+            sources_service = SourcesService()
+            sources_index = sources_service._load_index(self.workspace_id)
+            sources = sources_index.get("sources", []) if isinstance(sources_index, dict) else []
+        except Exception as exc:
+            print(f"⚠️ Could not load sources index: {exc}")
+            sources = []
+
+        if not sources:
+            return []
+
+        def sort_key(source: dict) -> str:
+            authors = source.get("authors") or []
+            if authors:
+                if isinstance(authors[0], dict):
+                    name = str(authors[0].get("name", "")).strip()
+                else:
+                    name = str(authors[0]).strip()
+                return name.lower()
+            return "unknown"
+
+        entries = []
+        for source in sorted(sources, key=sort_key):
+            authors_text = self._format_authors(source.get("authors") or [])
+            year = source.get("year") or "n.d."
+            title_text = source.get("title") or "Untitled"
+            venue = source.get("venue") or ""
+            doi = source.get("doi") or ""
+            url = source.get("url") or ""
+            if doi and not url:
+                url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+            entry = f"{authors_text} ({year}). *{title_text}*."
+            if venue:
+                entry += f" {venue}."
+            if url:
+                entry += f" {url}"
+            entries.append(entry)
+
+        return entries
+
+    def _load_latest_text(self, directory: Path, patterns: List[str]) -> str:
+        matches = []
+        if directory.exists():
+            for pattern in patterns:
+                matches.extend(list(directory.glob(pattern)))
+        if not matches:
+            return ""
+        latest = max(matches, key=lambda p: p.stat().st_mtime)
+        try:
+            return latest.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
     
     def load_chapters_from_files(self) -> bool:
         """
@@ -106,13 +221,18 @@ class ThesisCombiner:
         print("📖 Loading chapters from workspace...")
         
         chapters_found = 0
-        for ch_num in range(1, 7):
-            # Search for chapter files (both patterns)
-            chapter_files = (
-                list(self.workspace_dir.glob(f"Chapter_{ch_num}*.md")) +
-                list(self.workspace_dir.glob(f"chapter_{ch_num}*.md")) +
-                list(self.workspace_dir.glob(f"Chapter_{ch_num}_*.md"))
-            )
+        for ch_num, outline_title in self.chapter_order:
+            # Search for chapter files (workspace root + chapters subdir)
+            search_dirs = [self.workspace_dir]
+            chapters_dir = self.workspace_dir / "chapters"
+            if chapters_dir.exists():
+                search_dirs.append(chapters_dir)
+
+            chapter_files = []
+            for base_dir in search_dirs:
+                chapter_files.extend(list(base_dir.glob(f"Chapter_{ch_num}*.md")))
+                chapter_files.extend(list(base_dir.glob(f"chapter_{ch_num}*.md")))
+                chapter_files.extend(list(base_dir.glob(f"Chapter_{ch_num}_*.md")))
             
             if chapter_files:
                 filepath = chapter_files[0]  # Use first match
@@ -122,7 +242,7 @@ class ThesisCombiner:
                     
                     # Extract chapter title
                     title_match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
-                    title = title_match.group(1) if title_match else f"Chapter {ch_num}"
+                    title = title_match.group(1) if title_match else outline_title
                     
                     # Count words
                     word_count = len(content.split())
@@ -225,27 +345,26 @@ class ThesisCombiner:
         
         logo_markdown = ""
         if "juba" in self.university.lower():
-            logo_path = "/home/gemtech/Desktop/thesis/backend/lightweight/uoj_logo.png"
-            logo_markdown = f"![{self.university} LOGO]({logo_path})\n\n"
+            logo_source = Path(__file__).parent.parent / "uoj_logo.png"
+            try:
+                logo_dest = self.workspace_dir / "uoj_logo.png"
+                if logo_source.exists() and not logo_dest.exists():
+                    logo_dest.write_bytes(logo_source.read_bytes())
+                if logo_dest.exists():
+                    logo_markdown = f"![{self.university} LOGO](uoj_logo.png)\n\n"
+            except Exception as logo_err:
+                print(f"⚠️ Could not prepare logo: {logo_err}")
         
         preliminaries = f"""
 {'='*80}
 PRELIMINARY PAGES
 {'='*80}
 
-<div style="text-align: center;">
-
 {logo_markdown}# {self.topic.upper()}
-
-&nbsp;
 
 **BY**
 
-&nbsp;
-
 ### {self.student_name}
-
-&nbsp;
 
 ---
 
@@ -258,8 +377,6 @@ PRELIMINARY PAGES
 **Date:** {submission_date}
 
 ---
-
-</div>
 
 {'='*80}
 
@@ -361,7 +478,8 @@ This thesis investigates {self.topic.lower()} within the context of {self.case_s
 """
         
         # Add chapters with section headings
-        for ch_num in sorted(self.chapters.keys()):
+        ordered_numbers = [num for num, _ in self.chapter_order if num in self.chapters]
+        for ch_num in ordered_numbers:
             chapter = self.chapters[ch_num]
             toc += f"### {chapter.title}\n"
             
@@ -393,6 +511,18 @@ This thesis investigates {self.topic.lower()} within the context of {self.case_s
         self.all_references = self.extract_all_references()
         
         if not self.all_references:
+            source_entries = self._build_references_from_sources()
+            if source_entries:
+                refs_text = f"""
+
+{'='*80}
+# REFERENCES
+{'='*80}
+
+"""
+                refs_text += "\n\n".join(source_entries)
+                refs_text += f"\n\n---\n**Total References:** {len(source_entries)}\n"
+                return refs_text
             return """
 
 {'='*80}
@@ -427,44 +557,50 @@ No references extracted.
     
     def generate_appendices(self) -> str:
         """Generate appendices section."""
-        
+        study_tools_dir = self.workspace_dir / "study_tools"
+        questionnaire_text = self._load_latest_text(study_tools_dir, ["Questionnaire*.md"])
+        interview_text = self._load_latest_text(study_tools_dir, ["Interview_Guide*.md"])
+        fgd_text = self._load_latest_text(study_tools_dir, ["FGD_Guide*.md", "FGD*.md"])
+        observation_text = self._load_latest_text(study_tools_dir, ["Observation_Checklist*.md", "Observation*.md"])
+
+        datasets_dir = self.workspace_dir / "datasets"
+        dataset_files = []
+        if datasets_dir.exists():
+            dataset_files = [p.name for p in datasets_dir.glob("*.*") if p.is_file()]
+
         appendices = f"""
 
 {'='*80}
 # APPENDICES
 {'='*80}
 
-## Appendix A: Research Instruments
+## Appendix A: Research Questionnaire
 
-### A.1 Questionnaire
-[Attach questionnaire used for data collection]
-
-### A.2 Interview Guide
-[Attach interview guide if applicable]
+{questionnaire_text or "[Questionnaire not generated]"}
 
 ---
 
-## Appendix B: Ethical Clearance
+## Appendix B: Interview Guide
 
-[Attach ethical clearance certificate]
-
----
-
-## Appendix C: Raw Data Summary
-
-[Summary tables of raw data if applicable]
+{interview_text or "[Interview guide not generated]"}
 
 ---
 
-## Appendix D: Additional Statistical Outputs
+## Appendix C: Focus Group Discussion Guide
 
-[Additional SPSS/statistical outputs if applicable]
+{fgd_text or "[FGD guide not generated]"}
 
 ---
 
-## Appendix E: Map of Study Area
+## Appendix D: Observation Checklist
 
-[Map showing {self.case_study} if applicable]
+{observation_text or "[Observation checklist not generated]"}
+
+---
+
+## Appendix E: Raw Data Files
+
+{'\n'.join([f"- {name}" for name in dataset_files]) if dataset_files else "[No datasets found]"}
 
 ---
 
@@ -519,7 +655,7 @@ No references extracted.
 
 **Document Structure:**
 - Preliminary Pages: Declaration, Approval, Dedication, Acknowledgements, Abstract, TOC
-- Main Body: Chapters 1-6
+- Main Body: Chapters 1-{len(self.chapters)}
 - Back Matter: References, Appendices
 
 ---
@@ -528,7 +664,8 @@ No references extracted.
         
         # Save to file
         safe_topic = re.sub(r'[^\w\s-]', '', self.topic)[:50].replace(' ', '_')
-        filename = f"Complete_PhD_Thesis_{safe_topic}_{self.timestamp}.md"
+        degree_label = self._degree_slug()
+        filename = f"Complete_{degree_label}_Thesis_{safe_topic}_{self.timestamp}.md"
         filepath = Path(self.output_dir) / filename
         
         with open(filepath, 'w', encoding='utf-8') as f:

@@ -8,7 +8,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 interface FilePreviewPanelProps {
-    file: { name: string; path: string; type: string } | null;
+    file: { name: string; path: string; type: string; refreshedAt?: number } | null;
     onClose: () => void;
     workspaceId: string;
     browserAction?: {
@@ -81,7 +81,7 @@ export function FilePreviewPanel({ file, onClose, workspaceId, browserAction }: 
             setIsEditing(false);
             setSpreadsheetData(null);
         }
-    }, [file]);
+    }, [file?.name, file?.path, file?.type, file?.refreshedAt, browserAction]);
 
     // Close download menu when clicking outside
     useEffect(() => {

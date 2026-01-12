@@ -14,7 +14,7 @@ Target: 30 pages in under 60 seconds
 import asyncio
 import json
 import uuid
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -351,6 +351,15 @@ class ResearchSwarm:
     def __init__(self, state: ChapterState):
         self.state = state
         try:
+            self._min_abstract_chars = int(os.getenv("ABSTRACT_MIN_CHARS", "80"))
+        except ValueError:
+            self._min_abstract_chars = 80
+        try:
+            self._min_relevance_score = float(os.getenv("ABSTRACT_RELEVANCE_MIN_SCORE", "0.08"))
+        except ValueError:
+            self._min_relevance_score = 0.08
+        self._relevance_keywords: Optional[set] = None
+        try:
             max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
         except ValueError:
             max_concurrency = 4
@@ -374,11 +383,81 @@ class ResearchSwarm:
         else:
             self._citation_lock = asyncio.Lock()
             self.state.parameters["citation_lock"] = self._citation_lock
-        try:
-            self._section_stagger_seconds = float(os.getenv("LLM_SECTION_STAGGER_SECONDS", "0.2"))
-        except ValueError:
-            self._section_stagger_seconds = 0.2
-    
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r"[a-z0-9]+", text.lower())
+
+    def _get_relevance_keywords(self) -> set:
+        if self._relevance_keywords:
+            return self._relevance_keywords
+
+        stopwords = {
+            "the", "and", "for", "with", "from", "that", "this", "these", "those",
+            "into", "over", "under", "about", "between", "among", "within", "without",
+            "study", "studies", "research", "analysis", "review", "case", "cases",
+            "impact", "effects", "effect", "system", "systems", "data", "method",
+            "methods", "results", "finding", "findings", "approach", "approaches",
+            "issue", "issues", "factor", "factors", "model", "models"
+        }
+
+        raw_terms = [
+            self.state.topic,
+            self.state.case_study,
+            self.state.parameters.get("country", ""),
+        ]
+
+        objectives = []
+        if isinstance(self.state.objectives, dict):
+            objectives = self.state.objectives.get("specific", []) or []
+        elif isinstance(self.state.objectives, list):
+            objectives = self.state.objectives
+        raw_terms.extend([str(obj) for obj in objectives])
+
+        keywords = set()
+        for term in raw_terms:
+            if not term:
+                continue
+            for token in self._tokenize(str(term)):
+                if len(token) >= 3 and token not in stopwords:
+                    keywords.add(token)
+
+        self._relevance_keywords = keywords
+        return keywords
+
+    def _score_relevance(self, result: ResearchResult, keywords: set) -> float:
+        if not result.abstract:
+            return 0.0
+        if not keywords:
+            return 1.0
+        title_tokens = set(self._tokenize(result.title or ""))
+        abstract_tokens = set(self._tokenize(result.abstract or ""))
+        title_hits = len(title_tokens & keywords)
+        abstract_hits = len(abstract_tokens & keywords)
+        base_score = (abstract_hits + (2 * title_hits)) / max(1, len(keywords))
+        recency_bonus = 0.05 if result.year and result.year >= (datetime.now().year - 5) else 0.0
+        return min(1.0, base_score + recency_bonus)
+
+    def _is_result_acceptable(self, result: ResearchResult, min_score: Optional[float] = None, min_chars: Optional[int] = None) -> Tuple[bool, float]:
+        if not result.title or not result.authors or not result.year:
+            return False, 0.0
+        min_chars = min_chars if min_chars is not None else self._min_abstract_chars
+        abstract = (result.abstract or "").strip()
+        if len(abstract) < min_chars:
+            return False, 0.0
+        keywords = self._get_relevance_keywords()
+        score = self._score_relevance(result, keywords)
+        threshold = min_score if min_score is not None else self._min_relevance_score
+        return score >= threshold, score
+
+    def _filter_research_results(self, results: List[ResearchResult], min_score: float, min_chars: int) -> List[ResearchResult]:
+        scored_results: List[Tuple[float, ResearchResult]] = []
+        for result in results:
+            accepted, score = self._is_result_acceptable(result, min_score=min_score, min_chars=min_chars)
+            if accepted:
+                scored_results.append((score, result))
+        scored_results.sort(key=lambda item: item[0], reverse=True)
+        return [result for _, result in scored_results]
+
     async def search_all(self) -> Dict[str, List[ResearchResult]]:
         """Run all search agents in parallel."""
         await events.connect()
@@ -534,33 +613,60 @@ class ResearchSwarm:
         
         await self._include_uploaded_sources(unique_results, seen_identifiers)
 
+        # Filter results to ensure abstracts are present and relevant
+        min_score = self._min_relevance_score
+        min_chars = self._min_abstract_chars
+        filtered_results = self._filter_research_results(unique_results, min_score, min_chars)
+
+        if len(filtered_results) < target_min:
+            relaxed_score = max(0.0, min_score * 0.5)
+            relaxed_chars = max(40, min_chars // 2)
+            filtered_results = self._filter_research_results(unique_results, relaxed_score, relaxed_chars)
+            self._min_relevance_score = relaxed_score
+            self._min_abstract_chars = relaxed_chars
+
+        if not filtered_results:
+            filtered_results = [
+                result for result in unique_results
+                if len((result.abstract or "").strip()) >= min_chars
+            ]
+
+        filtered_out = len(unique_results) - len(filtered_results)
+        if filtered_out > 0:
+            await events.publish(
+                self.state.job_id,
+                "log",
+                {"message": f"🧪 Filtered out {filtered_out} papers without usable abstracts or low relevance."},
+                session_id=self.state.session_id
+            )
+
         # Store in state for citation tracking
-        self.state.chapter2_citation_pool = unique_results
+        self.state.chapter2_citation_pool = filtered_results
         
         await events.publish(
             self.state.job_id,
             "log",
-            {"message": f"✅ Found {len(unique_results)} unique studies for Chapter 2 (target: 70-100 to be used)"},
+            {"message": f"✅ Accepted {len(filtered_results)} studies with validated abstracts (target: 70-100 to be used)"},
             session_id=self.state.session_id
         )
         
         # Distribute research to scopes for backward compatibility
         # But we'll use the citation pool for actual writing
         # Ensure division doesn't result in empty lists if unique_results is small
-        num_results = len(unique_results)
+        num_results = len(filtered_results)
         q1 = num_results // 4
         q2 = num_results // 2
         q3 = 3 * num_results // 4
 
         self.state.research = {
-            "global": unique_results[:q1],
-            "continental": unique_results[q1:q2],
-            "national": unique_results[q2:q3],
-            "local": unique_results[q3:],
+            "global": filtered_results[:q1],
+            "continental": filtered_results[q1:q2],
+            "national": filtered_results[q2:q3],
+            "local": filtered_results[q3:],
         }
         
         # Count total papers for the final message
-        total = len(unique_results)
+        total = len(filtered_results)
 
         await events.publish(
             self.state.job_id,
@@ -804,6 +910,325 @@ class WriterSwarm:
         else:
             self._citation_lock = asyncio.Lock()
             self.state.parameters["citation_lock"] = self._citation_lock
+
+    def _load_custom_outline(self) -> Optional[Dict]:
+        """Load outline.json if present; avoid default outline fallback."""
+        thesis_type = (self.state.parameters.get("thesis_type") or "").lower()
+        if thesis_type not in ("general", "uoj_general") and not self.state.parameters.get("use_custom_outline"):
+            return None
+        cached = self.state.parameters.get("custom_outline")
+        if isinstance(cached, dict):
+            return cached
+        if not self.state.workspace_id:
+            return None
+        try:
+            from services.workspace_service import WORKSPACES_DIR
+            from services.outline_parser import outline_parser
+            outline_path = WORKSPACES_DIR / (self.state.workspace_id or "default") / "outline.json"
+            if outline_path.exists():
+                outline = outline_parser.load_outline(self.state.workspace_id)
+                if isinstance(outline, dict):
+                    self.state.parameters["custom_outline"] = outline
+                    return outline
+        except Exception as exc:
+            print(f"⚠️ Could not load custom outline: {exc}")
+        return None
+
+    def _parse_outline_section(self, section: Any, fallback_index: int) -> Tuple[str, str, Dict[str, Any]]:
+        """Parse outline section entry into id/title with optional metadata."""
+        meta: Dict[str, Any] = {}
+        raw_id: Optional[str] = None
+        raw_title: Optional[str] = None
+
+        if isinstance(section, dict):
+            meta = dict(section)
+            raw_id = str(meta.pop("id", "") or meta.pop("number", "") or meta.pop("section", "")).strip() or None
+            raw_title = str(meta.pop("title", "") or meta.pop("name", "")).strip() or None
+            if raw_title is None and raw_id is None:
+                raw_title = str(section)
+        else:
+            raw_title = str(section).strip()
+
+        if not raw_title and raw_id:
+            return raw_id, f"Section {raw_id}", meta
+        if not raw_title and not raw_id:
+            return f"{self.state.chapter_number}.{fallback_index}", f"Section {fallback_index}", meta
+
+        match = re.match(r"^\s*(\d+(?:\.\d+)*)\s*(?:[-:]\s*|\s+)?(.+)?$", raw_title or "")
+        if match:
+            section_id = match.group(1)
+            title = (match.group(2) or "").strip() or f"Section {section_id}"
+            return section_id, title, meta
+
+        if raw_id:
+            return raw_id, raw_title or f"Section {raw_id}", meta
+
+        return f"{self.state.chapter_number}.{fallback_index}", raw_title or f"Section {fallback_index}", meta
+
+    def _infer_outline_section_config(
+        self,
+        section_id: str,
+        title: str,
+        chapter_num: int,
+        chapter_count: int
+    ) -> Dict[str, Any]:
+        """Infer a reasonable section config based on outline labels."""
+        lower = title.lower()
+        config = {
+            "id": section_id,
+            "title": title,
+            "paragraphs": 2,
+            "sources": [],
+            "needs_citations": True,
+            "style": "synthesis",
+        }
+
+        if "background" in lower:
+            config.update(
+                paragraphs=6,
+                sources=["global", "continental", "regional", "national", "local"],
+                needs_citations=True,
+                style="general_background",
+                structure="inverted_pyramid",
+            )
+            return config
+
+        if "problem statement" in lower or "statement of the problem" in lower:
+            config.update(paragraphs=3, sources=["national", "local"], needs_citations=True, style="problem_statement")
+            return config
+
+        if "introduction" in lower:
+            if chapter_num == 2:
+                config.update(paragraphs=2, needs_citations=False, style="lit_intro")
+            elif chapter_num == 3:
+                config.update(paragraphs=2, needs_citations=False, style="methodology_intro")
+            else:
+                config.update(paragraphs=3, needs_citations=True, style="general_intro")
+            return config
+
+        if "objective" in lower and "specific" not in lower and "general" not in lower:
+            config.update(paragraphs=1, needs_citations=False, style="objectives_intro")
+            return config
+
+        if "general objective" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="objective")
+            return config
+
+        if "specific objective" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="objectives_list_smart")
+            return config
+
+        if "research question" in lower or "study question" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="questions")
+            return config
+
+        if "hypoth" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="hypothesis")
+            return config
+
+        if "significance" in lower:
+            config.update(paragraphs=2, needs_citations=False, style="significance")
+            return config
+
+        if "scope" in lower:
+            config.update(paragraphs=3, needs_citations=False, style="scope_detail")
+            return config
+
+        if "limitation" in lower:
+            config.update(paragraphs=2, needs_citations=False, style="limitations")
+            return config
+
+        if "delimitation" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="delimitations")
+            return config
+
+        if "definition" in lower:
+            config.update(paragraphs=4, needs_citations=True, style="definitions_gen")
+            return config
+
+        if "organisation of the study" in lower or "organization of the study" in lower:
+            style = "organization_5chapter" if chapter_count <= 5 else "organization_6chapter"
+            config.update(paragraphs=2, needs_citations=False, style=style)
+            return config
+
+        if chapter_num == 2:
+            if "theoretical review" in lower or "theoretical reviews" in lower:
+                config.update(paragraphs=1, sources=["theories"], needs_citations=True, style="framework_intro")
+                return config
+            if "theory" in lower and "general" in lower:
+                config.update(paragraphs=4, sources=["theories"], needs_citations=True, style="general_theory_main")
+                return config
+            if "theoretical framework" in lower:
+                config.update(paragraphs=4, sources=["theories"], needs_citations=True, style="general_theory_obj")
+                return config
+            if "theoretical" in lower:
+                config.update(paragraphs=4, sources=["theories"], needs_citations=True, style="general_theory_main")
+                return config
+            if "empirical" in lower:
+                config.update(paragraphs=4, sources=["all"], needs_citations=True, style="general_empirical")
+                return config
+            if "references for chapter two" in lower:
+                config.update(paragraphs=1, sources=[], needs_citations=False, style="chapter_references_notice")
+                return config
+            if "conceptual framework" in lower:
+                config.update(paragraphs=3, sources=["theories"], needs_citations=True, style="conceptual_framework")
+                return config
+            if "research gap" in lower or "gap" in lower:
+                config.update(paragraphs=3, sources=["all"], needs_citations=True, style="literature_gap")
+                return config
+            if "summary" in lower:
+                config.update(paragraphs=1, needs_citations=False, style="general_lit_summary")
+                return config
+
+        if chapter_num == 3:
+            if "research design" in lower:
+                config.update(paragraphs=3, sources=["methodology"], needs_citations=True, style="research_design")
+                return config
+            if "data sources" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="data_sources")
+                return config
+            if "primary data" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="primary_data_sources")
+                return config
+            if "secondary data" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="secondary_data_sources")
+                return config
+            if "target population" in lower:
+                config.update(paragraphs=3, sources=["methodology", "local"], needs_citations=True, style="target_population")
+                return config
+            if "sample size" in lower:
+                config.update(paragraphs=3, sources=["methodology"], needs_citations=True, style="sample_size")
+                return config
+            if "sampling" in lower:
+                config.update(paragraphs=3, sources=["methodology"], needs_citations=True, style="sampling_procedures")
+                return config
+            if "data collection" in lower and "instrument" in lower:
+                config.update(paragraphs=3, sources=["methodology"], needs_citations=True, style="data_instruments")
+                return config
+            if "data collection" in lower and "procedure" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="data_procedures")
+                return config
+            if "validity" in lower or "reliability" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="validity_reliability")
+                return config
+            if "data analysis" in lower:
+                config.update(paragraphs=3, sources=["methodology", "data_analysis"], needs_citations=True, style="data_analysis")
+                return config
+            if "ethical" in lower:
+                config.update(paragraphs=2, sources=["methodology"], needs_citations=True, style="ethical_considerations")
+                return config
+
+        if "summary" in lower:
+            config.update(paragraphs=1, needs_citations=False, style="standard")
+            return config
+
+        return config
+
+    def _build_outline_section_configs(self, outline: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert custom outline chapter sections into writer configs."""
+        if not outline or not isinstance(outline, dict):
+            return []
+
+        chapters = outline.get("chapters", [])
+        chapter_num = self.state.chapter_number
+        chapter_count = len(chapters)
+        chapter = next((ch for ch in chapters if ch.get("number") == chapter_num), None)
+        if not chapter:
+            return []
+        sections = chapter.get("sections", [])
+        if not isinstance(sections, list) or not sections:
+            return []
+
+        objective_list: List[str] = []
+        if chapter_num == 2:
+            objective_list = self._get_objective_list(max_items=6)
+
+            empirical_sections = []
+            has_empirical_subsections = False
+            for idx, section in enumerate(sections, start=1):
+                sec_id, title, _meta = self._parse_outline_section(section, idx)
+                title_lower = (title or "").lower()
+                if "empirical" in title_lower:
+                    empirical_sections.append((idx, sec_id, title, section))
+                    if "objective" in title_lower or re.match(r"^2\.3\.\d+", sec_id or ""):
+                        has_empirical_subsections = True
+
+            if len(empirical_sections) == 1 and objective_list and not has_empirical_subsections:
+                idx, sec_id, title, _section = empirical_sections[0]
+                base_id = sec_id or f"{chapter_num}.{idx}"
+                expanded_sections: List[Any] = []
+                for j, section in enumerate(sections, start=1):
+                    if j == idx:
+                        expanded_sections.append({
+                            "id": base_id,
+                            "title": title,
+                            "style": "empirical_intro",
+                            "paragraphs": 2,
+                            "sources": ["all"],
+                            "needs_citations": True
+                        })
+                        for obj_idx, objective in enumerate(objective_list, start=1):
+                            clean_obj = re.sub(r'^(to|To)\s+(assess|examine|analyze|analyse|evaluate|investigate|determine|study|explore)\s+', '', objective).strip()
+                            short_obj = " ".join(clean_obj.split()[:8]) if clean_obj else f"Objective {obj_idx}"
+                            expanded_sections.append({
+                                "id": f"{base_id}.{obj_idx}",
+                                "title": f"Empirical Review for Objective {obj_idx}: {short_obj}",
+                                "style": "lit_synthesis",
+                                "objective_text": objective,
+                                "paragraphs": 3,
+                                "sources": ["all"],
+                                "needs_citations": True
+                            })
+                    else:
+                        expanded_sections.append(section)
+                sections = expanded_sections
+
+        configs: List[Dict[str, Any]] = []
+        for idx, section in enumerate(sections, start=1):
+            section_id, title, meta = self._parse_outline_section(section, idx)
+            section_config = self._infer_outline_section_config(section_id, title, chapter_num, chapter_count)
+            for key in ("paragraphs", "sources", "needs_citations", "style", "structure", "prompt", "prompt_template", "notes"):
+                if key in meta and meta[key] is not None:
+                    section_config[key] = meta[key]
+            if chapter_num == 2 and section_config.get("style") == "general_empirical" and objective_list:
+                if not section_config.get("objective_text"):
+                    section_config["objective_text"] = "\n".join(
+                        [f"{i + 1}. {obj}" for i, obj in enumerate(objective_list)]
+                    )
+                if "paragraphs" not in meta:
+                    target_paragraphs = min(8, max(section_config.get("paragraphs", 2), len(objective_list) * 2))
+                    section_config["paragraphs"] = target_paragraphs
+            if chapter_num == 2 and objective_list:
+                title_lower = (title or "").lower()
+                if section_config.get("style") == "general_theory_obj":
+                    match = re.search(r"\bframework\s*(\d+)\b", title_lower)
+                    if match:
+                        idx = int(match.group(1))
+                        if idx == 1 and len(objective_list) >= 2:
+                            section_config["objective_text"] = "\n".join(objective_list[:2])
+                        elif idx == 2 and len(objective_list) >= 3:
+                            section_config["objective_text"] = objective_list[2]
+                        else:
+                            section_config["objective_text"] = objective_list[min(idx - 1, len(objective_list) - 1)]
+                if "empirical" in title_lower:
+                    match = re.search(r"\bempirical\s*(\d+)\b", title_lower)
+                    if match:
+                        idx = int(match.group(1))
+                        if 1 <= idx <= len(objective_list):
+                            section_config["objective_text"] = objective_list[idx - 1]
+            configs.append(section_config)
+
+        try:
+            group_size = int(os.getenv("OUTLINE_SECTION_GROUP_SIZE", "3"))
+        except ValueError:
+            group_size = 3
+        if group_size <= 0:
+            group_size = len(configs)
+
+        grouped: List[Dict[str, Any]] = []
+        for i in range(0, len(configs), group_size):
+            grouped.append({"id": f"outline_writer_{i // group_size + 1}", "sections": configs[i:i + group_size]})
+        return grouped
     
     # -------------------------------------------------------------------------
     # GENERAL THESIS (5-CHAPTER) FORMAT CONFIGURATIONS
@@ -813,7 +1238,7 @@ class WriterSwarm:
         {
             "id": "gen_intro",
             "sections": [
-                {"id": "1.0", "title": "Introduction to the Study", "paragraphs": 4, "sources": [], "needs_citations": True, "style": "general_intro"},
+                {"id": "1.0", "title": "Introduction to the Study", "paragraphs": 4, "sources": ["global", "continental", "national", "local"], "needs_citations": True, "style": "general_intro"},
                 {"id": "1.1", "title": "Background of the Study", "paragraphs": 6, "sources": ["global", "continental", "regional", "national", "local"], "structure": "inverted_pyramid", "needs_citations": True, "style": "general_background"},
             ]
         },
@@ -972,6 +1397,16 @@ class WriterSwarm:
             await events.publish(self.state.job_id, "log", {"message": "📝 Using General Thesis Structure (5 Chapters)"}, session_id=self.state.session_id)
         else:
             configs = self.SECTION_CONFIGS
+        custom_outline = self._load_custom_outline()
+        outline_configs = self._build_outline_section_configs(custom_outline)
+        if outline_configs:
+            configs = outline_configs
+            await events.publish(
+                self.state.job_id,
+                "log",
+                {"message": f"🧭 Using custom outline sections for Chapter {self.state.chapter_number}"},
+                session_id=self.state.session_id
+            )
         
         # Calculate total sections for progress tracking
         total_sections = sum(len(config["sections"]) for config in configs)
@@ -1057,7 +1492,7 @@ class WriterSwarm:
         
         # Run all in parallel (but staggered start)
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Aggregate
         for config, result in zip(configs, results):  # Use dynamic configs
             if isinstance(result, Exception):
@@ -1065,6 +1500,25 @@ class WriterSwarm:
             elif result:
                 for section_id, content in result.items():
                     self.state.sections[section_id] = content
+
+        # Ensure every expected section is present (avoid missing outline entries)
+        expected_sections = [sec["id"] for cfg in configs for sec in cfg.get("sections", [])]
+        section_titles = {
+            sec["id"]: sec.get("title", f"Section {sec['id']}")
+            for cfg in configs
+            for sec in cfg.get("sections", [])
+            if sec.get("id")
+        }
+        missing_sections = [sec_id for sec_id in expected_sections if sec_id not in self.state.sections]
+        for sec_id in missing_sections:
+            title = section_titles.get(sec_id, f"Section {sec_id}")
+            self.state.sections[sec_id] = SectionContent(
+                title=title,
+                content=f"[Section {sec_id} generation pending - will be completed in revision]",
+                citations=[],
+                word_count=0,
+                status="pending"
+            )
         
         # Final progress update
         await events.publish(
@@ -1219,6 +1673,8 @@ class WriterSwarm:
                 prompt = self._build_general_lit_summary_prompt(section_id, title)
             elif style == "lit_intro":
                 prompt = self._build_lit_intro_prompt(section_id, title)
+            elif style == "empirical_intro":
+                prompt = self._build_empirical_intro_prompt(section_id, title, citation_context)
             elif style == "framework_intro":
                 prompt = self._build_framework_intro_prompt(section_id, title, citation_context)
             elif style == "theory_detailed":
@@ -1247,6 +1703,12 @@ class WriterSwarm:
                 prompt = self._build_sample_size_prompt(section_id, title, citation_context)
             elif style == "data_instruments":
                 prompt = self._build_data_instruments_prompt(section_id, title, citation_context)
+            elif style == "data_sources":
+                prompt = self._build_data_sources_prompt(section_id, title, citation_context)
+            elif style == "primary_data_sources":
+                prompt = self._build_primary_data_sources_prompt(section_id, title, citation_context)
+            elif style == "secondary_data_sources":
+                prompt = self._build_secondary_data_sources_prompt(section_id, title, citation_context)
             elif style == "validity_reliability":
                 prompt = self._build_validity_reliability_prompt(section_id, title, citation_context)
             elif style == "data_procedures":
@@ -2104,67 +2566,86 @@ Write the section content now (without any heading):"""
     # -------------------------------------------------------------------------
     
     def _build_general_intro_prompt(self, section_id: str, title: str, citation_context: str) -> str:
-        return f"""Write a brief Introduction about {self.state.topic} in {self.state.parameters.get('country', 'South Sudan')} and specifically in {self.state.case_study} with enough in-text citations. Make about three paragraphs for this Introduction and conclude the fourth paragraph outlining the outline of chapter one ie saying due to the above introduction, chapter one of this study will focus on historical background, problem statement, purpose of the study, objectives of the study outlining the general and specific objectives, research questions and hypothesis, significance of the study, scope of the study, brief methodology of the study, anticipated limitations and delimitation, assumptions of the study, definition of key terms, and summary of chapter one ... NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style.
-        
-        Use ONLY sources from the CITATION CONTEXT below. If the approved sources do not cover a sub-topic, explicitly state that evidence is limited and do not invent citations.
-        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
+        return f"""Write a brief Introduction about {self.state.topic} in {self.state.parameters.get('country', 'South Sudan')} and specifically in {self.state.case_study} with enough in-text citations. Make about three paragraphs for this Introduction and conclude the fourth paragraph outlining the outline of chapter one ie saying due to the above introduction, chapter one of this study will focus on historical background, problem statement, purpose of the study, objectives of the study outlining the general and specific objectives, research questions and hypothesis, significance of the study, scope of the study, brief methodology of the study, anticipated limitations and delimitation, assumptions of the study, definition of key terms, and summary of chapter one. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2026 and citations need to be between June of 2020 to June of 2026 and in APA style.
 
-        Annd be brief.
-        
-        CITATION CONTEXT:
-        {citation_context}
-        """
+Use ONLY sources from the CITATION CONTEXT below. If the approved sources do not cover a sub-topic, explicitly state that evidence is limited and do not invent citations. Do not fabricate authors or studies. Avoid placeholder or generic names (e.g., Smith, Johnson, Lee) unless they appear in the approved source list. Use UK English spelling. Ensure citations are in APA 7 format using LAST NAMES ONLY so that links can be attached (e.g., (Author, 2023)). If local sources exist in the context, use them for local content; if not, note the limitation.
+
+dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher. Annd be brief.
+
+CITATION CONTEXT:
+{citation_context}
+"""
 
     def _build_general_background_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
-        return f"""Sumarise in one paragraph and In one summarized and precise paragraph, Write historical Background of the study about {self.state.topic} looking at it on a global perspective with enough in text citations at the end of each line or sentence. Write the first big paragraph outlining a global perspective, then write the historical background about {self.state.topic} in sample countries or states in America, another paragraph write the historical background about {self.state.topic} in sample countries or states in Asia, another paragraph write the historical background about {self.state.topic} in sample countries or states in Australia, also another write the historical background about {self.state.topic} in sample countries or states in Europe. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025 and citations need to be between June of 2020 to June of 2025 and in APA style (Author, Year). Use ONLY sources from the CITATION CONTEXT below. If a region is not covered by approved sources, say evidence is limited and avoid new citations.
-        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
-        Please sumarise and present in one small paragraph
-        Specifically one paragraph mentioning all country names and or places in those countries
+        return f"""Write a historical Background of the study about {self.state.topic} in multiple SINGLE paragraphs (no subheadings, no bullets). Use strong academic tone, UK English, and avoid "we". Use ONLY sources from the CITATION CONTEXT below. If a region is not covered by approved sources, state that evidence is limited and do not invent citations. Do not fabricate authors or studies. Avoid placeholder or generic names (e.g., Smith, Johnson, Lee) unless they appear in the approved source list. Use author–date citations in parentheses (e.g., (Surname, 2023) or (Surname et al., 2024)). Avoid two-author formats; use single surname or et al. Use only LAST NAMES so hyperlinks can be attached.
 
-        THEN:
-        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on an African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining African perspective, then write the historical background about {self.state.topic} in sample countries or states in North Africa/Arabic African Countries any of Egypt, Libya, Tunisia, Morocco, Sudan, etc, another paragraph write the historical background about {self.state.topic} in sample countries or states in South African Counties/States, another paragraph write the historical background about {self.state.topic} in sample countries or states in Central Africa, also another write the historical background about {self.state.topic} in sample countries or states in West Africa. In all make as much citations as possible. NOTE THAT THE CURRENT YEAR WE ARE IN IS 2025. Use ONLY sources from the CITATION CONTEXT below.
-        
-        THEN:
-        Sumarise in one paragraph  and  In one summarized and precise paragraph. Write historical Background of the study about {self.state.topic} looking at it on a East African perspective with in text citations at the end of each line or sentence. Write the first big paragraph outlining East African perspective,, then write the historical background about {self.state.topic} in sample Districts/Villages/Places in sample countries of East Africa. In all make as much citations as possible.
-        
-        THEN:
-        Write historical Background of the study about {self.state.topic} looking at it on {country} perspective with in text citations. Write the first big paragraph outlining {country} perspective,, then write the historical background about {self.state.topic} in sample States, Payams, Bomas, Villages/Places in {country}. In all make as much citations as possible. Then Write A very detailed past then current situation of {self.state.topic} in {self.state.case_study}. Conclude saying it is upon the above background that this study aims to ... {self.state.topic} in {self.state.case_study}, {country}. Use ONLY sources from the CITATION CONTEXT below.
-        
-        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
-        
-        CITATION CONTEXT:
-        {citation_context}
-        """
+GLOBAL SECTION (five single paragraphs):
+1) One paragraph giving a global historical overview of {self.state.topic}.
+2) One paragraph covering the Americas (mention sample countries/states).
+3) One paragraph covering Asia (mention sample countries/states).
+4) One paragraph covering Australia/Oceania (mention sample countries/states).
+5) One paragraph covering Europe (mention sample countries/states).
+
+AFRICAN SECTION (five single paragraphs):
+6) One paragraph giving an Africa-wide historical overview of {self.state.topic}.
+7) One paragraph covering North Africa/Arab African countries (e.g., Egypt, Libya, Tunisia, Morocco, Sudan) using only approved sources.
+8) One paragraph covering Southern Africa.
+9) One paragraph covering Central Africa.
+10) One paragraph covering West Africa.
+
+EAST AFRICA SECTION (two single paragraphs):
+11) One paragraph giving an East African overview.
+12) One paragraph mentioning sample districts/villages/places in East African countries, and include local place names where sources allow.
+
+COUNTRY + LOCAL SECTION (two single paragraphs):
+13) One paragraph giving a {country}-level historical background with local place names where sources allow.
+14) One paragraph giving the past-to-present situation of {self.state.topic} in {self.state.case_study}, then conclude that it is upon the above background that this study aims to examine {self.state.topic} in {self.state.case_study}, {country}.
+
+NOTE: The current year is 2026; use sources dated June 2020 to June 2026 where available in the approved list.
+
+CITATION CONTEXT:
+{citation_context}
+"""
 
     def _build_problem_statement_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
-        return f"""Write a standard problem Statement in APA style For the study about {self.state.topic} in {self.state.case_study}, {country}.
-        Organize in this fomart per paragraph:
-        1. Problem is current
-        2. Population affected
-        3. Has wide magnitude justified by data
-        4. Effects on the individuals, community or health service providers
-        5. Plausible factors contributing to the problem
-        6. Attempts taken to solve this problem inside be including studies, the prblesms and gaps
-        7. where information is missing put
-        
-        Use ONLY sources from the CITATION CONTEXT below. If no approved source supports a claim, explicitly state evidence is limited and avoid inventing citations.
-        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
-        
-        CITATION CONTEXT:
-        {citation_context}
-        """
+        return f"""Write a standard problem statement for the study about {self.state.topic} in {self.state.case_study}, {country}. Use UK English and an academic tone. Do not use bullets or headings. Never say "we".
+
+Organise each paragraph to cover: the current nature of the problem, the population affected, the magnitude supported by data, effects on individuals/communities/service providers, plausible contributing factors, and attempts to solve the problem including gaps. If evidence is missing, explicitly state the gap.
+
+Use ONLY sources from the CITATION CONTEXT below. Do not fabricate studies or authors. Avoid placeholder names (e.g., Smith, Johnson, Lee) unless they appear in the approved source list. Use author–date citations in parentheses (e.g., (Surname, 2023) or (Surname et al., 2024)) so links can be attached. Avoid two-author formats.
+
+CITATION CONTEXT:
+{citation_context}
+"""
 
     def _build_purpose_statement_prompt(self, section_id: str, title: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
         return f"""Write the purpose of the study about {self.state.topic} in {self.state.case_study}, {country}. Let it be precise and very summarized. Only the purpose of the study don't add anything else and write in academic and professional tone. Be brief."""
 
     def _build_objectives_smart_prompt(self, section_id: str, title: str) -> str:
-        return f"""List three SMART study specific objectives about {self.state.topic} in {self.state.case_study}
-        Write short setences and brief, don’t include time 
-        Objectives have to have the last two on challenges and then solutions
-        Be brief. Don't use bullets, write as a list in text or proper format."""
+        objective_list = self._get_objective_list(max_items=10)
+        if objective_list:
+            formatted = "\n".join([f"{idx + 1}. {obj}" for idx, obj in enumerate(objective_list)])
+            return f"""Use the specific objectives exactly as provided.
+{uk_english_note}
+SPECIFIC OBJECTIVES:
+{formatted}
+
+Return ONLY the numbered objectives list, preserving the wording."""
+        return f"""List THREE SMART specific objectives about {self.state.topic} in {self.state.case_study}.
+{uk_english_note}
+
+Rules:
+- Write each objective on its OWN line.
+- Use numbered formatting: 1., 2., 3.
+- Keep each objective short and precise (one sentence each).
+- Do NOT write a paragraph.
+- Do NOT include time frames.
+- The last two objectives must focus on challenges and solutions, respectively.
+
+Return ONLY the numbered objectives list."""
 
     def _build_hypothesis_prompt(self, section_id: str, title: str) -> str:
         return f"""Convert the objectives into hypothesis statements from H1,H01 to H4,H04 based on {self.state.topic}."""
@@ -2192,16 +2673,19 @@ Write the section content now (without any heading):"""
         return f"""State and explain the Delimitation(s) of the study about {self.state.topic} in {self.state.case_study}, {country}. Present all in One paragraph and write in academic language."""
 
     def _build_theoretical_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
-        return f"""Generate one theory by a scholar or scholars for a study about {self.state.topic}. It should be like this; The study will be guided by the theory of ... by Author(year). state what the theory says with precise in-text citations, state two authors who oppose the theory and what they say, also two authors who agree with the theory and what they say each on a specific paragraph.
-        State the importance of the theory in the context of {self.state.topic}. in a new paragraph, state the importance of the theory in {self.state.case_study}. Key gaps.
-        
-        Use ONLY sources from the CITATION CONTEXT below. Do not invent or guess citations.
-        dont bullet or number, dont sub headings, present in big detailed paragraphs in academic tone. never say we, say the study, or the reseacher
-        be very very detailed
-        
-        CITATION CONTEXT:
-        {citation_context}
-        """
+        return f"""Select ONE existing theory explicitly named in the CITATION CONTEXT below and use it to frame the study about {self.state.topic}.
+State the author(s) and year, explain what the theory says with precise in-text citations, then provide two opposing and two supporting scholarly views drawn from the same CITATION CONTEXT, each in its own paragraph.
+State the importance of the theory in the context of {self.state.topic}, then its importance in {self.state.case_study}, and finally the gaps.
+
+Rules:
+- Do NOT invent a new theory name.
+- Do NOT create placeholder citations.
+- Use ONLY sources from the CITATION CONTEXT below. If no suitable theory exists, explicitly state that evidence is limited and avoid inventing one.
+- No bullets or sub-headings; formal academic tone; UK English.
+
+CITATION CONTEXT:
+{citation_context}
+"""
 
     def _build_conceptual_gen_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         return f"""Just List to make my copying easy and State Independent and dependent Variables for the study about {self.state.topic} and list 10 independent and 5 dependent variables. List four intervening variables also. Then make a discussion on how each of the Independent, dependent and intervening Variables relates to another with the concept of the study with intext citations. Be detailed in discussions and in context of {self.state.case_study}.
@@ -2232,28 +2716,47 @@ Write the section content now (without any heading):"""
         return f"""In one paragraph, write Introduction of chapter two about literature reviews for the study about {self.state.topic} and study objectives ie saying Chapter two of this study will be about literature reviews using previous information from former scholars, both theoretical and empirical studies will be reviewed and study gaps in accordance to the study area of {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')} will be identified which will be he basis for this study."""
 
     def _build_general_theory_main_prompt(self, section_id: str, title: str, citation_context: str) -> str:
-        return f"""For the study titled {self.state.topic} in {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')} write a theoretical framework or a theory that can be used to model the study. State the author of the theory generated for pasted work/topic/objective and the year, state what the theory says in detail with precise in-text citations.
-        At least make four real current citations ie those real studies made not exceeding five years back and note that the current year is 2025.
-        State two real authors who oppose the theory and what they say also two authors who agree with the theory and what they say each on a specific paragraph.
-        State the importance of the theory in the context of the study. in a new paragraph, state the importance of the theory in study and case study. similarly, state the gaps in the theory referring to case study.
-        Everything has to be academically well cited, real and original.
-        
-        CITATION CONTEXT:
-        {citation_context}"""
+        return f"""For the study titled {self.state.topic} in {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')} write a theoretical framework section using ONLY theories explicitly named in the CITATION CONTEXT below.
+
+Requirements:
+- Do NOT invent or rename a theory.
+- Use at least four real citations from the CITATION CONTEXT (2020-2025).
+- Provide two opposing and two supporting scholarly perspectives, each in its own paragraph.
+- Explain the theory, then its importance for the study and case study, and conclude with gaps.
+
+If no suitable theory exists in the CITATION CONTEXT, state that evidence is limited and avoid fabrication.
+
+CITATION CONTEXT:
+{citation_context}"""
 
     def _build_general_theory_obj_prompt(self, section_id: str, title: str, objectives_text: str, citation_context: str) -> str:
-        return f"""Select the objectives: "{objectives_text}" and write a theoretical framework or a theory that can be used to model them.
-        State the author of the theory and the year, state what the theory says in detail with clear real in-text citations.
-        At least make four real current citations (2020-2025).
-        State two real authors who oppose the theory and what they say also two authors who agree with the theory.
-        State the importance of the theory in the context of the study. State the gaps in the theory referring to case study.
-        
-        CITATION CONTEXT:
-        {citation_context}"""
+        return f"""Select the objectives: "{objectives_text}" and write a theoretical framework section using ONLY theories explicitly named in the CITATION CONTEXT below.
+
+Requirements:
+- Do NOT invent a new theory name.
+- Use at least four real citations from the CITATION CONTEXT (2020-2025).
+- Provide two opposing and two supporting scholarly perspectives.
+- Explain the theory, its importance for the objectives, and the gaps in the case study context.
+
+If no suitable theory exists in the CITATION CONTEXT, state that evidence is limited and avoid fabrication.
+
+CITATION CONTEXT:
+{citation_context}"""
 
     def _build_general_empirical_prompt(self, section_id: str, title: str, objective: str, citation_context: str) -> str:
         country = self.state.parameters.get('country', 'South Sudan')
-        return f"""Select up to six real studies about the objective: "{objective}" from the approved source list below.
+        objective_text = (objective or "").strip()
+        objective_lines = [line.strip() for line in objective_text.splitlines() if line.strip()]
+        if not objective_lines:
+            objective_lines = [f"Review empirical studies relevant to {self.state.topic} in {self.state.case_study}."]
+        objective_block = "\n".join(objective_lines)
+        objective_instruction = "Cover each objective in a distinct paragraph or mini-subsection with clear transitions."
+        return f"""Select up to six real studies about the objective(s) below from the approved source list.
+
+OBJECTIVES TO COVER:
+{objective_block}
+
+{objective_instruction}
         For each, make sure they are not more than five years old (2020-2025). If fewer than six approved sources exist, cite fewer and state evidence is limited.
         Write like this: Author (year) conducted a study about ... where the main objective was to... in ... the methodology was ..., the study found out that (with statistical results)... The study concluded that ... The study recommended that ... However, the study gap is ... Write more of the gaps. (Then cite at the end ie Author, year).
         
@@ -2274,9 +2777,33 @@ Write the section content now (without any heading):"""
         return f"""Write literature summary and knowledge gap basing on the empirical reviews above in the context of {self.state.topic} in {self.state.case_study}, {self.state.parameters.get('country', 'South Sudan')}.
         Don’t bullet or number."""
 
+    def _build_empirical_intro_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        return f"""Write a short empirical literature review introduction for section "{section_id} {title}".
+
+TOPIC: {self.state.topic}
+CASE STUDY: {self.state.case_study}
+
+AVAILABLE SOURCES:
+{citation_context}
+
+REQUIREMENTS:
+- 1-2 paragraphs
+- UK English spelling
+- Formal academic tone
+- Cite 2-3 sources total
+- Explain that the empirical review is organised around the study objectives
+- Do NOT include the section heading
+
+Write the section content now:"""
+
     def _build_objectives_prompt(self, section_id: str, title: str, style: str) -> str:
         """Build prompt for objectives sections - improved for academic quality."""
         uk_english_note = "\n\n**LANGUAGE**: UK English spelling (analyse, organisation, whilst, amongst, realise)\n**TONE**: Formal academic register\n"
+        objective_count = self.state.parameters.get("objective_count")
+        objective_list = self._get_objective_list()
+        general_objective = ""
+        if isinstance(self.state.objectives, dict):
+            general_objective = (self.state.objectives.get("general") or "").strip()
         
         if style == "objectives_intro":
             return f"""Write a brief introduction paragraph for "{section_id} {title}".
@@ -2291,6 +2818,13 @@ Do NOT include citations. Do NOT include the heading.
 Just write the content directly:"""
         
         elif style == "objective":
+            if general_objective:
+                return f"""Use the general objective exactly as provided.
+{uk_english_note}
+GENERAL OBJECTIVE:
+{general_objective}
+
+Return ONLY the objective text, without additional commentary or heading."""
             return f"""Write the general objective for "{section_id} {title}".
 {uk_english_note}
 TOPIC: {self.state.topic}
@@ -2310,7 +2844,21 @@ Do NOT include citations. Do NOT include the heading.
 Just write the objective:"""
         
         elif style == "objectives_list":
-            return f"""Write 4-5 specific objectives for "{section_id} {title}".
+            if objective_list:
+                formatted = "\n".join([f"{idx + 1}. {obj}" for idx, obj in enumerate(objective_list)])
+                return f"""Use the specific objectives exactly as provided.
+{uk_english_note}
+SPECIFIC OBJECTIVES:
+{formatted}
+
+Return ONLY the objectives list, preserving the wording."""
+            target = objective_count or 5
+            roman = ["i", "ii", "iii", "iv", "v", "vi", "vii"]
+            sample_lines = "\n".join([
+                f"{roman[i]}. [Objective {i + 1} aligned to the study context]"
+                for i in range(min(target, len(roman)))
+            ])
+            return f"""Write {target} specific objectives for "{section_id} {title}".
 {uk_english_note}
 TOPIC: {self.state.topic}
 CASE STUDY: {self.state.case_study}
@@ -2323,11 +2871,7 @@ Create SMART (Specific, Measurable, Achievable, Relevant, Time-bound) objectives
 - Reference specific variables, populations, or contexts
 
 Write as a numbered list using lowercase Roman numerals:
-i. To examine [specific variable/phenomenon] [among specific population] in [specific context in case study]
-ii. To assess [specific aspect such as availability, accessibility, barriers] to [specific resource/service] [in specific geographic/demographic context]
-iii. To determine the [relationship/association/correlation] between [independent variable] and [dependent variable] among [specific population]
-iv. To evaluate [specific intervention/program/policy] [for specific outcome] in [specific setting]
-v. To establish [specific factor/mechanism] that [specific action/influence] [specific outcome] in the context of [case study setting]
+{sample_lines}
 
 CRITICAL: Make each objective:
 - Grounded in {self.state.case_study} context
@@ -2338,10 +2882,22 @@ Do NOT include citations. Do NOT include the heading.
 Just write the objectives list:"""
         
         elif style == "questions":
-            return f"""Write 4-5 research questions that correspond PRECISELY to the specific objectives for "{section_id} {title}".
+            target = objective_count or 5
+            objectives_text = ""
+            if objective_list:
+                objectives_text = "\n".join([f"{idx + 1}. {obj}" for idx, obj in enumerate(objective_list)])
+            roman = ["i", "ii", "iii", "iv", "v", "vi", "vii"]
+            sample_lines = "\n".join([
+                f"{roman[i]}. [Research question directly corresponding to objective {i + 1}]"
+                for i in range(min(target, len(roman)))
+            ])
+            return f"""Write {target} research questions that correspond PRECISELY to the specific objectives for "{section_id} {title}".
 {uk_english_note}
 TOPIC: {self.state.topic}
 CASE STUDY: {self.state.case_study}
+
+SPECIFIC OBJECTIVES:
+{objectives_text or "[Auto-generate objectives if none are provided]"}
 
 For EACH specific objective, create ONE corresponding research question that:
 - Directly addresses the same variables/concepts as the objective
@@ -2357,11 +2913,7 @@ Types of research questions to use:
 - Evaluative: "To what extent does [intervention/factor] affect [outcome] in [specific context in case study]?"
 
 Write as a numbered list:
-i. [Research question directly corresponding to objective i]
-ii. [Research question directly corresponding to objective ii]
-iii. [Research question directly corresponding to objective iii]
-iv. [Research question directly corresponding to objective iv]
-v. [Research question directly corresponding to objective v]
+{sample_lines}
 
 CRITICAL: Ensure perfect 1:1 alignment between each objective and its corresponding research question.
 
@@ -3157,6 +3709,50 @@ Write the content now:"""
 
     def _build_sampling_procedures_prompt(self, section_id: str, title: str, citation_context: str) -> str:
         """Build prompt for sampling procedures."""
+        include_sample_size = "sample size" in (title or "").lower()
+        sample_size_block = ""
+        paragraph_count = 6
+        if include_sample_size:
+            paragraph_count = 8
+            meth_ctx = self.state.parameters.get('methodology_context', {})
+            user_n = meth_ctx.get('sampling', {}).get('sample_size') or self.state.parameters.get('sample_size') or 385
+            from services.research_context_manager import ResearchContextManager
+            config = {
+                'sample_size': user_n,
+                'research_design': meth_ctx.get('research_design', 'survey'),
+                'topic': self.state.topic,
+                'case_study': self.state.case_study
+            }
+            rcm = ResearchContextManager(config)
+            justification_data = rcm.get_sample_size_justification()
+            citation = justification_data['citation']
+            method_name = justification_data['method']
+            prompt_instruction = justification_data['prompt_text']
+
+            sample_size_block = f"""
+
+**5. Sample Size Determination (2 paragraphs + calculation block)**
+- Define sample size with scholarly citations ({citation}; Yamane, 1967; Cochran, 1977).
+- Justify the chosen method for this study (use {method_name}).
+- Explicitly state the final sample size n={user_n} and link it to the study design.
+
+{prompt_instruction}
+
+**Sample Size Calculation (Step-by-Step):**
+1. State the formula on its own line using $$...$$.
+2. List each substitution step with actual values.
+3. Simplify step-by-step.
+4. Conclude with the final result ≈ n={user_n}.
+
+**Table: Sample Size Distribution by Stratum (if applicable)**
+
+| Strata/Category | Population (N) | Proportion | Sample Size (n) | Sampling Method |
+|-----------------|----------------|------------|-----------------|------------------|
+| [Stratum 1]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified/Purposive |
+| [Stratum 2]     | [realistic #]  | [0.XX]     | [proportional]  | Stratified/Purposive |
+| **Total**       | **[Realistic N]** | **1.00**   | **{user_n}** | –                |
+"""
+
         return f"""Write section "{section_id} {title}" - comprehensive sampling methodology.
 
 TOPIC: {self.state.topic}
@@ -3164,7 +3760,7 @@ CASE STUDY: {self.state.case_study}
 
 {citation_context}
 
-Write 6 detailed paragraphs:
+Write {paragraph_count} detailed paragraphs:
 
 **1. Sampling Design Choice (1 paragraph)**
 - Compare **Probability Sampling** (random, representative) vs. **Non-Probability Sampling** (purposive, convenience)
@@ -3190,6 +3786,7 @@ CRITICAL: Provide EXACT procedural steps:
 - Discuss potential sources of sampling bias (e.g., non-response, selection bias)
 - Explain how your procedure minimizes bias
 - Mention ensuring representation across key demographics
+{sample_size_block}
 
 CRITICAL REQUIREMENTS:
 - MANDATORY: 3-5 citations per paragraph
@@ -3275,6 +3872,9 @@ Paragraph 2: Justify sampling strategy selection (e.g., Stratified Random or Pur
         - Include the formula on its own line using $$...$$.
         - Show substitution, simplification, and final result ≈ n={config['sample_size']}.
         - If the method is non-formula (e.g., saturation or rule-of-thumb), show the decision steps and numeric justification (range/threshold → selected n).
+
+**ALTERNATIVE METHODS PARAGRAPH (REQUIRED):**
+Add a short paragraph (3-5 sentences) listing at least two alternative sample size approaches (e.g., Yamane, Cochran, Krejcie & Morgan, power analysis) and briefly explain why the chosen method is most appropriate for this study's design and context.
 
 Paragraph 5: Justify adequacy, mention power analysis if applicable.
 
@@ -3411,6 +4011,84 @@ Paragraph 5: **Administration Mode**
 - **CITATION DISTRIBUTION**: Distribute citations evenly within paragraphs.
 - Provide SPECIFIC sample items (not placeholders)
 - Use realistic context from {self.state.case_study}
+
+Write the content now:"""
+
+    def _build_data_sources_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        """Build data sources prompt for methodology."""
+        objective_list = self._get_objective_list()
+        objectives_context = ""
+        if objective_list:
+            obj_text = "\n".join([f"- {obj}" for obj in objective_list])
+            objectives_context = f"\n\nSTUDY OBJECTIVES:\n{obj_text}\n"
+        return f"""Write content for the data sources section.
+
+**CRITICAL: Do NOT write the heading "{section_id} {title}". Start directly with the definition.**
+
+TOPIC: {self.state.topic}
+CASE STUDY: {self.state.case_study}{objectives_context}
+
+{citation_context}
+
+Include:
+1. A brief scholarly definition of data sources in research.
+2. Distinction between primary and secondary data with examples.
+3. Clear statement of the data sources used in this study and why they fit the objectives and design.
+
+REQUIREMENTS:
+- UK English spelling
+- Formal academic tone
+- Past tense where appropriate
+- 2-3 citations per paragraph
+- No bullet list headings
+
+Write the content now:"""
+
+    def _build_primary_data_sources_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        """Build primary data sources prompt."""
+        return f"""Write content for the primary data sources subsection.
+
+**CRITICAL: Do NOT write the heading "{section_id} {title}". Start directly with the explanation.**
+
+TOPIC: {self.state.topic}
+CASE STUDY: {self.state.case_study}
+
+{citation_context}
+
+Cover:
+- What counts as primary data for this study
+- The instruments used (questionnaires, interviews, observation) and why
+- How primary data align with the study objectives
+
+REQUIREMENTS:
+- UK English spelling
+- Formal academic tone
+- Past tense where appropriate
+- 2-3 citations per paragraph
+
+Write the content now:"""
+
+    def _build_secondary_data_sources_prompt(self, section_id: str, title: str, citation_context: str) -> str:
+        """Build secondary data sources prompt."""
+        return f"""Write content for the secondary data sources subsection.
+
+**CRITICAL: Do NOT write the heading "{section_id} {title}". Start directly with the explanation.**
+
+TOPIC: {self.state.topic}
+CASE STUDY: {self.state.case_study}
+
+{citation_context}
+
+Cover:
+- What counts as secondary data for this study
+- Typical sources (journal articles, government reports, institutional records)
+- How secondary data complement primary data for the objectives
+
+REQUIREMENTS:
+- UK English spelling
+- Formal academic tone
+- Past tense where appropriate
+- 2-3 citations per paragraph
 
 Write the content now:"""
 
@@ -3697,6 +4375,118 @@ class QualitySwarm:
     
     def __init__(self, state: ChapterState):
         self.state = state
+        self._placeholder_author_pattern = re.compile(r"\b(author|anon|unknown)\b", re.IGNORECASE)
+
+    def _extract_last_name(self, author: Any) -> str:
+        if isinstance(author, dict):
+            name = author.get("name") or author.get("family") or author.get("given") or ""
+        else:
+            name = str(author or "").strip()
+        if not name:
+            return ""
+        if "," in name:
+            return name.split(",")[0].strip()
+        parts = name.split()
+        return parts[-1] if parts else name
+
+    def _collect_allowed_author_last_names(self) -> set:
+        allowed = set()
+        for papers in self.state.research.values():
+            for paper in papers:
+                for author in paper.authors or []:
+                    last = self._extract_last_name(author)
+                    if last:
+                        allowed.add(last.lower())
+        return allowed
+
+    def _filter_citation_chunk(self, chunk: str, allowed_authors: set) -> str:
+        match = re.search(r"(.+?),\s*(\d{4}[a-z]?)", chunk)
+        if not match:
+            return ""
+        author_part = match.group(1).strip()
+        if self._placeholder_author_pattern.search(author_part):
+            return ""
+        if allowed_authors:
+            candidate_parts = re.split(r"\s+(?:and|&)\s+|,\s*", author_part)
+            candidate_parts = [part.replace("et al.", "").strip() for part in candidate_parts if part.strip()]
+            matched = False
+            for part in candidate_parts:
+                last = part.split()[-1] if part else ""
+                if last and last.lower() in allowed_authors:
+                    matched = True
+                    break
+            if not matched:
+                return ""
+        return chunk.strip()
+
+    def _strip_invented_theory_sentences(self, text: str) -> str:
+        triggers = [
+            "generated for the present study",
+            "generated for this study",
+            "proposed for the present study",
+            "proposed for this study",
+            "this study proposes",
+            "this study introduces",
+            "novel theory",
+            "new theory",
+            "is proposed as"
+        ]
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        filtered = []
+        for sentence in sentences:
+            if any(trigger in sentence.lower() for trigger in triggers):
+                continue
+            filtered.append(sentence)
+        return " ".join(filtered).strip()
+
+    def _sanitize_citations(self, text: str, allowed_authors: set, title: str) -> str:
+        def repl_parenthetical(match: re.Match) -> str:
+            content = match.group(1)
+            parts = [part.strip() for part in content.split(";") if part.strip()]
+            kept = []
+            for part in parts:
+                filtered = self._filter_citation_chunk(part, allowed_authors)
+                if filtered:
+                    kept.append(filtered)
+            if not kept:
+                return ""
+            return f"({'; '.join(kept)})"
+
+        def repl_bracket(match: re.Match) -> str:
+            content = match.group(1)
+            parts = [part.strip() for part in content.split(";") if part.strip()]
+            kept = []
+            for part in parts:
+                filtered = self._filter_citation_chunk(part, allowed_authors)
+                if filtered:
+                    kept.append(filtered)
+            if not kept:
+                return ""
+            return f"[{'; '.join(kept)}]"
+
+        text = re.sub(r"\(([^()]*\d{4}[a-z]?(?:[^()]*)?)\)", repl_parenthetical, text)
+        text = re.sub(r"\[([^\]]*\d{4}[a-z]?(?:[^\]]*)?)\]", repl_bracket, text)
+
+        def repl_narrative(match: re.Match) -> str:
+            author = match.group(1)
+            year = match.group(2)
+            if self._placeholder_author_pattern.search(author):
+                return ""
+            if allowed_authors:
+                last = author.split()[-1].strip()
+                if not last or last.lower() not in allowed_authors:
+                    return ""
+            return f"{author} ({year})"
+
+        text = re.sub(r"\b([A-Z][A-Za-z\\-]+(?:\\s+et\\s+al\\.)?)\\s*\\((\\d{4}[a-z]?)\\)", repl_narrative, text)
+
+        if "theor" in title.lower() or "framework" in title.lower():
+            text = self._strip_invented_theory_sentences(text)
+
+        text = re.sub(r"\s{2,}", " ", text)
+        text = re.sub(r"\(\s*\)", "", text)
+        text = re.sub(r"\[\s*\]", "", text)
+        return text.strip()
     
     async def validate_and_combine(self) -> str:
         """Run 4-agent quality pipeline and combine sections."""
@@ -3874,6 +4664,15 @@ class QualitySwarm:
             # Find malformed citations (e.g., "13)." instead of "(Author, Year)")
             malformed = re.findall(r'\d+\)', section.content)
             citation_metrics["malformed_citations"].extend(malformed)
+
+        allowed_authors = self._collect_allowed_author_last_names()
+        removed_citation_blocks = 0
+        for section in self.state.sections.values():
+            original = section.content
+            cleaned = self._sanitize_citations(original, allowed_authors, section.title or "")
+            if cleaned != original:
+                removed_citation_blocks += 1
+                section.content = cleaned
         
         self.state.total_citations = citation_metrics["total_papers"]
         
@@ -3881,7 +4680,7 @@ class QualitySwarm:
         await events.publish(
             self.state.job_id,
             "log",
-            {"message": f"{status} Citation Agent: {citation_metrics['with_doi']}/{citation_metrics['total_papers']} have DOIs, {len(citation_metrics['malformed_citations'])} malformed"},
+            {"message": f"{status} Citation Agent: {citation_metrics['with_doi']}/{citation_metrics['total_papers']} have DOIs, {len(citation_metrics['malformed_citations'])} malformed, cleaned {removed_citation_blocks} sections"},
             session_id=self.state.session_id
         )
     
@@ -3952,10 +4751,10 @@ class QualitySwarm:
         def section_sort_key(item):
             section_id = item[0]
             try:
-                parts = section_id.split(".")
-                return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
-            except (ValueError, IndexError):
-                return (999, 0)
+                parts = [int(p) for p in section_id.split(".")]
+            except ValueError:
+                return (999,)
+            return tuple(parts)
         
         sorted_sections = sorted(self.state.sections.items(), key=section_sort_key)
         
@@ -4271,6 +5070,23 @@ class ParallelChapterGenerator:
         self.state.parameters["thesis_type"] = thesis_type # Also set in parameters
         if sample_size:
             self.state.parameters["sample_size"] = sample_size
+        try:
+            if objectives:
+                normalized = normalize_objectives(objectives, topic, case_study)
+                self.state.objectives = normalized
+                specific_count = len(normalized.get("specific", []) or [])
+                if specific_count:
+                    self.state.parameters["objective_count"] = specific_count
+            else:
+                db = resolve_thesis_db(session_id, workspace_id)
+                saved_objectives = db.get_objectives() if db else None
+                if saved_objectives:
+                    self.state.objectives = saved_objectives
+                    specific_count = len(saved_objectives.get("specific", []) or [])
+                    if specific_count:
+                        self.state.parameters["objective_count"] = specific_count
+        except Exception as e:
+            print(f"⚠️ Could not load objectives for Chapter 1: {e}")
         
         # Try to load variables from thesis plan for consistency (Golden Thread)
         try:
@@ -4292,16 +5108,28 @@ class ParallelChapterGenerator:
         # BRANCH TO UOJ GENERAL (Bachelor's) ONLY
         # PhD theses use standard structure with "Setting the Scene" etc.
         if thesis_type == "general":
-             # Retrieve country from entities or default
-             db = resolve_thesis_db(session_id, workspace_id)
-             country = "South Sudan"  # Default country for UoJ theses
-             
-             # Need objectives for UoJ Chapter 1
-             saved_objectives = db.get_objectives() or {}
-             
-             return await generate_chapter_one_uoj(
-                 topic, case_study, country, job_id, session_id, workspace_id, saved_objectives, thesis_type=thesis_type
-             )
+             try:
+                 from services.outline_parser import outline_parser
+                 from services.workspace_service import WORKSPACES_DIR
+                 outline_path = WORKSPACES_DIR / workspace_id / "outline.json"
+                 if outline_path.exists():
+                     self.state.parameters["custom_outline"] = outline_parser.load_outline(workspace_id)
+                 else:
+                     # Retrieve country from entities or default
+                     db = resolve_thesis_db(session_id, workspace_id)
+                     country = "South Sudan"  # Default country for UoJ theses
+                     saved_objectives = db.get_objectives() or {}
+                     return await generate_chapter_one_uoj(
+                         topic, case_study, country, job_id, session_id, workspace_id, saved_objectives, thesis_type=thesis_type
+                     )
+             except Exception as e:
+                 print(f"⚠️ Could not load outline for UoJ Chapter 1: {e}")
+                 db = resolve_thesis_db(session_id, workspace_id)
+                 country = "South Sudan"
+                 saved_objectives = db.get_objectives() or {}
+                 return await generate_chapter_one_uoj(
+                     topic, case_study, country, job_id, session_id, workspace_id, saved_objectives, thesis_type=thesis_type
+                 )
         await events.publish(
             job_id,
             "stage_started",
@@ -4362,6 +5190,9 @@ class ParallelChapterGenerator:
                                     source="continuous",
                                     venue=paper.get("venue", "")
                                 )
+                                accepted, _score = research_swarm._is_result_acceptable(research)
+                                if not accepted:
+                                    continue
                                 # Add to state if not duplicate
                                 if not any(p.doi == research.doi and research.doi for scope in self.state.research.values() for p in scope):
                                     if "continuous" not in self.state.research:
@@ -4623,7 +5454,9 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         research_questions: List[str] = None,
         thesis_type: str = "phd",
         sample_size: int = None,
-        allow_quality_failure: bool = False
+        allow_quality_failure: bool = False,
+        chapter2_paragraphs: int = None,
+        chapter2_paragraph_plan: Dict[str, Any] = None
     ) -> str:
         """Generate Chapter Two - Literature Review with massive parallelization.
         
@@ -4645,10 +5478,40 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         topic = re.sub(r'/uoj_phd\s*\w*', '', topic, flags=re.IGNORECASE)
         topic = re.sub(r'\s+', ' ', topic).strip()
         
+        custom_outline = None
+        try:
+            from services.outline_parser import outline_parser
+            from services.workspace_service import WORKSPACES_DIR
+            outline_path = WORKSPACES_DIR / (workspace_id or "default") / "outline.json"
+            if outline_path.exists():
+                custom_outline = outline_parser.load_outline(workspace_id)
+        except Exception as outline_error:
+            print(f"⚠️ Could not load outline for Chapter 2: {outline_error}")
+        use_custom_outline = bool(custom_outline and custom_outline.get("chapters"))
+
         # STRICT BIFURCATION: Only General thesis uses UoJ-specific Chapter 2
-        # PhD theses use standard academic literature review structure
+        # unless a custom outline is provided (then follow that outline).
         if thesis_type == "general":
-             return await self._generate_chapter_two_strict_uoj(topic, case_study, job_id, session_id, workspace_id, objectives, research_questions)
+            if use_custom_outline:
+                return await self._generate_chapter_two_general(
+                    topic,
+                    case_study,
+                    job_id,
+                    session_id,
+                    workspace_id,
+                    objectives,
+                    research_questions,
+                    custom_outline=custom_outline
+                )
+            return await self._generate_chapter_two_strict_uoj(
+                topic,
+                case_study,
+                job_id,
+                session_id,
+                workspace_id,
+                objectives,
+                research_questions
+            )
 
         # Try to use database for objectives, but fall back if DB unavailable
         db = None
@@ -4741,6 +5604,51 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
             thesis_type=thesis_type # Propagate thesis_type
         )
         self.state.parameters["thesis_type"] = thesis_type
+        if chapter2_paragraphs:
+            self.state.parameters["chapter2_paragraphs"] = chapter2_paragraphs
+        if chapter2_paragraph_plan:
+            self.state.parameters["chapter2_paragraph_plan"] = chapter2_paragraph_plan
+
+        paragraph_override = None
+        if chapter2_paragraphs:
+            try:
+                paragraph_override = max(1, min(int(chapter2_paragraphs), 12))
+            except (TypeError, ValueError):
+                paragraph_override = None
+
+        paragraph_plan = {}
+        if isinstance(chapter2_paragraph_plan, dict):
+            key_map = {
+                "intro": "intro",
+                "framework_intro": "framework_intro",
+                "frameworkIntro": "framework_intro",
+                "theory": "theory",
+                "theory_per_objective": "theory",
+                "theoryPerObjective": "theory",
+                "conceptual": "conceptual",
+                "conceptual_framework": "conceptual",
+                "conceptualFramework": "conceptual",
+                "empirical_intro": "empirical_intro",
+                "empiricalIntro": "empirical_intro",
+                "empirical_variable": "empirical_variable",
+                "empiricalPerVariable": "empirical_variable",
+                "empirical_per_variable": "empirical_variable",
+                "gap": "gap",
+                "research_gap": "gap",
+                "gap_summary": "gap"
+            }
+            for key, value in chapter2_paragraph_plan.items():
+                if key not in key_map:
+                    continue
+                try:
+                    paragraph_plan[key_map[key]] = max(1, min(int(value), 12))
+                except (TypeError, ValueError):
+                    continue
+
+        def _para(default_value: int, key: str = None) -> int:
+            if key and key in paragraph_plan:
+                return paragraph_plan[key]
+            return paragraph_override if paragraph_override else default_value
         
         await events.connect()
         
@@ -4784,6 +5692,8 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
         ]
         
         # Search for each theme in parallel
+        relevance_filter = ResearchSwarm(self.state)
+
         async def search_theme(theme_num: int, queries: List[str]) -> List[ResearchResult]:
             """Search for papers for a specific theme."""
             results = []
@@ -4792,7 +5702,7 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
                     # Increased max_results to 30 to support bulkier literature review
                     papers = await academic_search_service.search_academic_papers(query, max_results=30)
                     for paper in papers:
-                        results.append(ResearchResult(
+                        research_result = ResearchResult(
                             title=paper.get("title", ""),
                             authors=paper.get("authors", [])[:5],
                             year=paper.get("year") or 2023,
@@ -4801,7 +5711,10 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
                             abstract=paper.get("abstract", "")[:500],
                             source=f"theme{theme_num}",
                             venue=paper.get("venue", "")
-                        ))
+                        )
+                        accepted, _score = relevance_filter._is_result_acceptable(research_result)
+                        if accepted:
+                            results.append(research_result)
                 except Exception as e:
                     print(f"Theme {theme_num} search error: {e}")
             return results
@@ -4817,7 +5730,7 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
                     # Increased max_results for theories
                     papers = await academic_search_service.search_academic_papers(query, max_results=20)
                     for paper in papers:
-                        results.append(ResearchResult(
+                        research_result = ResearchResult(
                             title=paper.get("title", ""),
                             authors=paper.get("authors", [])[:5],
                             year=paper.get("year") or 2023,
@@ -4826,7 +5739,10 @@ Example: ["Institutional Challenges", "Resource Allocation Frameworks", "Stakeho
                             abstract=paper.get("abstract", "")[:500],
                             source="theories",
                             venue=paper.get("venue", "")
-                        ))
+                        )
+                        accepted, _score = relevance_filter._is_result_acceptable(research_result)
+                        if accepted:
+                            results.append(research_result)
                 except:
                     pass
             return results
@@ -4933,7 +5849,7 @@ Example format:
         chapter_two_configs.append({
             "id": "lit_intro_writer",
             "sections": [
-                {"id": "2.0", "title": "Introduction", "paragraphs": 2, "sources": [], "needs_citations": False, "style": "lit_intro"},
+                {"id": "2.0", "title": "Introduction", "paragraphs": _para(2, "intro"), "sources": [], "needs_citations": False, "style": "lit_intro"},
             ]
         })
         
@@ -5024,7 +5940,7 @@ Example format:
         selected_theories = theory_pool[:num_objectives] if num_objectives <= len(theory_pool) else theory_pool + theory_pool[:num_objectives - len(theory_pool)]
         
         framework_sections = [
-            {"id": "2.1", "title": "Theoretical and Conceptual Framework", "paragraphs": 2, "sources": ["theories"], "needs_citations": True, "style": "framework_intro"},
+            {"id": "2.1", "title": "Theoretical and Conceptual Framework", "paragraphs": _para(2, "framework_intro"), "sources": ["theories"], "needs_citations": True, "style": "framework_intro"},
         ]
         
         for i, theory in enumerate(selected_theories, 1):
@@ -5032,7 +5948,7 @@ Example format:
             framework_sections.append({
                 "id": f"2.1.{i}", 
                 "title": theory, 
-                "paragraphs": 6, 
+                "paragraphs": _para(6, "theory"), 
                 "sources": ["theories"], 
                 "needs_citations": True, 
                 "style": "theory_detailed", 
@@ -5049,7 +5965,7 @@ Example format:
         framework_sections.append({
             "id": f"2.1.{num_objectives + 1}", 
             "title": "Conceptual Framework for the Study", 
-            "paragraphs": 5, 
+            "paragraphs": _para(5, "conceptual"), 
             "sources": ["theories"], 
             "needs_citations": True, 
             "style": "conceptual_framework",
@@ -5103,14 +6019,14 @@ Example format:
                 vars_for_obj = await self._generate_creative_headings(objective, topic)
                 
             empirical_sections = [
-                {"id": f"2.{section_num}", "title": section_title, "paragraphs": 2, "sources": [f"theme{i}"], "needs_citations": True, "style": "theme_intro", "objective_text": objective},
+                {"id": f"2.{section_num}", "title": section_title, "paragraphs": _para(2, "empirical_intro"), "sources": [f"theme{i}"], "needs_citations": True, "style": "theme_intro", "objective_text": objective},
             ]
             
             for j, var in enumerate(vars_for_obj, 1):
                 empirical_sections.append({
                     "id": f"2.{section_num}.{j}", 
                     "title": var, 
-                    "paragraphs": 10, 
+                    "paragraphs": _para(10, "empirical_variable"), 
                     "sources": [f"theme{i}"], 
                     "needs_citations": True, 
                     "style": "lit_synthesis", 
@@ -5128,10 +6044,29 @@ Example format:
         chapter_two_configs.append({
             "id": "gap_writer",
             "sections": [
-                {"id": f"2.{gap_section_num}", "title": "Research Gap and Summary of Literature", "paragraphs": 4, "sources": ["all"], "needs_citations": True, "style": "literature_gap"},
+                {"id": f"2.{gap_section_num}", "title": "Research Gap and Summary of Literature", "paragraphs": _para(4, "gap"), "sources": ["all"], "needs_citations": True, "style": "literature_gap"},
             ]
         })
         
+        used_custom_outline = False
+        outline_configs = None
+        try:
+            outline_writer = WriterSwarm(self.state)
+            custom_outline = outline_writer._load_custom_outline()
+            outline_configs = outline_writer._build_outline_section_configs(custom_outline)
+        except Exception as outline_error:
+            print(f"⚠️ Could not build outline configs for Chapter 2: {outline_error}")
+        if outline_configs:
+            chapter_two_configs = outline_configs
+            themes = []
+            used_custom_outline = True
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "🧭 Using custom outline sections for Chapter 2"},
+                session_id=session_id
+            )
+
         # Create writer swarm with Chapter 2 configs
         class ChapterTwoWriterSwarm(WriterSwarm):
             SECTION_CONFIGS = chapter_two_configs
@@ -5277,11 +6212,14 @@ Example format:
             session_id=session_id
         )
         
+        theme_line = f"- 🎯 {len(themes)} themes from objectives"
+        if used_custom_outline:
+            theme_line = "- 🧭 Sections aligned to custom outline"
         # Final summary
         await events.publish(
             job_id,
             "response_chunk",
-            {"chunk": f"\n\n---\n\n✅ **Chapter Two Complete!**\n- ⏱️ Generated in {elapsed:.1f} seconds\n- 📄 {word_count} words\n- 📚 {citation_count} citations\n- 🎯 {len(themes)} themes from objectives\n- 💾 Saved: `{filename}`\n", "accumulated": final_content},
+            {"chunk": f"\n\n---\n\n✅ **Chapter Two Complete!**\n- ⏱️ Generated in {elapsed:.1f} seconds\n- 📄 {word_count} words\n- 📚 {citation_count} citations\n{theme_line}\n- 💾 Saved: `{filename}`\n", "accumulated": final_content},
             session_id=session_id
         )
         
@@ -5340,8 +6278,19 @@ Example format:
         )
         
         
-        # STRICT BIFURCATION: If General or UoJ PhD Thesis, use separate logic TOTALLY
-        if thesis_type == "general":
+        custom_outline = None
+        try:
+            from services.outline_parser import outline_parser
+            from services.workspace_service import WORKSPACES_DIR
+            outline_path = WORKSPACES_DIR / (workspace_id or "default") / "outline.json"
+            if outline_path.exists():
+                custom_outline = outline_parser.load_outline(workspace_id)
+        except Exception as outline_error:
+            print(f"⚠️ Could not load outline for Chapter 3: {outline_error}")
+        use_custom_outline = bool(custom_outline and custom_outline.get("chapters"))
+
+        # STRICT BIFURCATION: General theses use the UoJ method only if no custom outline
+        if thesis_type == "general" and not use_custom_outline:
              return await self._generate_chapter_three_general(topic, case_study, job_id, session_id, workspace_id)
         
         state = ChapterState(
@@ -5432,6 +6381,33 @@ Example format:
             SECTION_CONFIGS = WriterSwarm.CHAPTER_THREE_CONFIGS
         
         writer_swarm = ChapterThreeWriterSwarm(state)
+        used_custom_outline = False
+        expected_sections = None
+        section_titles = {}
+        outline_configs = None
+        try:
+            outline_writer = WriterSwarm(state)
+            custom_outline = outline_writer._load_custom_outline()
+            outline_configs = outline_writer._build_outline_section_configs(custom_outline)
+        except Exception as outline_error:
+            print(f"⚠️ Could not build outline configs for Chapter 3: {outline_error}")
+        if outline_configs:
+            writer_swarm.SECTION_CONFIGS = outline_configs
+            used_custom_outline = True
+            expected_sections = [
+                sec["id"] for cfg in outline_configs for sec in cfg.get("sections", [])
+            ]
+            section_titles = {
+                sec["id"]: sec["title"]
+                for cfg in outline_configs
+                for sec in cfg.get("sections", [])
+            }
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "🧭 Using custom outline sections for Chapter 3"},
+                session_id=session_id
+            )
         
         # Run parallel writers for methodology sections
         await events.publish(
@@ -5458,11 +6434,11 @@ Example format:
         )
 
         # Ensure all expected sections are present (avoid skipped subsections)
-        expected_sections = [f"3.{i}" for i in range(1, 13)]
-        section_titles = {}
-        for config in WriterSwarm.CHAPTER_THREE_CONFIGS:
-            for sec in config.get("sections", []):
-                section_titles[sec["id"]] = sec["title"]
+        if expected_sections is None:
+            expected_sections = [f"3.{i}" for i in range(1, 13)]
+            for config in WriterSwarm.CHAPTER_THREE_CONFIGS:
+                for sec in config.get("sections", []):
+                    section_titles[sec["id"]] = sec["title"]
 
         missing_sections = [sec_id for sec_id in expected_sections if sec_id not in state.sections]
         if missing_sections:
@@ -5473,7 +6449,8 @@ Example format:
                 session_id=session_id
             )
             section_lookup = {}
-            for config in WriterSwarm.CHAPTER_THREE_CONFIGS:
+            fallback_configs = outline_configs if used_custom_outline and outline_configs else WriterSwarm.CHAPTER_THREE_CONFIGS
+            for config in fallback_configs:
                 for sec in config.get("sections", []):
                     section_lookup[sec["id"]] = sec
 
@@ -5777,6 +6754,8 @@ Example format:
 
         datasets_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "datasets")
         output_dir = str(WORKSPACES_DIR / (workspace_id or "default") / "chapters")
+        os.makedirs(datasets_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
         result_map = await generate_chapter4(
             topic=topic,
@@ -5971,6 +6950,51 @@ Example format:
             seen_citations.add(key)
             citations.append({"text": text, "url": url})
         if not citations:
+            try:
+                from services.sources_service import SourcesService
+                sources_service = SourcesService()
+                sources_index = sources_service._load_index(workspace_id or "default")
+                sources = sources_index.get("sources", []) if isinstance(sources_index, dict) else []
+                for source in sources[:12]:
+                    authors = source.get("authors") or []
+                    year = source.get("year")
+                    url = source.get("url") or ""
+                    doi = source.get("doi") or ""
+                    if not url and doi:
+                        url = doi if doi.startswith("http") else f"https://doi.org/{doi}"
+                    if not year:
+                        continue
+                    author_text = "Unknown"
+                    if authors:
+                        if isinstance(authors[0], dict):
+                            author_name = authors[0].get("name", "").strip()
+                        else:
+                            author_name = str(authors[0]).strip()
+                        author_parts = author_name.split()
+                        author_last = author_parts[-1] if author_parts else "Unknown"
+                        if len(authors) > 2:
+                            author_text = f"{author_last} et al."
+                        elif len(authors) == 2:
+                            if isinstance(authors[1], dict):
+                                second_name = authors[1].get("name", "").strip()
+                            else:
+                                second_name = str(authors[1]).strip()
+                            second_last = second_name.split()[-1] if second_name else "Unknown"
+                            author_text = f"{author_last} & {second_last}"
+                        else:
+                            author_text = author_last
+                    citation_text = f"{author_text} ({year})"
+                    if not url:
+                        url = ""
+                    key = f"{citation_text}|{url}".lower()
+                    if key in seen_citations:
+                        continue
+                    seen_citations.add(key)
+                    citations.append({"text": citation_text, "url": url})
+            except Exception as exc:
+                print(f"⚠️ Could not load fallback citations: {exc}")
+
+        if not citations:
             await events.publish(
                 job_id,
                 "log",
@@ -5986,7 +7010,13 @@ Example format:
                 idx = (take_citations.counter) % len(citations)
                 take_citations.counter += 1
                 selected.append(citations[idx])
-            return " ".join([f"[{c['text']}]({c['url']})" for c in selected])
+            rendered = []
+            for c in selected:
+                if c.get("url"):
+                    rendered.append(f"[{c['text']}]({c['url']})")
+                else:
+                    rendered.append(c["text"])
+            return " ".join(rendered)
 
         take_citations.counter = 0
 
@@ -6207,6 +7237,8 @@ Example format:
         research_design: str = None,
         preferred_analyses: List[str] = None,
         custom_instructions: str = "",
+        chapter2_paragraphs: int = None,
+        chapter2_paragraph_plan: Dict[str, Any] = None,
         allow_quality_failure: bool = False
     ) -> Dict[int, str]:
         """Generate all chapters in sequence (1 through 6)."""
@@ -6224,6 +7256,56 @@ Example format:
         db = resolve_thesis_db(session_id, workspace_id)
         if not db.get_topic():
             db.create_session(topic, case_study)
+
+        from services.plan_tracker import ensure_plan_file, get_plan_chapter_labels, mark_plan_item
+        from services.outline_parser import outline_parser
+        from services.workspace_service import WORKSPACES_DIR
+
+        outline_path = WORKSPACES_DIR / (workspace_id or "default") / "outline.json"
+        outline = None
+        if thesis_type == "general" and outline_path.exists():
+            outline = outline_parser.load_outline(workspace_id)
+        outline_defaults = outline.get("defaults") if isinstance(outline, dict) else {}
+        use_custom_outline = bool(outline and outline.get("chapters"))
+        objective_target_count = None
+        if isinstance(outline_defaults, dict):
+            try:
+                objective_target_count = int(outline_defaults.get("specific_objectives") or 0) or None
+            except (TypeError, ValueError):
+                objective_target_count = None
+        plan_path, plan_created = ensure_plan_file(workspace_id or "default", outline, thesis_type)
+        plan_chapter_labels = get_plan_chapter_labels(outline, thesis_type)
+        plan_label_map = {num: label for num, label in plan_chapter_labels}
+
+        async def _update_plan(label: str, cascade: bool = False):
+            if not label:
+                return
+            if mark_plan_item(workspace_id or "default", label, cascade=cascade):
+                await events.publish(
+                    job_id,
+                    "file_updated",
+                    {
+                        "path": str(plan_path.relative_to(WORKSPACES_DIR / (workspace_id or "default"))),
+                        "full_path": str(plan_path),
+                        "filename": plan_path.name,
+                        "workspace_id": workspace_id or "default",
+                        "type": "markdown"
+                    },
+                    session_id=session_id
+                )
+
+        if plan_created:
+            await events.publish(
+                job_id,
+                "file_created",
+                {
+                    "path": str(plan_path),
+                    "filename": plan_path.name,
+                    "workspace_id": workspace_id or "default",
+                    "type": "markdown"
+                },
+                session_id=session_id
+            )
             
         research_config = {
             "sample_size": sample_size,
@@ -6244,7 +7326,7 @@ Example format:
             # Trigger objective generation if none exist and not provided
             existing_objs = db.get_objectives()
             if not existing_objs or not existing_objs.get('specific'):
-                objectives = generate_smart_objectives(topic, 6)
+                objectives = generate_smart_objectives(topic, objective_target_count or 6)
                 normalized_objectives = normalize_objectives(objectives, topic, case_study)
                 db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
             else:
@@ -6260,6 +7342,13 @@ Example format:
                 ws_db.save_objectives(normalized_objectives["general"], normalized_objectives["specific"])
             except Exception as e:
                 print(f"⚠️ Could not mirror config/objectives to workspace DB: {e}")
+        
+        # Refresh planner once objectives are stored to show sections/subsections.
+        try:
+            from services.plan_tracker import ensure_plan_file
+            ensure_plan_file(workspace_id or "default", outline if thesis_type == "general" else None, thesis_type)
+        except Exception as e:
+            print(f"⚠️ Could not refresh planner after objectives: {e}")
         
         await events.publish(
             job_id, 
@@ -6283,10 +7372,23 @@ Example format:
                 )
 
                 await events.publish(job_id, "stage_started", {"stage": "chapter_1", "message": "📖 Generating Chapter 1: Introduction"}, session_id=session_id)
-                country = "South Sudan"
-                c1_content = await generate_chapter_one_uoj(
-                    topic, case_study, country, job_id, session_id, workspace_id, normalized_objectives or objectives, thesis_type=thesis_type
-                )
+                if use_custom_outline:
+                    ch1_gen = ParallelChapterGenerator()
+                    c1_content = await ch1_gen.generate(
+                        topic=topic,
+                        case_study=case_study,
+                        job_id=job_id,
+                        session_id=session_id,
+                        workspace_id=workspace_id,
+                        thesis_type=thesis_type,
+                        objectives=normalized_objectives or objectives,
+                        sample_size=sample_size
+                    )
+                else:
+                    country = "South Sudan"
+                    c1_content = await generate_chapter_one_uoj(
+                        topic, case_study, country, job_id, session_id, workspace_id, normalized_objectives or objectives, thesis_type=thesis_type
+                    )
 
                 await events.publish(job_id, "stage_started", {"stage": "chapter_2", "message": "📚 Generating Chapter 2: Literature Review"}, session_id=session_id)
                 ch2_gen = ParallelChapterGenerator()
@@ -6300,6 +7402,8 @@ Example format:
                         objectives=normalized_objectives or objectives,
                         thesis_type=thesis_type,
                         sample_size=sample_size,
+                        chapter2_paragraphs=chapter2_paragraphs,
+                        chapter2_paragraph_plan=chapter2_paragraph_plan,
                         allow_quality_failure=allow_quality_failure
                     )
                 )
@@ -6381,10 +7485,15 @@ Example format:
 
                 results[0] = prelims
                 results[1] = c1_content
+                await _update_plan(plan_label_map.get(1), cascade=True)
                 results[2] = c2_content
+                await _update_plan(plan_label_map.get(2), cascade=True)
                 results[3] = c3_content
+                await _update_plan(plan_label_map.get(3), cascade=True)
                 results[4] = c4_content
+                await _update_plan(plan_label_map.get(4), cascade=True)
                 results[5] = c5_content
+                await _update_plan(plan_label_map.get(5), cascade=True)
 
                 await events.publish(job_id, "stage_started", {"stage": "appendices", "message": "📎 Generating Appendices..."}, session_id=session_id)
                 try:
@@ -6396,12 +7505,17 @@ Example format:
                 await events.publish(job_id, "stage_started", {"stage": "combining", "message": "📑 Combining chapters into final thesis document..."}, session_id=session_id)
                 try:
                     from services.thesis_combiner import ThesisCombiner
+                    from services.outline_parser import outline_parser
+                    combiner_outline = outline if thesis_type == "general" else None
+                    if thesis_type == "general" and not combiner_outline:
+                        combiner_outline = outline_parser.get_default_outline("uoj_bsc_accounting_finance")
                     combiner = ThesisCombiner(
                         workspace_id=workspace_id,
                         topic=topic,
                         case_study=case_study,
                         objectives=objectives,
-                        output_dir=None
+                        output_dir=None,
+                        custom_outline=combiner_outline
                     )
                     combiner.load_chapters_from_files()
                     combined_content, combined_path = combiner.combine_thesis()
@@ -6450,6 +7564,7 @@ Example format:
                 )
                 
             results[1] = c1_content
+            await _update_plan(plan_label_map.get(1), cascade=True)
             
             # Chapter 2 - Literature Review
             await events.publish(job_id, "stage_started", {"stage": "chapter_2", "message": "📚 Generating Chapter 2: Literature Review"}, session_id=session_id)
@@ -6462,9 +7577,12 @@ Example format:
                 objectives=objectives,
                 thesis_type=thesis_type,
                 sample_size=sample_size,
+                chapter2_paragraphs=chapter2_paragraphs,
+                chapter2_paragraph_plan=chapter2_paragraph_plan,
                 allow_quality_failure=allow_quality_failure
             )
             results[2] = c2_content
+            await _update_plan(plan_label_map.get(2), cascade=True)
 
             # Chapter 3 - Methodology
             await events.publish(job_id, "stage_started", {"stage": "chapter_3", "message": "🧪 Generating Chapter 3: Research Methodology"}, session_id=session_id)
@@ -6480,6 +7598,7 @@ Example format:
                 allow_quality_failure=allow_quality_failure
             )
             results[3] = c3_content
+            await _update_plan(plan_label_map.get(3), cascade=True)
             
             # Retrieve objectives for tools generation
             objectives_data = db.get_objectives()
@@ -6531,6 +7650,7 @@ Example format:
                 allow_quality_failure=allow_quality_failure
             )
             results[4] = c4_content
+            await _update_plan(plan_label_map.get(4), cascade=True)
 
             # Chapter 5 - Findings & Discussion (General: Findings, Discussion & Conclusion)
             msg = "🗣️ Generating Chapter 5: Discussion" if thesis_type == "phd" else "🏁 Generating Chapter 5: Discussion, Conclusions & Recommendations"
@@ -6544,6 +7664,7 @@ Example format:
                 allow_quality_failure=allow_quality_failure
             )
             results[5] = c5_content
+            await _update_plan(plan_label_map.get(5), cascade=True)
 
             # Appendices (General Only)
             if thesis_type == "general":
@@ -6559,12 +7680,67 @@ Example format:
                 await events.publish(job_id, "stage_started", {"stage": "chapter_6", "message": "🏁 Generating Chapter 6: Conclusions"}, session_id=session_id)
                 c6_content = await self.generate_chapter_six(job_id, session_id, workspace_id, thesis_type=thesis_type, sample_size=sample_size)
                 results[6] = c6_content
+                await _update_plan(plan_label_map.get(6), cascade=True)
             
-            # Step 8: Combine Thesis (For both PhD and General)
+            # Step 8: Apply custom outline if provided
+            try:
+                from services.outline_parser import outline_parser
+                from services.workspace_service import WORKSPACES_DIR
+                outline_path = WORKSPACES_DIR / (workspace_id or "default") / "outline.json"
+                outline = outline_parser.load_outline(workspace_id) if outline_path.exists() else None
+                if outline and outline.get("chapters"):
+                    await events.publish(job_id, "stage_started", {"stage": "outline_rewrite", "message": "🧭 Reformatting chapters to custom outline..."}, session_id=session_id)
+                    from services.outline_rewriter import rewrite_thesis_to_outline
+
+                    source_chapters = {
+                        key: value for key, value in results.items()
+                        if isinstance(key, int) and isinstance(value, str)
+                    }
+                    if not source_chapters:
+                        for ch_num in range(1, 7):
+                            chapter_files = list((WORKSPACES_DIR / (workspace_id or "default")).glob(f"Chapter_{ch_num}*.md"))
+                            if chapter_files:
+                                with open(chapter_files[0], "r", encoding="utf-8") as f:
+                                    source_chapters[ch_num] = f.read()
+
+                    chapter_titles = {}
+                    for idx, chapter in enumerate(outline.get("chapters", []), 1):
+                        number = chapter.get("number") or idx
+                        try:
+                            number = int(number)
+                        except (TypeError, ValueError):
+                            number = idx
+                        chapter_titles[number] = chapter.get("title") or f"Chapter {number}"
+
+                    rewritten = await rewrite_thesis_to_outline(
+                        outline=outline,
+                        source_chapters=source_chapters,
+                        topic=topic,
+                        case_study=case_study,
+                        thesis_type=thesis_type
+                    )
+                    for ch_num, content in rewritten.items():
+                        raw_title = chapter_titles.get(ch_num, f"Chapter {ch_num}")
+                        safe_title = re.sub(r"[^\w\s-]", "", raw_title).strip().replace(" ", "_")
+                        chapter_filename = f"Chapter_{ch_num}_{safe_title}.md" if safe_title else f"Chapter_{ch_num}.md"
+                        chapter_path = WORKSPACES_DIR / (workspace_id or "default") / chapter_filename
+                        with open(chapter_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        results[ch_num] = content
+            except Exception as e:
+                print(f"⚠️ Outline rewrite failed: {e}")
+
+            # Step 9: Combine Thesis (For both PhD and General)
             await events.publish(job_id, "stage_started", {"stage": "combining", "message": "📑 Combining chapters into final thesis document..."}, session_id=session_id)
             
             try:
                 from services.thesis_combiner import ThesisCombiner
+                from services.outline_parser import outline_parser
+                from services.workspace_service import WORKSPACES_DIR
+                outline_path = WORKSPACES_DIR / (workspace_id or "default") / "outline.json"
+                custom_outline = outline_parser.load_outline(workspace_id) if outline_path.exists() else None
+                if thesis_type == "general" and not custom_outline:
+                    custom_outline = outline_parser.get_default_outline("uoj_bsc_accounting_finance")
                 
                 # Instantiate combiner
                 combiner = ThesisCombiner(
@@ -6572,7 +7748,8 @@ Example format:
                     topic=topic,
                     case_study=case_study,
                     objectives=objectives,
-                    output_dir=None # Defaults to workspace_dir
+                    output_dir=None, # Defaults to workspace_dir
+                    custom_outline=custom_outline
                 )
                 
                 # Load all generated chapters
@@ -6603,7 +7780,17 @@ Example format:
 
 
 # Singleton instance
-    async def _generate_chapter_two_general(self, topic: str, case_study: str, job_id: str, session_id: str, workspace_id: str, objectives: Dict, research_questions: List[str]) -> str:
+    async def _generate_chapter_two_general(
+        self,
+        topic: str,
+        case_study: str,
+        job_id: str,
+        session_id: str,
+        workspace_id: str,
+        objectives: Dict,
+        research_questions: List[str],
+        custom_outline: Dict[str, Any] = None
+    ) -> str:
         """Generate Chapter 2 (General Thesis) with REAL search integration."""
         
         # 1. Setup State & Logging
@@ -6624,6 +7811,9 @@ Example format:
             thesis_type="general"
         )
         self.state.parameters["thesis_type"] = "general"
+        self.state.objectives = saved_objectives
+        if specific_objs:
+            self.state.parameters["objective_count"] = len(specific_objs)
         
         from core.config import settings
         use_external_search = settings.GENERAL_LIT_SEARCH_ENABLED
@@ -6709,6 +7899,31 @@ Example format:
             await self._include_uploaded_sources(all_papers, seen_identifiers)
 
         self.state.chapter2_citation_pool = all_papers  # Enables citation injection
+
+        # If a custom outline is provided, use it to drive the section structure.
+        if custom_outline and custom_outline.get("chapters"):
+            self.state.parameters["custom_outline"] = custom_outline
+            await events.publish(
+                job_id,
+                "log",
+                {"message": "🧭 Using custom outline for Chapter 2 sections"},
+                session_id=session_id
+            )
+
+            writer_swarm = WriterSwarm(self.state)
+            await writer_swarm.write_all()
+
+            quality_swarm = QualitySwarm(self.state)
+            final_content = await quality_swarm.validate_and_combine()
+
+            filename = "Chapter_2_Literature_Review.md"
+            from services.workspace_service import WORKSPACES_DIR
+            path = WORKSPACES_DIR / workspace_id / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(final_content)
+
+            return final_content
 
         # 3. Build Write Configurations (General Structure)
         configs = []

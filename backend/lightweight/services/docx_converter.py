@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_COLOR_INDEX
 from docx.oxml.ns import qn, nsmap
 from docx.oxml import OxmlElement
 from typing import List, Optional
@@ -158,6 +158,8 @@ class EnhancedDOCXConverter:
             if line.strip().startswith('#'):
                 level = len(line) - len(line.lstrip('#'))
                 heading_text = line.lstrip('#').strip()
+                # Strip markdown emphasis markers from headings (headings are bold by style).
+                heading_text = re.sub(r'^\*{1,3}(.+?)\*{1,3}$', r'\1', heading_text)
                 heading = self.doc.add_heading(heading_text, level=min(level, 9))
                 
                 # Detect References section - all following paragraphs get hanging indent
@@ -167,9 +169,20 @@ class EnhancedDOCXConverter:
                     # Reset when we hit a new major section (level 1 or 2)
                     self.in_references_section = False
                 
-                # Center "CHAPTER", "INTRODUCTION", and cover page elements
-                centered_keywords = ['CHAPTER', 'INTRODUCTION', 'REFERENCES', 'UNIVERSITY OF JUBA', 'DECLARATION', 'APPROVAL', 'DEDICATION', 'ACKNOWLEDGEMENTS', 'ABSTRACT', 'TABLE OF CONTENTS']
-                if any(kw in heading_text.upper() for kw in centered_keywords) or (level == 1 and len(heading_text) < 100):
+                # Center only cover page elements; keep headings left-aligned.
+                centered_keywords = [
+                    'UNIVERSITY OF JUBA',
+                    'DECLARATION',
+                    'APPROVAL',
+                    'DEDICATION',
+                    'ACKNOWLEDGEMENTS',
+                    'ABSTRACT',
+                    'TABLE OF CONTENTS',
+                    'LIST OF TABLES',
+                    'LIST OF FIGURES',
+                    'LIST OF ABBREVIATIONS',
+                ]
+                if any(kw in heading_text.upper() for kw in centered_keywords):
                     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 
                 # Make heading text black and bold
@@ -605,9 +618,7 @@ class EnhancedDOCXConverter:
         ]
         
         is_centered = any(re.match(pattern, text.strip()) for pattern in centered_patterns)
-        # Also center if it's very short and bold
-        if not is_centered and text.startswith('**') and text.endswith('**') and len(text) < 60:
-            is_centered = True
+        # Do not auto-center short bold lines; reserve centering for explicit patterns above.
             
         if is_centered:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -706,7 +717,7 @@ class EnhancedDOCXConverter:
         
         # Split by markdown patterns including inline math $...$ AND HTML sub/sup tags
         # Note: We use (?<!\$) and (?!\$) to avoid matching $$ (block math)
-        parts = re.split(r'(\*\*.*?\*\*|\*.*?\*|`.*?`|\[.*?\]\(.*?\)|(?<!\$)\$(?!\$).*?(?<!\$)\$(?!\$)|<sub>.*?</sub>|<sup>.*?</sup>)', normalized_text)
+        parts = re.split(r'(\*\*\*.*?\*\*\*|\*\*.*?\*\*|\*.*?\*|`.*?`|\[.*?\]\(.*?\)|(?<!\$)\$(?!\$).*?(?<!\$)\$(?!\$)|<sub>.*?</sub>|<sup>.*?</sup>)', normalized_text)
         
         for part in parts:
             if not part:
@@ -731,6 +742,13 @@ class EnhancedDOCXConverter:
                 latex = part[1:-1].strip()
                 if latex:
                     self._add_inline_math(paragraph, latex)
+            # Bold + italic
+            elif part.startswith('***') and part.endswith('***'):
+                run = paragraph.add_run(part[3:-3])
+                run.bold = True
+                run.italic = True
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(12)
             # Bold
             elif part.startswith('**') and part.endswith('**'):
                 run = paragraph.add_run(part[2:-2])
@@ -748,7 +766,7 @@ class EnhancedDOCXConverter:
                 run = paragraph.add_run(part[1:-1])
                 run.font.name = 'Courier New'
                 run.font.size = Pt(11)
-                run.font.highlight_color = RGBColor(240, 240, 240)
+                run.font.highlight_color = WD_COLOR_INDEX.GRAY_25
             # Links - create REAL clickable hyperlinks
             elif part.startswith('[') and '](' in part:
                 match = re.match(r'\[(.*?)\]\((.*?)\)', part)
@@ -1282,4 +1300,3 @@ def convert_markdown_to_docx_enhanced(content: str, filename: str = "document", 
     """
     converter = EnhancedDOCXConverter(workspace_id=workspace_id)
     return converter.convert(content, filename)
-

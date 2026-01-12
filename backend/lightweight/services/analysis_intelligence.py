@@ -382,10 +382,30 @@ def parse_research_command(command: str) -> ResearchConfig:
     design_match = re.search(r'design[=\s]+(\w+)', command, re.IGNORECASE)
     if design_match:
         design_str = design_match.group(1).lower()
-        for design in ResearchDesign:
-            if design.value in design_str or design_str in design.value:
-                config.research_design = design
-                break
+        alias_map = {
+            'mixed': ResearchDesign.MIXED_METHODS,
+            'mixed_methods': ResearchDesign.MIXED_METHODS,
+            'qualitative': ResearchDesign.CASE_STUDY,
+            'ethnographic': ResearchDesign.CASE_STUDY,
+            'phenomenological': ResearchDesign.CASE_STUDY,
+            'grounded_theory': ResearchDesign.CASE_STUDY,
+            'clinical': ResearchDesign.EXPERIMENTAL,
+            'experimental': ResearchDesign.EXPERIMENTAL,
+            'quasi_experimental': ResearchDesign.QUASI_EXPERIMENTAL,
+            'survey': ResearchDesign.SURVEY,
+            'quantitative': ResearchDesign.SURVEY,
+            'descriptive': ResearchDesign.SURVEY,
+            'correlational': ResearchDesign.CORRELATIONAL,
+            'cross_sectional': ResearchDesign.CROSS_SECTIONAL,
+            'longitudinal': ResearchDesign.LONGITUDINAL
+        }
+        if design_str in alias_map:
+            config.research_design = alias_map[design_str]
+        else:
+            for design in ResearchDesign:
+                if design.value in design_str or design_str in design.value:
+                    config.research_design = design
+                    break
     
     # Extract preferred analyses
     analyses_match = re.search(r'analyses?[=\s]+([\w,]+)', command, re.IGNORECASE)

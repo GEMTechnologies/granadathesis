@@ -527,7 +527,15 @@ Respond with ONLY the interview response text, no labels or formatting:"""
                 })
             
             # Discussion themes based on objectives
-            for theme_idx, obj in enumerate(self.objectives[:4] if self.objectives else ["General discussion"], 1):
+            objectives_list = []
+            if isinstance(self.objectives, dict):
+                objectives_list = self.objectives.get("specific", []) or []
+            elif isinstance(self.objectives, list):
+                objectives_list = self.objectives
+            if not objectives_list:
+                objectives_list = ["General discussion"]
+
+            for theme_idx, obj in enumerate(objectives_list[:4], 1):
                 # Each participant contributes to each theme
                 for participant in participants:
                     response = await self._generate_interview_response(
@@ -578,7 +586,14 @@ Respond with ONLY the interview response text, no labels or formatting:"""
         
         # Observation items based on objectives
         observation_items = []
-        for obj in self.objectives[:5] if self.objectives else ["General observation"]:
+        objectives_list = []
+        if isinstance(self.objectives, dict):
+            objectives_list = self.objectives.get("specific", []) or []
+        elif isinstance(self.objectives, list):
+            objectives_list = self.objectives
+        if not objectives_list:
+            objectives_list = ["General observation"]
+        for obj in objectives_list[:5]:
             observation_items.extend([
                 f"Presence of {obj[:30]} related activity",
                 f"Level of engagement with {obj[:30]}",
@@ -1003,7 +1018,11 @@ async def generate_study_tools(
     likert_scale: int = 5,
     items_per_objective: int = 5,
     interview_questions: int = 10,
-    fgd_questions: int = 8
+    fgd_questions: int = 8,
+    include_questionnaire: bool = True,
+    include_interviews: bool = True,
+    include_fgd: bool = True,
+    include_observation: bool = True
 ) -> Dict[str, Any]:
     """Generate research study tools (questionnaire, interview guide, FGD guide, observation checklist).
     
@@ -1034,7 +1053,10 @@ async def generate_study_tools(
                 pass
         print(message)
     
-    await publish_log("📋 Generating structured questionnaire and transmittal letter...")
+    questionnaire_path = None
+    interview_path = None
+    fgd_path = None
+    observation_path = None
 
     scale = likert_scale if likert_scale in (3, 5, 7) else 5
     if items_per_objective < 2:
@@ -1071,8 +1093,11 @@ async def generate_study_tools(
     scale_cells = " | ".join(["[ ]" for _ in range(1, scale + 1)])
     scale_lines = "\n".join([f"- **{num}** = {scale_labels[num]}" for num in range(1, scale + 1)])
     
-    # ===================== QUESTIONNAIRE =====================
-    questionnaire_content = f"""# TRANSMITTAL LETTER
+    if include_questionnaire:
+        await publish_log("📋 Generating structured questionnaire and transmittal letter...")
+
+        # ===================== QUESTIONNAIRE =====================
+        questionnaire_content = f"""# TRANSMITTAL LETTER
     
 Dear Respondent,
 
@@ -1145,36 +1170,36 @@ D. Other
 {scale_lines}
 """
 
-    item_templates = [
-        "I believe that {objective} is important",
-        "Adequate measures exist to support {objective}",
-        "Current practices effectively address {objective}",
-        "There are challenges related to {objective}",
-        "Notable improvements are needed regarding {objective}",
-        "Stakeholders demonstrate commitment to {objective}",
-        "Resources allocated to {objective} are sufficient",
-        "Policies governing {objective} are implemented effectively"
-    ]
+        item_templates = [
+            "I believe that {objective} is important",
+            "Adequate measures exist to support {objective}",
+            "Current practices effectively address {objective}",
+            "There are challenges related to {objective}",
+            "Notable improvements are needed regarding {objective}",
+            "Stakeholders demonstrate commitment to {objective}",
+            "Resources allocated to {objective} are sufficient",
+            "Policies governing {objective} are implemented effectively"
+        ]
 
-    for i, obj in enumerate(objectives, 1):
-        # Clean objective text
-        obj_clean = obj.strip()
-        if obj_clean.lower().startswith('to '):
-            obj_clean = obj_clean[3:]
-        obj_title = obj_clean.capitalize()
+        for i, obj in enumerate(objectives, 1):
+            # Clean objective text
+            obj_clean = obj.strip()
+            if obj_clean.lower().startswith('to '):
+                obj_clean = obj_clean[3:]
+            obj_title = obj_clean.capitalize()
+            
+            questionnaire_content += (
+                f"\n#### Objective {i}: {obj_title}\n\n"
+                f"| # | Statement | {scale_header} |\n"
+                f"|---|-----------|{('|' + '|'.join(['---'] * scale) + '|')}"
+            )
+
+            for item_idx in range(1, items_per_objective + 1):
+                template = item_templates[(item_idx - 1) % len(item_templates)]
+                statement = template.format(objective=obj_clean.lower())
+                questionnaire_content += f"\n| {i}.{item_idx} | {statement} | {scale_cells} |"
         
-        questionnaire_content += (
-            f"\n#### Objective {i}: {obj_title}\n\n"
-            f"| # | Statement | {scale_header} |\n"
-            f"|---|-----------|{('|' + '|'.join(['---'] * scale) + '|')}"
-        )
-
-        for item_idx in range(1, items_per_objective + 1):
-            template = item_templates[(item_idx - 1) % len(item_templates)]
-            statement = template.format(objective=obj_clean.lower())
-            questionnaire_content += f"\n| {i}.{item_idx} | {statement} | {scale_cells} |"
-    
-    questionnaire_content += """
+        questionnaire_content += """
 ---
 
 ### SECTION C: OPEN-ENDED QUESTIONS
@@ -1199,15 +1224,16 @@ Please provide brief responses to the following:
 
 *This questionnaire is for academic research purposes only. All responses will be kept confidential.*
 """
+        
+        questionnaire_path = os.path.join(output_dir, f"Questionnaire_{timestamp}.md")
+        with open(questionnaire_path, 'w', encoding='utf-8') as f:
+            f.write(questionnaire_content)
+
+    if include_interviews:
+        await publish_log("📝 Generating Key Informant Interview (KII) Guide...")
     
-    questionnaire_path = os.path.join(output_dir, f"Questionnaire_{timestamp}.md")
-    with open(questionnaire_path, 'w', encoding='utf-8') as f:
-        f.write(questionnaire_content)
-    
-    await publish_log("📝 Generating Key Informant Interview (KII) Guide...")
-    
-    # ===================== INTERVIEW GUIDE =====================
-    interview_content = f"""# Key Informant Interview (KII) Guide
+        # ===================== INTERVIEW GUIDE =====================
+        interview_content = f"""# Key Informant Interview (KII) Guide
 ## {topic}
 
 ---
@@ -1233,13 +1259,13 @@ Do you have any questions before we begin?
 ### Section B: Main Interview Questions
 
 """
-    
-    for i, obj in enumerate(objectives, 1):
-        obj_clean = obj.strip()
-        if obj_clean.lower().startswith('to '):
-            obj_clean = obj_clean[3:]
-        
-        interview_content += f"""
+
+        for i, obj in enumerate(objectives, 1):
+            obj_clean = obj.strip()
+            if obj_clean.lower().startswith('to '):
+                obj_clean = obj_clean[3:]
+            
+            interview_content += f"""
 #### Theme {i}: {obj_clean.capitalize()}
 
 **Q{i}.1:** In your experience, how would you describe the current state of {obj_clean.lower()}?
@@ -1256,8 +1282,8 @@ Do you have any questions before we begin?
 - What has been your personal experience with this?
 
 """
-    
-    interview_content += """
+
+        interview_content += """
 ---
 
 ### Section C: Closing Questions
@@ -1278,15 +1304,16 @@ Thank you very much for your time and valuable insights. Your responses will con
 *Date: _______________*  
 *Duration: _______________*
 """
+
+        interview_path = os.path.join(output_dir, f"Interview_Guide_{timestamp}.md")
+        with open(interview_path, 'w', encoding='utf-8') as f:
+            f.write(interview_content)
+
+    if include_fgd:
+        await publish_log("👥 Generating Focus Group Discussion (FGD) Guide...")
     
-    interview_path = os.path.join(output_dir, f"Interview_Guide_{timestamp}.md")
-    with open(interview_path, 'w', encoding='utf-8') as f:
-        f.write(interview_content)
-    
-    await publish_log("👥 Generating Focus Group Discussion (FGD) Guide...")
-    
-    # ===================== FGD GUIDE =====================
-    fgd_content = f"""# Focus Group Discussion (FGD) Guide
+        # ===================== FGD GUIDE =====================
+        fgd_content = f"""# Focus Group Discussion (FGD) Guide
 ## {topic}
 
 ---
@@ -1323,13 +1350,13 @@ Let's go around the room and have each person briefly introduce themselves and s
 ### Main Discussion Questions
 
 """
-    
-    for i, obj in enumerate(objectives, 1):
-        obj_clean = obj.strip()
-        if obj_clean.lower().startswith('to '):
-            obj_clean = obj_clean[3:]
-        
-        fgd_content += f"""
+
+        for i, obj in enumerate(objectives, 1):
+            obj_clean = obj.strip()
+            if obj_clean.lower().startswith('to '):
+                obj_clean = obj_clean[3:]
+            
+            fgd_content += f"""
 #### Topic {i}: {obj_clean.capitalize()} (15 minutes)
 
 **Opening Question:** What is your understanding of {obj_clean.lower()}?
@@ -1342,8 +1369,8 @@ Let's go around the room and have each person briefly introduce themselves and s
 **Activity:** Let's brainstorm solutions on the flip chart.
 
 """
-    
-    fgd_content += """
+
+        fgd_content += """
 ---
 
 ### Wrap-up (10 minutes)
@@ -1370,15 +1397,16 @@ Thank you all for your valuable participation. Your insights will be very helpfu
 - Moderator: _______________
 - Note-taker: _______________
 """
+
+        fgd_path = os.path.join(output_dir, f"FGD_Guide_{timestamp}.md")
+        with open(fgd_path, 'w', encoding='utf-8') as f:
+            f.write(fgd_content)
+
+    if include_observation:
+        await publish_log("📋 Generating Observation Checklist...")
     
-    fgd_path = os.path.join(output_dir, f"FGD_Guide_{timestamp}.md")
-    with open(fgd_path, 'w', encoding='utf-8') as f:
-        f.write(fgd_content)
-    
-    await publish_log("📋 Generating Observation Checklist...")
-    
-    # ===================== OBSERVATION CHECKLIST =====================
-    observation_content = f"""# Observation Checklist
+        # ===================== OBSERVATION CHECKLIST =====================
+        observation_content = f"""# Observation Checklist
 ## {topic}
 
 ---
@@ -1404,13 +1432,13 @@ Observe and record findings related to each criterion. Use the rating scale:
 ### Observation Criteria
 
 """
-    
-    for i, obj in enumerate(objectives, 1):
-        obj_clean = obj.strip()
-        if obj_clean.lower().startswith('to '):
-            obj_clean = obj_clean[3:]
-        
-        observation_content += f"""
+
+        for i, obj in enumerate(objectives, 1):
+            obj_clean = obj.strip()
+            if obj_clean.lower().startswith('to '):
+                obj_clean = obj_clean[3:]
+            
+            observation_content += f"""
 #### Category {i}: {obj_clean.capitalize()}
 
 | # | Observation Item | 1 | 2 | 3 | 4 | N/A | Notes |
@@ -1422,8 +1450,8 @@ Observe and record findings related to each criterion. Use the rating scale:
 | {i}.5 | Overall impression | [ ] | [ ] | [ ] | [ ] | [ ] | |
 
 """
-    
-    observation_content += """
+
+        observation_content += """
 ---
 
 ### General Observations
@@ -1451,17 +1479,19 @@ _____________________________________________________________
 **Observer's Signature:** _______________  
 **Date:** _______________
 """
-    
-    observation_path = os.path.join(output_dir, f"Observation_Checklist_{timestamp}.md")
-    with open(observation_path, 'w', encoding='utf-8') as f:
-        f.write(observation_content)
-    
-    await publish_log("✅ All study tools generated successfully!")
-    
+
+        observation_path = os.path.join(output_dir, f"Observation_Checklist_{timestamp}.md")
+        with open(observation_path, 'w', encoding='utf-8') as f:
+            f.write(observation_content)
+
+    await publish_log("✅ Study tools generated successfully!")
+
+    files = [path for path in [questionnaire_path, interview_path, fgd_path, observation_path] if path]
+
     return {
         'questionnaire_path': questionnaire_path,
         'interview_path': interview_path,
         'fgd_path': fgd_path,
         'observation_path': observation_path,
-        'files': [questionnaire_path, interview_path, fgd_path, observation_path]
+        'files': files
     }

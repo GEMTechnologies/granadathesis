@@ -128,6 +128,17 @@ class EventPublisher:
             "metadata": metadata or {},
             "timestamp": time.time()
         }, session_id=session_id)
+
+    async def stage_started(self, job_id: str, stage_name: str, metadata: dict = None, session_id: str = None):
+        """Publish a stage start event."""
+        payload = {
+            "stage": stage_name,
+            "metadata": metadata or {},
+            "timestamp": time.time()
+        }
+        if metadata and isinstance(metadata, dict) and metadata.get("message"):
+            payload["message"] = metadata.get("message")
+        await self.publish(job_id, "stage_started", payload, session_id=session_id)
     
     async def debate_message(self, job_id: str, speaker: str, message: str, objectives: list = None, session_id: str = None):
         """Publish a debate message with optional objectives."""

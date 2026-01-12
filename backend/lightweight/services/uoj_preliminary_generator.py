@@ -116,8 +116,8 @@ Abstract ................................................................... vi
 Table of Contents .......................................................... vii
 """
 
-    # Combined
-    content = f"{title_page}\n<div style='page-break-after: always;'></div>\n{declaration}\n<div style='page-break-after: always;'></div>\n{approval}\n<div style='page-break-after: always;'></div>\n{dedication}\n<div style='page-break-after: always;'></div>\n{acknowledgement}\n<div style='page-break-after: always;'></div>\n{abstract}\n<div style='page-break-after: always;'></div>\n{toc}\n<div style='page-break-after: always;'></div>\n"
+    page_break = "\n\n---\n\n"
+    content = f"{title_page}{page_break}{declaration}{page_break}{approval}{page_break}{dedication}{page_break}{acknowledgement}{page_break}{abstract}{page_break}{toc}\n"
 
     if workspace_id:
         workspace_path = WORKSPACES_DIR / workspace_id

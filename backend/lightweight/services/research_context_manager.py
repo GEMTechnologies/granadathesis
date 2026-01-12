@@ -58,7 +58,9 @@ class ResearchContextManager:
                 - measurement_scale: str ('likert', 'nominal', etc.)
         """
         self.sample_size = config.get('sample_size', 385)
-        self.research_design = config.get('research_design', 'survey')
+        self.research_design_raw = config.get('research_design', 'survey')
+        self.design_family = self._design_family(self.research_design_raw)
+        self.research_design = self._normalize_design(self.research_design_raw)
         self.topic = config.get('topic', 'Research Study')
         self.case_study = config.get('case_study', '')
         self.measurement_scale = config.get('measurement_scale', 'likert')
@@ -69,6 +71,40 @@ class ResearchContextManager:
         self.population_config = self._calculate_population()
         self.sampling_config = self._determine_sampling_technique()
         self.statistical_config = self._determine_statistical_approach()
+
+    def _design_family(self, design: str) -> str:
+        """Map a design label to a broad family used for sampling and justification."""
+        if not design:
+            return "quantitative"
+        value = design.strip().lower().replace('-', '_').replace(' ', '_')
+        qualitative = {
+            'qualitative', 'ethnographic', 'phenomenological', 'phenomenology',
+            'grounded_theory', 'narrative', 'case_study', 'case_study_research'
+        }
+        mixed = {'mixed', 'mixed_methods', 'convergent', 'sequential_explanatory', 'sequential_exploratory'}
+        experimental = {'experimental', 'quasi_experimental', 'clinical', 'rct', 'randomized_controlled_trial'}
+        if value in qualitative:
+            return "qualitative"
+        if value in mixed:
+            return "mixed"
+        if value in experimental:
+            return "experimental"
+        return "quantitative"
+
+    def _normalize_design(self, design: str) -> str:
+        """Normalize design labels into sampling categories."""
+        if not design:
+            return "survey"
+        value = design.strip().lower().replace('-', '_').replace(' ', '_')
+        if value in {'case_study', 'ethnographic', 'phenomenological', 'phenomenology', 'grounded_theory', 'qualitative'}:
+            return "case_study"
+        if value in {'experimental', 'quasi_experimental', 'clinical', 'rct', 'randomized_controlled_trial'}:
+            return "experimental"
+        if value in {'mixed', 'mixed_methods', 'convergent', 'sequential_explanatory', 'sequential_exploratory'}:
+            return "mixed_methods"
+        if value in {'survey', 'quantitative', 'descriptive', 'correlational', 'cross_sectional', 'longitudinal'}:
+            return "survey"
+        return value
     
     def _calculate_population(self) -> PopulationConfig:
         """
@@ -232,11 +268,11 @@ class ResearchContextManager:
             - prompt_text: str (Instructions for the LLM)
         """
         n = self.sample_size
-        design = self.research_design
+        design = self.design_family
         N = self.population_config.target_population_size
         
         # 1. Qualitative / Small Samples (n < 30)
-        if n < 30 or design == 'phenomenology':
+        if n < 30 or design == 'qualitative':
             return {
                 "citation": "Guest et al. (2006); Saunders (2012)",
                 "method": "Data Saturation",
@@ -266,7 +302,7 @@ Paragraph 3: Justify Sample Size using 'Power Analysis':
         # 3. Roscoe's Rule of Thumb (30 <= n <= 500) - Ideally for Case Studies / Mixed Methods
         # If specific population is unknown or it's a "general" justifications
         # We prioritize Roscoe if it's a Case Study or if n doesn't perfectly match a formula
-        if 30 <= n <= 500 and (design == 'case_study' or design == 'mixed_methods'):
+        if 30 <= n <= 500 and (design in ('qualitative', 'mixed')):
              return {
                 "citation": "Roscoe (1975)",
                 "method": "Rule of Thumb",
@@ -464,7 +500,7 @@ Paragraph 3: Justify Sample Size using **Yamane's Formula (1967)**:
             Dict with all methodology details the LLM needs
         """
         return {
-            'research_design': self.research_design,
+            'research_design': self.research_design_raw,
             'population': {
                 'target_size': self.population_config.target_population_size,
                 'accessible_size': self.population_config.accessible_population_size,
@@ -498,6 +534,8 @@ Paragraph 3: Justify Sample Size using **Yamane's Formula (1967)**:
         """
         return {
             'sample_size': self.sample_size,
+            'research_design': self.research_design_raw,
+            'design_family': self.design_family,
             'use_parametric': self.statistical_config['use_parametric'],
             'recommended_tests': self.statistical_config['recommended_tests'],
             'confidence_level': 0.95,
